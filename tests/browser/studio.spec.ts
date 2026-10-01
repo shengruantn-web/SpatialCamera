@@ -1,0 +1,41 @@
+import { test, expect } from '@playwright/test';
+
+test('studio, viewer, guide, photo selection, and mobile layout', async ({ page }) => {
+  test.setTimeout(120_000);
+  const errors: string[] = [];
+  page.on('pageerror', error => errors.push(error.message));
+  await page.goto('/');
+  await expect(page.getByRole('heading', { name: 'Places worth keeping.' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Create 3D splat' })).toBeDisabled();
+  await expect(page.getByText('Processor not connected', { exact: false })).toBeVisible();
+  await page.getByRole('button', { name: 'Capture guide' }).click();
+  await expect(page.getByRole('dialog')).toBeVisible();
+  await page.getByRole('button', { name: 'Ready to capture' }).click();
+  await expect(page.getByRole('dialog')).not.toBeVisible();
+  await page.getByRole('button', { name: 'My captures' }).click();
+  await expect(page.getByRole('heading', { name: 'Your little worlds.' })).toBeVisible();
+  await page.getByRole('button', { name: 'Studio', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Rotate scene' })).toBeEnabled({ timeout: 45000 });
+  await page.getByRole('button', { name: 'Rotate scene' }).click();
+  await expect(page.getByRole('button', { name: 'Pause rotation' })).toBeVisible();
+  await page.getByRole('button', { name: 'Pause rotation' }).click({ force: true });
+  await page.getByRole('button', { name: 'Reset view' }).click({ force: true });
+  await page.screenshot({ path: 'public/screenshot.jpeg', type: 'jpeg', quality: 90 });
+  const png = Buffer.from(await page.evaluate(() => {
+    const canvas = document.createElement('canvas'); canvas.width = 32; canvas.height = 32;
+    const context = canvas.getContext('2d')!; context.fillStyle = '#74856a'; context.fillRect(0, 0, 32, 32);
+    return canvas.toDataURL('image/png').split(',')[1];
+  }), 'base64');
+  await page.getByLabel('Choose capture photos').setInputFiles(Array.from({ length: 12 }, (_, i) => ({ name: `fixture-${i}.png`, mimeType: 'image/png', buffer: png })));
+  await expect(page.getByText('12 photos', { exact: false }).first()).toBeVisible();
+  await page.getByLabel('Name your capture').fill('Test capture');
+  await expect(page.getByRole('button', { name: 'Create 3D splat' })).toBeEnabled();
+  await page.getByRole('button', { name: 'Remove fixture-0.png', exact: true }).click();
+  await expect(page.getByText('Add 1 more photos to get started.')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Create 3D splat' })).toBeDisabled();
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await page.screenshot({ path: 'test-results/mobile.jpeg', fullPage: true });
+  await page.setViewportSize({ width: 1200, height: 750 });
+  expect(errors).toEqual([]);
+});
