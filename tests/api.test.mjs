@@ -143,8 +143,8 @@ test('a stale attempt cannot overwrite the result published by a newer lease', a
   assert.equal(published.status, 200);
   assert.deepEqual(Buffer.from(await published.arrayBuffer()), winner);
   const keys = await listKeys(`${capture.id}/`);
-  assert.equal(keys.filter(k => k.endsWith('result.ply')).length, 1);
-  assert.match(keys.find(k => k.endsWith('result.ply')), new RegExp(`^${capture.id}/attempts/[0-9a-f]{32}/result\\.ply$`));
+  assert.equal(keys.filter(k => k.endsWith('.ply')).length, 1);
+  assert.match(keys.find(k => k.endsWith('.ply')), new RegExp(`^${capture.id}/attempts/[0-9a-f]{32}/result\\.[0-9a-f-]{36}\\.ply$`));
   assert.equal(keys.some(k => k.includes(first.lease) || k.includes(second.lease)), false, 'raw leases never appear in object keys');
 });
 
@@ -224,13 +224,13 @@ test('requests never run DDL; the schema comes from migrations, which upgrade le
     const bucket = await fresh.getR2Bucket('BUCKET');
     await bucket.put('legacy/result.ply', splat(7));
     await bucket.put('legacy/images/img', png);
-    assert.deepEqual(await applyMigrations(db), ['0001_api_integrity_hot_path.sql', '0002_spz_result.sql']);
+    assert.deepEqual(await applyMigrations(db), ['0001_api_integrity_hot_path.sql', '0002_spz_result.sql', '0003_attempt_keys_gc.sql']);
     assert.deepEqual(await applyMigrations(db), []);
     const indexes = (await db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%'").all()).results.map(r => r.name).sort();
-    assert.deepEqual(indexes, ['captures_owner_created_idx', 'captures_status_created_idx', 'captures_status_updated_idx', 'images_capture_uploaded_idx']);
+    assert.deepEqual(indexes, ['captures_gc_pending_idx', 'captures_owner_created_idx', 'captures_status_created_idx', 'captures_status_updated_idx', 'images_capture_uploaded_idx']);
     // Migrations are schema-only: no data is backfilled, so legacy rows keep NULL result_key and a 0 counter.
-    const raw = await db.prepare("SELECT result_key,uploaded_count,spz_bytes FROM captures WHERE id='legacy'").first();
-    assert.deepEqual({ ...raw }, { result_key: null, uploaded_count: 0, spz_bytes: null });
+    const raw = await db.prepare("SELECT result_key,uploaded_count,spz_bytes,spz_key,gc_pending FROM captures WHERE id='legacy'").first();
+    assert.deepEqual({ ...raw }, { result_key: null, uploaded_count: 0, spz_bytes: null, spz_key: null, gc_pending: 0 });
     const get = (path, method = 'GET') => fresh.dispatchFetch(`http://localhost/api/${path}`, { method, headers: { 'oai-authenticated-user-email': owner } });
     const detail = await (await get('captures/legacy')).json();
     assert.equal(detail.capture.uploaded_count, 1, 'past uploading, uploaded_count reads as image_count');
@@ -503,7 +503,7 @@ test('an attempt publishes its SPZ with its PLY; the viewer gets the SPZ, the ar
   assert.deepEqual([ready.status, ready.result_bytes, ready.spz_bytes], ['ready', ply.length, spz.length]);
   const keys = await listKeys(`${capture.id}/attempts/`);
   assert.equal(keys.length, 2);
-  assert.deepEqual(keys.map(k => k.replace(/^.*\//, '')).sort(), ['result.ply', 'result.spz']);
+  assert.deepEqual(keys.map(k => k.replace(/^.*\./, '')).sort(), ['ply', 'spz']);
   assert.equal(new Set(keys.map(k => k.replace(/\/[^/]+$/, ''))).size, 1, 'both formats live under one attempt');
 
   const scene = await request(`captures/${capture.id}/scene?v=${ready.ready_at}`);
@@ -598,13 +598,13 @@ test("a stale attempt's SPZ is never published, and is deleted once the attempt 
   const scene = await request(`captures/${capture.id}/scene?v=${ready.ready_at}`);
   assert.equal(scene.headers.get('x-splat-format'), 'ply');
   assert.deepEqual(Buffer.from(await scene.arrayBuffer()), winner);
-  // A comes back: its late SPZ and PLY are refused, and its stored SPZ is removed.
-  assert.equal((await listKeys(`${capture.id}/attempts/`)).filter(k => k.endsWith('.spz')).length, 1);
+  // B's publish already removed A's orphaned SPZ (C3); A's late SPZ and PLY are refused and leave nothing.
+  assert.deepEqual((await listKeys(`${capture.id}/attempts/`)).filter(k => k.endsWith('.spz')), []);
   assert.equal((await worker(`${capture.id}/result.spz`, 'PUT', spzFixture(), first.lease)).status, 409);
   assert.equal((await worker(`${capture.id}/result`, 'PUT', splat(111), first.lease)).status, 409);
   const keys = await listKeys(`${capture.id}/attempts/`);
   assert.equal(keys.length, 1);
-  assert.match(keys[0], /\/result\.ply$/);
+  assert.match(keys[0], /\/result\.[0-9a-f-]{36}\.ply$/);
   assert.deepEqual((await (await request(`captures/${capture.id}`)).json()).capture, ready);
 });
 
@@ -642,5 +642,174 @@ test('an SPZ upload whose lease lapses mid-upload is deleted, and a lost publish
     const row = await db.prepare('SELECT status,result_key,spz_bytes FROM captures WHERE id=?').bind(capture.id).first();
     assert.deepEqual({ ...row }, { status: 'failed', result_key: null, spz_bytes: null });
     assert.deepEqual(await listKeys(`${capture.id}/attempts/`), [], 'both unpublished objects are deleted');
+  }
+});
+
+// ---- S5 review fixes: C1 full SPZ validation, C2 immutable published SPZ, C3 attempt garbage --------
+const workerAuth = lease => ({ authorization: `Bearer ${token}`, 'x-job-lease': lease });
+test('an SPZ is inflated in full: truncated, short, long, padded or corrupt streams are rejected (C1)', async () => {
+  const { capture, job } = await queuedAndClaimed();
+  await toExporting(job);
+  const good = spzFixture();
+  const crc = Buffer.from(good); crc[crc.length - 6] ^= 0xff;
+  // A header for 200k points (5.8 MB inflated) in front of 100 MB of zeros: it compresses to ~100 KB, so
+  // its header and compressed size agree, and only counting the inflated bytes catches it.
+  const bomb = Buffer.alloc(16 + 200_000 * 29 + 100 * 1024 * 1024);
+  bomb.writeUInt32LE(0x5053474e, 0); bomb.writeUInt32LE(3, 4); bomb.writeUInt32LE(200_000, 8); bomb[12] = 1; bomb[13] = 12;
+  const invalid = {
+    // Each of these has a valid header that agrees with its compressed size, so header-only checks passed it.
+    'truncated gzip stream': good.subarray(0, good.length - 200),
+    'gzip cut before its trailer': good.subarray(0, good.length - 4),
+    'data shorter than the declared count': spzFixture(2000, { declared: 2010 }),
+    'data longer than the declared count': spzFixture(2000, { declared: 1990 }),
+    'bytes after the gzip member': Buffer.concat([good, Buffer.alloc(16)]),
+    'a second gzip member': Buffer.concat([good, gzipSync(Buffer.from('more'))]),
+    'bad CRC': crc,
+    'decompresses far past its header (zip-bomb cap)': gzipSync(bomb, { level: 1 }),
+  };
+  for (const [name, body] of Object.entries(invalid)) {
+    assert.equal((await worker(`${job.id}/result.spz`, 'PUT', body, job.lease)).status, 400, name);
+  }
+  assert.deepEqual(await listKeys(`${capture.id}/attempts/`), [], 'nothing rejected is stored');
+  const row = await (await mf.getD1Database('DB')).prepare('SELECT spz_key,spz_bytes FROM captures WHERE id=?').bind(capture.id).first();
+  assert.deepEqual({ ...row }, { spz_key: null, spz_bytes: null }, 'nothing rejected is recorded');
+  // The exact stream is accepted, and a body cut by the network is still a retryable 503, not a 400.
+  const cut = heldRequest(`worker/${job.id}/result.spz`, workerAuth(job.lease), good.length);
+  cut.send(good.subarray(0, 20000));
+  await settle();
+  cut.abort();
+  const outcome = await cut.response.catch(error => error);
+  if (outcome instanceof Response) assert.equal(outcome.status, 503);
+  assert.equal((await worker(`${job.id}/result.spz`, 'PUT', good, job.lease)).status, 200);
+  assert.equal((await worker(`${job.id}/result`, 'PUT', splat(2), job.lease)).status, 200);
+  const scene = await request(`captures/${capture.id}/scene`);
+  assert.equal(scene.headers.get('x-splat-format'), 'spz');
+  assert.deepEqual(Buffer.from(await scene.arrayBuffer()), good);
+});
+
+test('an SPZ PUT still in flight when its attempt publishes can never change the published scene (C2)', async () => {
+  const db = await mf.getD1Database('DB');
+  // 1. Two SPZ PUTs before publishing: the later one is recorded and the earlier object deleted.
+  //    Then a third (a retry whose response was lost, with different bytes) is mid-body when the PLY publishes.
+  {
+    const { capture, job } = await queuedAndClaimed();
+    await toExporting(job);
+    assert.equal((await worker(`${job.id}/result.spz`, 'PUT', spzFixture(1500, { seed: 3 }), job.lease)).status, 200);
+    const published = spzFixture(2000, { seed: 4 });
+    assert.equal((await worker(`${job.id}/result.spz`, 'PUT', published, job.lease)).status, 200);
+    assert.equal((await listKeys(`${capture.id}/attempts/`)).length, 1, 'the replaced SPZ is deleted');
+    const late = spzFixture(3000, { seed: 5 });
+    const upload = heldRequest(`worker/${job.id}/result.spz`, workerAuth(job.lease), late.length);
+    upload.send(late.subarray(0, late.length - 10));
+    await settle();
+    const ply = splat(12);
+    assert.equal((await worker(`${job.id}/result`, 'PUT', ply, job.lease)).status, 200);
+    const ready = (await (await request(`captures/${capture.id}`)).json()).capture;
+    assert.deepEqual([ready.status, ready.spz_bytes], ['ready', published.length]);
+    const before = await listKeys(`${capture.id}/attempts/`);
+    upload.send(late.subarray(late.length - 10));
+    upload.end();
+    assert.equal((await upload.response).status, 200, 'same attempt, already published: acknowledged, nothing changes');
+    assert.deepEqual((await (await request(`captures/${capture.id}`)).json()).capture, ready);
+    const scene = await request(`captures/${capture.id}/scene?v=${ready.ready_at}`);
+    assert.equal(scene.headers.get('cache-control'), 'private, max-age=31536000, immutable');
+    assert.deepEqual(Buffer.from(await scene.arrayBuffer()), published, 'the immutable URL still serves the published bytes');
+    assert.deepEqual((await listKeys(`${capture.id}/attempts/`)).sort(), before.sort(), "the late PUT's object is deleted");
+    const row = await db.prepare('SELECT spz_key,result_key FROM captures WHERE id=?').bind(capture.id).first();
+    assert.deepEqual([row.result_key, row.spz_key].sort(), before.sort());
+  }
+  // 2. No SPZ yet: one is mid-body when a PLY-only publish lands. The scene stays the PLY.
+  {
+    const { capture, job } = await queuedAndClaimed();
+    await toExporting(job);
+    const late = spzFixture();
+    const upload = heldRequest(`worker/${job.id}/result.spz`, workerAuth(job.lease), late.length);
+    upload.send(late.subarray(0, late.length - 10));
+    await settle();
+    const ply = splat(13);
+    assert.equal((await worker(`${job.id}/result`, 'PUT', ply, job.lease)).status, 200);
+    upload.send(late.subarray(late.length - 10));
+    upload.end();
+    assert.equal((await upload.response).status, 200);
+    const ready = (await (await request(`captures/${capture.id}`)).json()).capture;
+    assert.equal(ready.spz_bytes, null);
+    const scene = await request(`captures/${capture.id}/scene?v=${ready.ready_at}`);
+    assert.equal(scene.headers.get('x-splat-format'), 'ply');
+    assert.deepEqual(Buffer.from(await scene.arrayBuffer()), ply);
+    const keys = await listKeys(`${capture.id}/attempts/`);
+    assert.equal(keys.length, 1);
+    assert.match(keys[0], /\.ply$/);
+  }
+  // 3. A duplicate PLY PUT from the publishing attempt cannot rewrite the published PLY either.
+  {
+    const { capture, job } = await queuedAndClaimed();
+    await toExporting(job);
+    const duplicate = splat(15);
+    const upload = heldRequest(`worker/${job.id}/result`, workerAuth(job.lease), duplicate.length);
+    upload.send(duplicate.subarray(0, duplicate.length - 10));
+    await settle();
+    const winner = splat(14);
+    assert.equal((await worker(`${job.id}/result`, 'PUT', winner, job.lease)).status, 200);
+    upload.send(duplicate.subarray(duplicate.length - 10));
+    upload.end();
+    assert.equal((await upload.response).status, 200);
+    assert.deepEqual(Buffer.from(await (await request(`captures/${capture.id}/result.ply`)).arrayBuffer()), winner);
+    assert.equal((await listKeys(`${capture.id}/attempts/`)).length, 1);
+  }
+});
+
+test('attempt garbage is collected on publish and by the cron, never the published objects (C3)', async () => {
+  const db = await mf.getD1Database('DB');
+  const bucket = await mf.getR2Bucket('BUCKET');
+  const gc = id => db.prepare('SELECT status,gc_pending FROM captures WHERE id=?').bind(id).first();
+  // Earlier tests leave other terminal captures marked; each run collects ten, so run until all are done.
+  const cron = async () => { for (let run = 0; run < 6; run++) await (await mf.getWorker()).scheduled({ cron: '*/5 * * * *' }); };
+  // 1. The worker dies after uploading its SPZ, before its PLY: the cron expires it and removes the SPZ.
+  {
+    const { capture, job } = await queuedAndClaimed();
+    await toExporting(job);
+    assert.equal((await worker(`${job.id}/result.spz`, 'PUT', spzFixture(), job.lease)).status, 200);
+    assert.deepEqual({ ...(await gc(capture.id)) }, { status: 'exporting', gc_pending: 1 });
+    await db.prepare('UPDATE captures SET updated_at=? WHERE id=?').bind(Date.now() - 11 * 60_000, capture.id).run();
+    await cron();
+    assert.deepEqual({ ...(await gc(capture.id)) }, { status: 'failed', gc_pending: 0 });
+    assert.deepEqual(await listKeys(`${capture.id}/attempts/`), [], 'the orphaned SPZ is gone');
+  }
+  // 2. A ready capture with leftovers of other attempts (e.g. a publish-time cleanup that failed):
+  //    the cron removes them and keeps exactly the published PLY and SPZ.
+  {
+    const { capture, job } = await queuedAndClaimed();
+    await toExporting(job);
+    const spz = spzFixture();
+    assert.equal((await worker(`${job.id}/result.spz`, 'PUT', spz, job.lease)).status, 200);
+    assert.equal((await worker(`${job.id}/result`, 'PUT', splat(21), job.lease)).status, 200);
+    assert.deepEqual({ ...(await gc(capture.id)) }, { status: 'ready', gc_pending: 0 }, 'publish cleaned up at once');
+    const published = (await listKeys(`${capture.id}/attempts/`)).sort();
+    assert.equal(published.length, 2);
+    const strays = [`${capture.id}/attempts/${'a'.repeat(32)}/result.spz`, `${capture.id}/attempts/${'b'.repeat(32)}/result.x.ply`];
+    for (const key of strays) await bucket.put(key, 'stray');
+    await db.prepare('UPDATE captures SET gc_pending=1 WHERE id=?').bind(capture.id).run();
+    await cron();
+    assert.deepEqual((await listKeys(`${capture.id}/attempts/`)).sort(), published);
+    assert.equal((await gc(capture.id)).gc_pending, 0);
+    const ready = (await (await request(`captures/${capture.id}`)).json()).capture;
+    assert.deepEqual(Buffer.from(await (await request(`captures/${capture.id}/scene?v=${ready.ready_at}`)).arrayBuffer()), spz);
+  }
+  // 3. A failed capture: objects stored before it failed go; one stored after (a newer attempt that
+  //    may already be running) is left alone.
+  {
+    const id = 'gc-failed';
+    const failedAt = Date.now() - 60_000;
+    await db.prepare("INSERT INTO captures (id,owner,name,status,created_at,updated_at,image_count,gc_pending) VALUES (?,?,'GC','failed',?,?,12,1)").bind(id, owner, failedAt, failedAt).run();
+    await bucket.put(`${id}/attempts/${'c'.repeat(32)}/result.n.spz`, 'newer');
+    await db.prepare('UPDATE captures SET updated_at=? WHERE id=?').bind(Date.now() + 60_000, id).run();
+    await bucket.put(`${id}/attempts/${'d'.repeat(32)}/result.n.spz`, 'even newer');
+    await cron();
+    assert.deepEqual(await listKeys(`${id}/attempts/`), [], 'both predate the (moved) failure time');
+    await db.prepare('UPDATE captures SET updated_at=?,gc_pending=1 WHERE id=?').bind(Date.now() - 60_000, id).run();
+    await bucket.put(`${id}/attempts/${'e'.repeat(32)}/result.n.spz`, 'after the failure');
+    await cron();
+    assert.deepEqual(await listKeys(`${id}/attempts/`), [`${id}/attempts/${'e'.repeat(32)}/result.n.spz`]);
+    await db.prepare('DELETE FROM captures WHERE id=?').bind(id).run();
   }
 });
