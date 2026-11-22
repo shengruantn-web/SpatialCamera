@@ -49,16 +49,17 @@ type PutOptions = { fetcher?: typeof fetch; wait?: Sleep; delays?: readonly numb
 /**
  * PUTs one photo, retrying transient failures. A re-PUT before submit replaces the object, so a retry
  * after an ambiguous failure (the response was lost) is safe. An abort stops it at once, mid-request or
- * mid-wait, and is rethrown as is. Errors name the photo (`label`).
+ * mid-wait, and is rethrown as is. Errors name the photo (`label`). Resolves to the successful response
+ * (S10: a video part's carries its etag).
  */
-export async function putWithRetry(url: string, body: Blob, mime: string, { fetcher = fetch, wait = sleep, delays = UPLOAD_RETRY_DELAYS, random = Math.random, signal, label }: PutOptions = {}) {
+export async function putWithRetry(url: string, body: Blob, mime: string, { fetcher = fetch, wait = sleep, delays = UPLOAD_RETRY_DELAYS, random = Math.random, signal, label }: PutOptions = {}): Promise<Response> {
   for (let attempt = 0; ; attempt++) {
     let message = "Check your connection and try again.";
     let retryable = true;
     let serverWait: number | null = null;
     try {
       const response = await fetcher(url, { method: "PUT", body, headers: { "Content-Type": mime }, signal });
-      if (response.ok) return;
+      if (response.ok) return response;
       const data = await response.json().catch(() => ({})) as { error?: string };
       if (data.error) message = data.error;
       retryable = response.status >= 500 || response.status === 408 || response.status === 429;

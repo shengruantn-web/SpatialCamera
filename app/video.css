@@ -1,0 +1,6 @@
+/* S10 video captures (ADR-0009) */
+.video-keep{display:flex;gap:9px;align-items:flex-start;margin:16px 0 0;font-size:11px;font-weight:550;cursor:pointer}
+.video-keep input{margin:2px 0 0;accent-color:var(--orange)}
+.video-keep small{display:block;font-weight:400;font-size:10px;line-height:1.6;color:var(--muted);margin-top:3px}
+.video-upload .video-switch{margin-top:14px}
+.capture-panel>.video-switch{margin:-8px 0 20px}

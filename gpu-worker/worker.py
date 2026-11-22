@@ -225,7 +225,7 @@ EXIT_SIGNALS = ExitSignals()
 class Worker:
     def __init__(self, base_url, token, iterations, backend="nerfstudio", brush="brush_app",
                  max_resolution=1200, max_splats=300000, *, heartbeat_interval=25,
-                 retry_delays=(5, 15, 45, 120), recovery_dir=None):
+                 retry_delays=(5, 15, 45, 120), recovery_dir=None, ffmpeg="ffmpeg", ffprobe="ffprobe"):
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.iterations = iterations
@@ -239,6 +239,9 @@ class Worker:
         self.retry_delays = tuple(retry_delays)
         self.recovery_dir = (Path(recovery_dir).expanduser() if recovery_dir is not None
                              else Path.home() / ".cache/spatial-camera/recovered")
+        # S10: video captures need both; their absence fails only video jobs, with a clear message.
+        self.ffmpeg = ffmpeg
+        self.ffprobe = ffprobe
         # Optional headers supplied by the chosen hosting gateway; never log them.
         self.gateway_headers = json.loads(os.environ.get("SPATIAL_GATEWAY_HEADERS", "{}"))
 
@@ -262,6 +265,42 @@ class Worker:
                 return json.loads(data)
             except json.JSONDecodeError as exc:
                 raise RuntimeError("The worker endpoint returned a non-JSON response. Check hosting gateway authentication.") from exc
+
+    def download(self, path, destination, lease, expected=None):
+        """Streams a worker GET to a file: request() buffers, and a source video can be 1 GB."""
+        headers = {**self.gateway_headers, "Authorization": f"Bearer {self.token}", "X-Job-Lease": lease}
+        request = urllib.request.Request(self.base_url + "/api/worker/" + path, headers=headers)
+        with urllib.request.urlopen(request, timeout=180) as response, open(destination, "wb") as output:
+            shutil.copyfileobj(response, output, 1024 * 1024)
+        if expected is not None and destination.stat().st_size != expected:
+            raise RuntimeError("The video download was incomplete. Retry the capture.")
+
+    def extract_frames(self, job, root, photos, run):
+        """S10 (ADR-0009): downloads the job's video and selects its frames into `photos` as a stage
+        (heartbeat, timeout and process-group kill apply). Returns the number of frames written."""
+        missing = [os.path.basename(binary) for binary in (self.ffmpeg, self.ffprobe) if not shutil.which(binary)]
+        if missing:
+            raise RuntimeError(f"This capture is a video, but {' and '.join(missing)} {'is' if len(missing) == 1 else 'are'} not installed on the GPU worker. "
+                               "Install ffmpeg (brew install ffmpeg on a Mac) and retry the capture.")
+        video = job.get("video") or {}
+        source = root / ("source.mov" if video.get("mime") == "video/quicktime" else "source.mp4")
+        report = root / "frames.json"
+        try:
+            self.download(f"{job['id']}/video", source, job["lease"], video.get("bytes"))
+            run([sys.executable, str(Path(__file__).with_name("video_frames.py")), str(source), str(photos),
+                 "--work", str(root / "candidates"), "--report", str(report),
+                 "--ffmpeg", self.ffmpeg, "--ffprobe", self.ffprobe], root / "frames.log", timeout=3600)
+        except RuntimeError as exc:
+            try:
+                message = json.loads(report.read_text()).get("error")
+            except (OSError, ValueError, AttributeError):
+                message = None
+            if message:
+                raise RuntimeError(message) from exc
+            raise
+        finally:
+            source.unlink(missing_ok=True)  # the selected frames are all the later stages read
+        return json.loads(report.read_text())["selected"]
 
     def convert_spz(self, job_id, ply_path, spz_path):
         """Best-effort SPZ conversion of the validated PLY. Returns the SPZ path, or None to deliver the PLY alone."""
@@ -419,12 +458,14 @@ class Worker:
         stop = threading.Event()
         lease_lost = threading.Event()
         lock = threading.Lock()
+        video = job.get("source_kind") == "video"  # S10: frames come from one video, not uploaded photos
+        frame_count = len(job["images"])
 
         def status(value, error=None, registered=None):
             nonlocal stage
             payload = {"status": value, "error": error}
-            if registered is not None and job["images"]:
-                payload["metrics"] = {"alignment_ratio": registered / len(job["images"])}
+            if registered is not None and frame_count:
+                payload["metrics"] = {"alignment_ratio": registered / frame_count}
             with lock:
                 self.request(f"{job_id}/status", "PATCH", payload, lease)
                 stage = value
@@ -462,6 +503,8 @@ class Worker:
                 root = Path(directory).resolve()
                 photos = root / "photos"
                 photos.mkdir()
+                if video:
+                    frame_count = self.extract_frames(job, root, photos, run)
                 for index, image in enumerate(job["images"]):
                     if lease_lost.is_set():
                         raise RuntimeError("The processing lease was lost.")
@@ -485,7 +528,7 @@ class Worker:
                     run(["ns-process-data", "images", "--data", str(photos), "--output-dir", str(dataset)], root / "alignment.log")
                     transforms = json.loads((dataset / "transforms.json").read_text())
                     registered = len(transforms.get("frames", []))
-                    if registered < max(8, int(len(job["images"]) * 0.6)):
+                    if registered < max(8, int(frame_count * 0.6)):
                         raise RuntimeError("Too few photos could be aligned. Add overlapping views and avoid blur, mirrors, and moving subjects.")
                     status("training", registered=registered)
                     run(["ns-train", "splatfacto", "--data", str(dataset), "--output-dir", str(outputs),
@@ -572,6 +615,8 @@ if __name__ == "__main__":
                         help="Keep the newest 10 validated PLYs whose upload failed")
     parser.add_argument("--env-file", type=Path, help="Read WORKER_TOKEN from a local dotenv file without executing it")
     parser.add_argument("--once", action="store_true", help="Process at most one queued capture and exit")
+    parser.add_argument("--ffmpeg", default="ffmpeg", help="ffmpeg for video captures (S10)")
+    parser.add_argument("--ffprobe", default="ffprobe", help="ffprobe for video captures (S10)")
     args = parser.parse_args()
     token = os.environ.get("WORKER_TOKEN", "")
     if not token and args.env_file:
@@ -604,5 +649,11 @@ if __name__ == "__main__":
     for binary in binaries:
         if not shutil.which(binary):
             parser.error(f"Missing {binary}. Run npm run setup:mac for Brush, or use a CUDA-enabled Nerfstudio environment.")
+    # Photo captures do not need ffmpeg, so its absence is a warning; video jobs then fail with a clear message.
+    missing_video = [name for name in (args.ffmpeg, args.ffprobe) if not shutil.which(name)]
+    if missing_video:
+        print(f"Warning: {' and '.join(missing_video)} not found; video captures will fail until ffmpeg is installed "
+              "(brew install ffmpeg).", flush=True)
     Worker(args.url, token, args.iterations, args.backend, args.brush,
-           args.max_resolution, args.max_splats, recovery_dir=args.recovery_dir).serve(args.once)
+           args.max_resolution, args.max_splats, recovery_dir=args.recovery_dir,
+           ffmpeg=args.ffmpeg, ffprobe=args.ffprobe).serve(args.once)

@@ -33,7 +33,7 @@ Status key: ✅ done · 🟡 partial · ❌ missing (as of 2026-11-16)
 | R1.2 | Accept 12–200 JPG/PNG photos, ≤20 MB each, ≤1 GB total | ✅ |
 | R1.3 | Accept HEIC (iPhone default) and convert automatically | ✅ in-browser JPEG conversion (S6, spec §8.1); EXIF not carried over |
 | R1.4 | Capture directly from a phone camera | ❌ |
-| R1.5 | Accept video and select sharp, overlapping frames | ❌ |
+| R1.5 | Accept video and select sharp, overlapping frames | ✅ S10: one MP4/MOV (≤ 1 GB, ≤ 10 min) via R2 multipart; the worker keeps the sharpest frame per window and drops near-duplicates, 100–200 frames (ADR-0009, spec §7.11). The video is deleted at publish unless kept |
 | R1.6 | Warn about blurry or non-overlapping photos before upload | 🟡 blur, near-duplicates and too-few-usable warnings (S6, spec §8.2); overlap between distinct photos not checked |
 
 ### J2 Upload
@@ -116,5 +116,5 @@ The owner accepted ADRs 0008–0010 on 2026-11-22. Q2 and Q4 follow from those A
 
 1. **Persona and mobile capture** (default, overridable): the memory keeper is the primary persona. Mobile capture (R1.4) and video (R1.5) are in v1 scope as part of M2.
 2. **Preview tier**: yes (ADR-0008). Before shipping, the chosen model's licence must be checked and permit our use. A model that fails the check is not shipped.
-3. **Retention** (default, overridable): source photos stay until the owner deletes the capture (R5.3). A source video is deleted once frames are extracted, unless the owner chooses to keep it (ADR-0009).
+3. **Retention** (default, overridable): source photos stay until the owner deletes the capture (R5.3). A source video is deleted once frames are extracted, unless the owner chooses to keep it (ADR-0009). As built (S10), it is deleted when the capture is published, and a failed capture keeps it for a retry (ADR-0009 implementation status).
 4. **Sharing**: anonymous viewers via opt-in, revocable share tokens (ADR-0010). Source photos and the PLY are never served on share links unless the owner enables it.

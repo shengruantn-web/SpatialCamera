@@ -240,13 +240,16 @@ test('requests never run DDL; the schema comes from migrations, which upgrade le
     const bucket = await fresh.getR2Bucket('BUCKET');
     await bucket.put('legacy/result.ply', splat(7));
     await bucket.put('legacy/images/img', png);
-    assert.deepEqual(await applyMigrations(db), ['0001_api_integrity_hot_path.sql', '0002_spz_result.sql', '0003_attempt_keys_gc.sql', '0004_share_links.sql' /* S8 */]);
+    assert.deepEqual(await applyMigrations(db), ['0001_api_integrity_hot_path.sql', '0002_spz_result.sql', '0003_attempt_keys_gc.sql', '0004_share_links.sql' /* S8 */, '0005_video_source.sql' /* S10 */]);
     assert.deepEqual(await applyMigrations(db), []);
     const indexes = (await db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%'").all()).results.map(r => r.name).sort();
     assert.deepEqual(indexes, ['captures_gc_pending_idx', 'captures_owner_created_idx', 'captures_status_created_idx', 'captures_status_updated_idx', 'images_capture_uploaded_idx', 'shares_capture_created_idx', 'shares_token_hash_idx' /* S8 */]);
     // Migrations are schema-only: no data is backfilled, so legacy rows keep NULL result_key and a 0 counter.
     const raw = await db.prepare("SELECT result_key,uploaded_count,spz_bytes,spz_key,gc_pending FROM captures WHERE id='legacy'").first();
     assert.deepEqual({ ...raw }, { result_key: null, uploaded_count: 0, spz_bytes: null, spz_key: null, gc_pending: 0 });
+    // S10: legacy captures read as photo captures through the column default, not an UPDATE.
+    const source = await db.prepare("SELECT source_kind,video_key,video_upload_id,video_uploaded,keep_video FROM captures WHERE id='legacy'").first();
+    assert.deepEqual({ ...source }, { source_kind: 'photos', video_key: null, video_upload_id: null, video_uploaded: 0, keep_video: 0 });
     const get = (path, method = 'GET') => fresh.dispatchFetch(`http://localhost/api/${path}`, { method, headers: { 'oai-authenticated-user-email': owner } });
     const detail = await (await get('captures/legacy')).json();
     assert.equal(detail.capture.uploaded_count, 1, 'past uploading, uploaded_count reads as image_count');

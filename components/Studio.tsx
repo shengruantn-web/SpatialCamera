@@ -11,6 +11,7 @@ import PrepWarnings from "./PrepWarnings"; // S6 capture prep
 import { useCapturePrep } from "./useCapturePrep"; // S6 capture prep
 import { useDropGuard } from "./useDropGuard"; // S6 capture prep
 import SharePanel from "./SharePanel"; // S8 share links
+import VideoUpload from "./VideoUpload"; // S10 video captures
 
 const sample: SceneSource = { url: "https://sparkjs.dev/assets/splats/butterfly.spz", name: "The butterfly", sample: true };
 type Selected = { file: File; url: string };
@@ -38,6 +39,7 @@ export default function Studio() {
   const [activeId, setActiveId] = useState<string | null>(null);
   const [resume, setResume] = useState<{ id: string; images: ManifestImage[] } | null>(null);
   const [source, setSource] = useState<SceneSource>(sample);
+  const [videoMode, setVideoMode] = useState(false); // S10
   const prep = useCapturePrep(files); // S6 capture prep: HEIC conversion + warn-only checks
   useDropGuard(busy || prep.converting, () => { setDragging(false); if (prep.converting) setError("Wait for the photos being added to finish."); }); // S6: no navigating away on a drop while the dropzone is disabled
   const fileInput = useRef<HTMLInputElement>(null);
@@ -147,7 +149,7 @@ export default function Studio() {
     uploadAbort.current?.abort(new DOMException("Upload cancelled.", "AbortError")); uploadAbort.current = null;
     prep.reset(); // S6: cancel conversions/checks in flight
     files.forEach(item => URL.revokeObjectURL(item.url));
-    setFiles([]); setName(""); setError(""); setResume(null); setActiveId(null); setProgress(0); setBusy(false);
+    setFiles([]); setName(""); setError(""); setResume(null); setActiveId(null); setProgress(0); setBusy(false); setVideoMode(false);
   }
   async function upload() {
     if (!name.trim() || files.length < MIN_IMAGES || busy) return;
@@ -188,7 +190,7 @@ export default function Studio() {
   }
   async function openCapture(capture: Capture) {
     clear(); setActiveId(capture.id); setTab("studio"); wake.current();
-    if (capture.status === "uploading") {
+    if (capture.status === "uploading" && capture.source_kind !== "video") { // S10: a video capture resumes in VideoUpload
       try { const detail = await api<{ images: ManifestImage[] }>(`captures/${capture.id}`); setResume({ id: capture.id, images: detail.images }); setName(capture.name); }
       catch (e) { setError((e as Error).message); }
     }
@@ -283,6 +285,8 @@ export default function Studio() {
   }
   // ── end S7
   const processing = active && active.status !== "uploading" && !busy;
+  const videoResume = active?.status === "uploading" && active.source_kind === "video" ? active : undefined; // S10
+  const sourceLabel = (c: Capture) => c.source_kind === "video" ? "Video" : `${c.image_count} photos`; // S10
   return <>
     <header className="header">
       <button className="brand" onClick={() => setTab("studio")} aria-label="Spatial Camera home"><span className="brand-mark"><Scan size={22} /></span><span>spatial<span className="brand-light">camera</span></span><span className="beta">LAB</span></button>
@@ -294,10 +298,10 @@ export default function Studio() {
       {serverError && <div className="notice error" role="alert"><AlertCircle size={16} />{serverError}<button onClick={() => wake.current()}>Try again</button></div>}
       {tab === "studio" ? <div className="studio-grid">
         <section className="capture-panel" aria-label="Create a capture">
-          <div className="panel-heading"><span className="step-number">01</span><h2>{processing ? "Your capture" : resume ? "Resume your upload" : "Start with your photos"}</h2>{(files.length > 0 || active) && !busy && <button className="icon-button" aria-label="Start a new capture" title="Start a new capture" onClick={clear}><Plus size={18} /></button>}</div>
+          <div className="panel-heading"><span className="step-number">01</span><h2>{processing ? "Your capture" : resume || videoResume ? "Resume your upload" : videoMode ? "Start with a video" : "Start with your photos"}</h2>{(files.length > 0 || active) && !busy && <button className="icon-button" aria-label="Start a new capture" title="Start a new capture" onClick={clear}><Plus size={18} /></button>}</div>
           {processing ? <div className="job-panel">
             <div className={`job-symbol ${active.status === "ready" ? "success" : ""}`}>{active.status === "ready" ? <Check size={28} /> : active.status === "failed" ? <AlertCircle size={28} /> : <Layers size={28} />}</div>
-            <h3>{active.name}</h3><p>{active.image_count} photos · {statusLabels[active.status]}</p>
+            <h3>{active.name}</h3><p>{sourceLabel(active)} · {statusLabels[active.status]}</p>
             {active.status === "failed" ? <div className="notice error">{active.error}</div> : <ol className="stage-list">{stages.map((stage, i) => {
               const current = stages.indexOf(active.status as typeof stages[number]);
               return <li key={stage} className={i < current ? "complete" : i === current ? "current" : ""}><span>{i < current || active.status === "ready" ? <Check size={12} /> : i + 1}</span><div>{statusLabels[stage]}{stage === "queued" && current === 0 && <small>{processor ? "Your capture is in the queue." : "Photos saved. Processing begins when a GPU worker connects."}</small>}</div></li>;
@@ -308,7 +312,7 @@ export default function Studio() {
             {active.status === "ready" && active.spz_bytes ? <p className="privacy-note">The viewer streams a {formatBytes(active.spz_bytes)} SPZ; the PLY is the full-precision archive.</p> : null}
             {active.status === "ready" && <SharePanel key={active.id} captureId={active.id} name={active.name} /> /* S8 share links */}
             <button className="text-button" onClick={clear}>Start another capture <ArrowRight size={15} /></button>
-          </div> : <>
+          </div> : videoMode || videoResume ? <VideoUpload key={videoResume?.id ?? "new"} disabled={!!serverError} resume={videoResume && { id: videoResume.id, name: videoResume.name, bytes: videoResume.video_bytes ?? null, uploaded: !!videoResume.video_uploaded }} onCreated={id => { setActiveId(id); wake.current(); }} onSubmitted={id => { setActiveId(id); setVideoMode(false); wake.current(); }} onCancel={() => setVideoMode(false)} /> /* S10 */ : <>
             <p className="panel-description">One place, from different angles.<br />We’ll put the pieces together.</p>
             {resume && <div className="notice">Reselect the original photos. Uploaded files will be skipped.</div>}
             <input ref={fileInput} type="file" accept="image/jpeg,image/png,image/heic,image/heif,.heic,.heif" multiple className="sr-only" aria-label="Choose capture photos" disabled={busy || prep.converting /* S6 */} onChange={e => { if (e.target.files) void addFiles(e.target.files); e.target.value = ""; }} />
@@ -321,6 +325,7 @@ export default function Studio() {
             <button className="primary" disabled={busy || prep.converting || files.length < MIN_IMAGES || !name.trim() || !!serverError} onClick={upload}>{busy ? <><LoaderCircle size={16} className="spin" /> Uploading photos · {progress}%</> : <><Box size={17} />{resume ? "Resume & create splat" : "Create 3D splat"}<ArrowRight size={17} /></>}</button>
             {busy && <progress value={progress} max={100} aria-label="Upload progress" />}
             <p className="sr-only" aria-live="polite">{busy ? `Uploading photos, ${Math.floor(progress / 25) * 25}%` : ""}</p><p className="privacy-note"><LockKeyhole size={12} /> Your captures stay private.</p>
+            {!files.length && !resume && !busy && <button className="text-button video-switch" onClick={() => setVideoMode(true)}>Or upload one video instead <ArrowRight size={15} /></button> /* S10 */}
           </>}
           <div className="processor-note"><span className={`status-dot ${processor ? "online" : ""}`} /><div>{processor ? "Processor connected" : "Processor not connected"}<small>{processor ? "Captures are processed on the server." : "You can save photos now and process them later."}</small></div></div>
         </section>
@@ -333,7 +338,7 @@ export default function Studio() {
         {captures.length === 0 ? <div className="empty-library"><Scan size={36} strokeWidth={1} /><h3>Your first world starts here.</h3><p>Capture a favorite place. We’ll keep it here for you.</p><button className="text-button" onClick={() => setTab("studio")}>Create your first capture <ArrowRight size={16} /></button></div> : <div className="capture-list">{captures.map(c => {
           const locked = lockReason(c); // S7
           return <div key={c.id} className="capture-item" /* S7: the row plus its rename/delete actions */>
-            <button className="capture-row" onClick={() => void openCapture(c)}><span className={`capture-icon ${c.status === "ready" ? "ready" : ""}`}><Box size={23} strokeWidth={1.4} /></span><span className="capture-info"><strong>{c.name}</strong><small>{c.image_count} photos · {new Date(c.created_at).toLocaleDateString(undefined, { month: "short", day: "numeric" })}</small></span><span className={`status-pill ${c.status}`}>{statusLabels[c.status]}</span><ChevronRight size={17} /></button>
+            <button className="capture-row" onClick={() => void openCapture(c)}><span className={`capture-icon ${c.status === "ready" ? "ready" : ""}`}><Box size={23} strokeWidth={1.4} /></span><span className="capture-info"><strong>{c.name}</strong><small>{sourceLabel(c)} · {new Date(c.created_at).toLocaleDateString(undefined, { month: "short", day: "numeric" })}</small></span><span className={`status-pill ${c.status}`}>{statusLabels[c.status]}</span><ChevronRight size={17} /></button>
             {/* S7: aria-disabled rather than disabled keeps the buttons focusable, so the reason is announced. */}
             <div className="capture-actions">
               {locked && <small id={`lock-${c.id}`} className="capture-lock">{locked}</small>}
@@ -363,7 +368,7 @@ export default function Studio() {
           <div className="manage-actions"><button type="button" className="secondary-button" onClick={closeManage}>Cancel</button><button type="submit" className="primary" aria-busy={managing || undefined}>{managing ? <><LoaderCircle size={16} className="spin" /> Saving</> : "Save name"}</button></div>
         </form> : <>
           <h2 id="manage-title">Delete “{manage.capture.name}”?</h2>
-          <p id="manage-description">Its {manage.capture.image_count} photos and its 3D scene will be permanently deleted. This cannot be undone.</p>
+          <p id="manage-description">Its {manage.capture.source_kind === "video" ? "video" : `${manage.capture.image_count} photos`} and its 3D scene will be permanently deleted. This cannot be undone.</p>
           {manageError && <div className="notice error" role="alert"><AlertCircle size={16} />{manageError}</div>}
           <div className="manage-actions"><button ref={manageCancel} type="button" className="secondary-button" onClick={closeManage}>Cancel</button><button type="button" className="primary danger" aria-busy={managing || undefined} onClick={() => void confirmDelete()}>{managing ? <><LoaderCircle size={16} className="spin" /> Deleting</> : <><Trash2 size={16} /> Delete permanently</>}</button></div>
         </>}

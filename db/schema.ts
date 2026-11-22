@@ -33,6 +33,21 @@ export const captures = sqliteTable("captures", {
   failedAt: integer("failed_at"),
   // Fraction of frames registered by alignment (0..1), reported by the worker.
   alignmentRatio: real("alignment_ratio"),
+  // S10 (ADR-0009): 'photos' (image_count images rows) or 'video' (one MP4/MOV; frames are extracted by
+  // the GPU worker, so image_count stays 0 and there are no images rows).
+  sourceKind: text("source_kind").notNull().default("photos"),
+  // R2 key of the source video (`{id}/video/{nonce}.mp4|mov`), fixed at create. NULL for photo captures and
+  // once the video has been deleted after a published result (unless keep_video).
+  videoKey: text("video_key"),
+  // R2 multipart upload id while a video upload is in flight; NULL before start and after complete/abort.
+  videoUploadId: text("video_upload_id"),
+  // Declared size and type of the source video, frozen at create.
+  videoBytes: integer("video_bytes"),
+  videoMime: text("video_mime"),
+  // 1 once the multipart upload completed with exactly video_bytes bytes.
+  videoUploaded: integer("video_uploaded").notNull().default(0),
+  // Owner opt-in: 1 keeps the source video after the splat is published.
+  keepVideo: integer("keep_video").notNull().default(0),
 }, (t) => [
   index("captures_owner_created_idx").on(t.owner, t.createdAt),
   index("captures_status_created_idx").on(t.status, t.createdAt),

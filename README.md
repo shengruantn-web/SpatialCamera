@@ -9,6 +9,7 @@ A web-first photo-to-Gaussian-splat prototype. Capture photos are stored on the 
 - Warn-only checks before upload: blurry or low-detail photos, near-duplicates, and fewer than 30 usable photos.
 - Persistent capture manifests in D1, image/result storage in R2, and owner-scoped APIs.
 - Resumable uploads: reselect the original files from an incomplete capture.
+- One phone video (MP4/MOV, up to 1 GB) instead of photos (S10). The GPU worker picks 100–200 sharp, distinct frames from it. See "Video captures" below.
 - Rename and delete captures from the library (S7). Delete asks for confirmation, removes the photos, results and records for good, and is refused while a GPU worker holds the capture. Captures are kept until deleted. A very large capture disappears at once and its files are removed by the 5-minute cron; a hidden tombstone record stays for an hour so that late uploads are still refused, then the cron removes it. The cron also sweeps up files left under a capture that no longer exists (see [spec §7.10](docs/specs/capture-pipeline.md)).
 - A durable job queue with atomic claims, worker leases, real stage reporting, and stale-job recovery.
 - Interactive splat viewing, orbit/pan/zoom, rotation, reset, and fullscreen. Finished captures stream as compressed SPZ (about 7× smaller than the PLY) with real download progress, and the full-precision PLY stays available as a download. One WebGL context is reused across scenes.
@@ -37,6 +38,16 @@ Photos are prepared in the browser, in Web Workers, as soon as they are added. T
   - The low-detail or blurry photos, or the extra copies, can be removed in bulk after a confirmation that lists them.
 - Thresholds and how they were calibrated are in [docs/specs/capture-pipeline.md §8](docs/specs/capture-pipeline.md).
 - The code is in `lib/capture-prep/`, `components/useCapturePrep.ts` and `components/PrepWarnings.tsx`.
+
+## Video captures
+
+Choose **Or upload one video instead** to start from a single MP4 or MOV (ADR-0009, spec [§7.11](docs/specs/capture-pipeline.md)). A slow, steady 20–90 second walk around the subject works best.
+
+- The video uploads to R2 in 8 MiB parts, three at a time, each retried on network errors. The limit is 1 GB (128 parts). If the upload is interrupted, open the capture from the library and choose the same file to start again.
+- The GPU worker downloads the video and uses ffmpeg to decode up to 600 candidate frames, upright and at most 1920 px on the long edge. It splits the clip into equal windows and keeps the sharpest frame in each (variance of the Laplacian), then drops frames far blurrier than the clip's median and near-duplicates (64-bit difference hash). The result is 100–200 frames when the clip allows it. Clips longer than 10 minutes, or with fewer than 12 usable frames, fail with a message. The frames then go through the normal photo pipeline.
+- **Retention:** the video is deleted once the capture is `ready` unless you tick **Keep the original video** at upload. A failed capture keeps its video, so you can retry it without uploading again. Deleting the capture always deletes the video. Share links never include it.
+- The worker needs `ffmpeg` and `ffprobe` (`brew install ffmpeg` on a Mac; tested with ffmpeg 8.1). Without them it warns at startup, and only video captures fail. `--ffmpeg` and `--ffprobe` select other binaries.
+- **Deploy note:** an abandoned or un-abortable multipart upload is cleaned up only by R2's default lifecycle rule, which aborts incomplete multipart uploads after 7 days. Keep that rule on the production bucket.
 
 ## Sharing
 
@@ -100,6 +111,8 @@ npm run dev -- --port 3000    # terminal 1: migrates the local D1, then serves t
 npm run worker:mac           # terminal 2: claims captures; keeps the Mac awake during each job
 ```
 
+Video captures also need ffmpeg: `brew install ffmpeg`.
+
 Setup verifies the Brush download and an existing `.local/bin/brush_app` against pinned SHA-256 checksums, and reinstalls on mismatch. It keeps `.dev.vars` at mode 0600. Alignment (`gpu-worker/mac_pipeline.py`) applies EXIF orientation, skips files it cannot read, matches exhaustively up to 100 photos (sequentially above that, retrying exhaustively below 90% registration for sets of up to 300 photos), and rotates the model so up is +Z for the viewer. COLMAP uses every core; set `SPATIAL_COLMAP_THREADS` to limit it. On an idle M1 Pro (16 GB), 64 photos take about 6 minutes to align and 17 minutes to train 7000 steps; a busy machine can take several times longer (see `docs/plan/runs/`). The worker automatically holds `caffeinate -i -w <worker pid>` throughout each job, including downloads and uploads, and terminates/reaps it when the job ends or the worker stops. This replaces the manual `caffeinate -i` wrapper; idle workers may sleep. If caffeinate cannot start, the worker logs once and continues. Forced sleep can still suspend heartbeats: more than 10 minutes asleep expires the lease. Brush runs in the job’s temporary directory, so its `target/` autotune cache is removed with the job. The startup pycolmap availability check does not import it; only the alignment subprocess imports pycolmap, preserving the worker’s signal handlers.
 
 Private hosting may require gateway authentication in addition to the worker token. Configure your host's supported service access; optional JSON `SPATIAL_GATEWAY_HEADERS` are added to worker requests. A worker token does **not** bypass Sites sign-in. Do not make the site public to work around this. A Linux GPU and a working authenticated connection are required to validate actual reconstruction end to end.
@@ -112,13 +125,14 @@ All endpoints require `Authorization: Bearer <WORKER_TOKEN>`. After claiming, se
 | --- | --- | --- |
 | POST | `/api/worker/claim` | Atomically claim the oldest queued capture; returns job or null |
 | GET | `/api/worker/:id/images/:imageId` | Download a source photo |
+| GET | `/api/worker/:id/video` | Video captures (`source_kind: "video"`, `images: []`): download the source video |
 | PATCH | `/api/worker/:id/status` | Heartbeat/stage: aligning → training → exporting, or failed. Optional `metrics: { alignment_ratio }` (0–1) |
 | PUT | `/api/worker/:id/result.spz` | Optional, before `result`: upload the SPZ conversion. Stored with the attempt, published by the PLY PUT |
 | PUT | `/api/worker/:id/result` | Upload a Gaussian PLY; completes the job (and publishes the attempt's SPZ). Safe to retry: a repeat from the lease that completed the job returns 200 |
 
 Each attempt's results are stored under their own keys and published atomically, so a stale attempt can't overwrite a finished scene. Photos can't change after submit. Stale leases are expired by a Cron Trigger every 5 minutes, by the claim path, and when the capture is read. Details are in [the capture pipeline spec](docs/specs/capture-pipeline.md) §7.
 
-The prototype limits captures to 12–200 photos, 20 MB per image, 1 GB total, 90 MB per returned PLY, and 48 MB per SPZ. JPEG/PNG signatures are checked on upload and decoding is checked in the browser; deeper image validation happens in the reconstruction tools. GPU jobs should run in an isolated environment. Large datasets, video extraction, progressive level-of-detail loading (ADR-0007), and camera metadata ingestion are future work.
+The prototype limits captures to 12–200 photos, 20 MB per image, 1 GB total, 90 MB per returned PLY, and 48 MB per SPZ. A video capture is one MP4/MOV of up to 1 GB and 10 minutes. JPEG/PNG signatures are checked on upload and decoding is checked in the browser; deeper image validation happens in the reconstruction tools. GPU jobs should run in an isolated environment. Large datasets, progressive level-of-detail loading (ADR-0007), and camera metadata ingestion are future work.
 
 ## Hosting and architecture
 

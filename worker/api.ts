@@ -1,5 +1,6 @@
 import {
   isGaussianPly, isGzip, isImage, parseSpzHeader, parseWorkerMetrics, validateManifest, validateName, MAX_IMAGE_BYTES, MAX_PLY_BYTES, MAX_SPZ_BYTES,
+  isVideo, validateVideoManifest, videoPartBytes, videoParts, VIDEO_PART_BYTES, VIDEO_TYPES,
 } from "../lib/validation";
 import { handleOwnerShares } from "./share"; // S8
 
@@ -12,6 +13,9 @@ export interface ApiEnv {
 type Job = {
   id: string; owner: string; status: string; lease: string | null; image_count: number; updated_at: number;
   result_key: string | null; spz_key: string | null; spz_bytes: number | null; ready_at: number | null;
+  // S10 (ADR-0009)
+  source_kind: "photos" | "video"; video_key: string | null; video_upload_id: string | null; video_bytes: number | null;
+  video_mime: string | null; video_uploaded: number; keep_video: number;
 };
 type ImageRow = { id: string; name: string; bytes: number; mime: string; uploaded: number; object_key: string | null };
 const active = ["aligning", "training", "exporting"];
@@ -22,8 +26,11 @@ const RETRY_UPLOAD = "The upload was interrupted or could not be stored. Please 
 const STALE_ERROR = "The processor stopped responding. Retry this capture when it reconnects.";
 // Everything the owner may see. Never includes lease, result_key or R2 object keys.
 const publicFields = ["id", "name", "status", "created_at", "updated_at", "image_count", "uploaded_count", "error", "result_bytes",
-  "spz_bytes", "queued_at", "aligning_at", "training_at", "exporting_at", "ready_at", "failed_at", "alignment_ratio"] as const;
-const publicColumns = publicFields.join(",");
+  "spz_bytes", "queued_at", "aligning_at", "training_at", "exporting_at", "ready_at", "failed_at", "alignment_ratio",
+  "source_kind", "video_bytes", "video_uploaded", "keep_video", "video_stored"] as const; // S10
+// S10: `video_stored` is derived, so the video's R2 key never leaves the server.
+const VIDEO_STORED = "(video_key IS NOT NULL AND video_uploaded=1)";
+const publicColumns = publicFields.map(field => field === "video_stored" ? `${VIDEO_STORED} AS video_stored` : field).join(",");
 // Past `uploading` every manifest image is uploaded (I2) and frozen (I5), so `uploaded_count` is
 // `image_count`. Reading it that way keeps rows created before the counter existed correct without a
 // data backfill; while `uploading`, every image PUT recounts it (§7.2).
@@ -31,7 +38,8 @@ const publicColumns = publicFields.join(",");
 // once that attempt publishes, so it reads as null before `ready`.
 const toPublic = (row: Record<string, unknown>) => Object.fromEntries(publicFields.map(field =>
   [field, (field === "uploaded_count" && row.status !== "uploading" ? row.image_count
-    : field === "spz_bytes" && row.status !== "ready" ? null : row[field]) ?? null]));
+    : field === "spz_bytes" && row.status !== "ready" ? null
+    : field === "video_stored" && !("video_stored" in row) ? Number(row.video_key != null && row.video_uploaded === 1) : row[field]) ?? null]));
 const json = (value: unknown, status = 200) => Response.json(value, { status, headers: { "Cache-Control": "no-store" } });
 class ApiError extends Error { constructor(message: string, public status = 400) { super(message); } }
 function fail(message: string, status = 400): never { throw new ApiError(message, status); }
@@ -136,20 +144,30 @@ const deleteAttempt = (bucket: R2Bucket, dir: string, why: string) =>
  * may resubmit between this read and the listing); that attempt's own checks clean them up.
  * Returns true when the capture is clean and its mark was cleared; false when it is not terminal, changed
  * meanwhile, or has more to delete than this budget allowed (it stays marked for the next run).
+ *
+ * S10 (ADR-0009, spec §7.11): a published video capture's source video goes in the same pass unless the
+ * owner chose to keep it: everything under `{id}/video/` (the referenced video and any upload that lost
+ * its commit) or, when kept, everything but the referenced video. The mark update clears `video_key`
+ * in the same statement. A failed capture keeps its video so a retry can extract frames again.
  */
 async function collectCapture(env: Pick<ApiEnv, "DB" | "BUCKET">, id: string, budget: Budget) {
   if (budget.left < GC_MIN_PER_CAPTURE) return false;
   spend(budget);
-  const row = await env.DB.prepare("SELECT status,result_key,spz_key,spz_bytes,updated_at FROM captures WHERE id=?").bind(id)
-    .first<Published & { updated_at: number }>();
+  const row = await env.DB.prepare("SELECT status,result_key,spz_key,spz_bytes,updated_at,source_kind,video_key,keep_video FROM captures WHERE id=?").bind(id)
+    .first<Published & Pick<Job, "source_kind" | "video_key" | "keep_video"> & { updated_at: number }>();
   if (!row || (row.status !== "ready" && row.status !== "failed")) return false;
+  const video = row.status === "ready" && row.source_kind === "video"; // S10
   const keep = new Set([row.status === "ready" ? row.result_key : null, publishedSpzKey(row)].filter(Boolean));
-  // Two in reserve: the mark update below, and recording a failure should the next call throw.
+  // Two in reserve: the mark update below, and recording a failure should the next call throw; S10: two
+  // more for the video prefix's list and delete.
   const more = await deleteUnder(env.BUCKET, `${id}/attempts/`,
-    object => keep.has(object.key) || (row.status === "failed" && object.uploaded.getTime() > row.updated_at), GC_PAGES_PER_CAPTURE, budget, 2);
+    object => keep.has(object.key) || (row.status === "failed" && object.uploaded.getTime() > row.updated_at), GC_PAGES_PER_CAPTURE, budget, video ? 4 : 2);
   if (more) return false;
+  // S10: one page is plenty (the referenced video plus one object per upload that lost its commit).
+  if (video && await deleteUnder(env.BUCKET, `${id}/video/`, object => row.keep_video === 1 && object.key === row.video_key, 1, budget, 2)) return false;
   spend(budget);
-  const cleared = await env.DB.prepare("UPDATE captures SET gc_pending=0 WHERE id=? AND status=? AND updated_at=?").bind(id, row.status, row.updated_at).run();
+  const cleared = await env.DB.prepare(`UPDATE captures SET gc_pending=0${video ? ",video_key=CASE WHEN keep_video=1 THEN video_key END" : ""} WHERE id=? AND status=? AND updated_at=?`)
+    .bind(id, row.status, row.updated_at).run();
   return cleared.meta.changes > 0;
 }
 /** Right after a publish: this capture only, within what is left of the request's subrequests. */
@@ -211,7 +229,15 @@ type PurgeOutcome = "more" | "emptied" | "removed";
  * store under the prefix any more, the bucket is clean for good, and the capture row goes too ("removed").
  * "more" when the budget ran out first.
  */
-async function purgeCapture(env: Pick<ApiEnv, "DB" | "BUCKET">, id: string, since: number, budget: Budget): Promise<PurgeOutcome> {
+async function purgeCapture(env: Pick<ApiEnv, "DB" | "BUCKET">, id: string, since: number, budget: Budget, upload?: VideoUpload): Promise<PurgeOutcome> {
+  // S10: an in-flight video upload is aborted first, so a listing taken after it sees everything the
+  // upload could ever store (no route completes it once the row is `deleting`). A failed abort is only
+  // logged: parts are not objects, and R2 expires incomplete multipart uploads after seven days (§7.11).
+  if (upload?.video_upload_id && upload.video_key) {
+    if (budget.left < 4) return "more";
+    spend(budget);
+    await abortVideoUpload(env.BUCKET, upload.video_key, upload.video_upload_id);
+  }
   // A page needs a list and a delete, and the final statement one more.
   while (budget.left >= 3) {
     const listedAt = Date.now();
@@ -226,7 +252,7 @@ async function purgeCapture(env: Pick<ApiEnv, "DB" | "BUCKET">, id: string, sinc
       await env.DB.batch([images, env.DB.prepare("DELETE FROM captures WHERE id=? AND status='deleting'").bind(id)]);
       return "removed";
     }
-    await env.DB.batch([images, env.DB.prepare("UPDATE captures SET gc_pending=0 WHERE id=? AND status='deleting'").bind(id)]);
+    await env.DB.batch([images, env.DB.prepare("UPDATE captures SET gc_pending=0,video_upload_id=NULL WHERE id=? AND status='deleting'").bind(id)]);
     return "emptied";
   }
   return "more";
@@ -239,12 +265,12 @@ async function purgeCapture(env: Pick<ApiEnv, "DB" | "BUCKET">, id: string, sinc
  */
 export async function purgeDeletedCaptures(env: Pick<ApiEnv, "DB" | "BUCKET">, { budget = { left: PURGE_SUBREQUESTS_PER_RUN } }: { budget?: Budget } = {}) {
   spend(budget);
-  const { results } = await env.DB.prepare("SELECT id,updated_at FROM captures WHERE status='deleting' AND (gc_pending>0 OR updated_at<?) ORDER BY updated_at LIMIT ?")
-    .bind(Date.now() - PURGE_GRACE_MS, PURGE_CAPTURES_PER_RUN).all<{ id: string; updated_at: number }>();
+  const { results } = await env.DB.prepare("SELECT id,updated_at,video_key,video_upload_id FROM captures WHERE status='deleting' AND (gc_pending>0 OR updated_at<?) ORDER BY updated_at LIMIT ?")
+    .bind(Date.now() - PURGE_GRACE_MS, PURGE_CAPTURES_PER_RUN).all<{ id: string; updated_at: number } & VideoUpload>();
   let removed = 0;
-  for (const { id, updated_at: since } of results) {
+  for (const { id, updated_at: since, ...upload } of results) {
     if (budget.left < 3) break;
-    try { if (await purgeCapture(env, id, since, budget) === "removed") removed++; }
+    try { if (await purgeCapture(env, id, since, budget, upload) === "removed") removed++; }
     catch (error) {
       console.error("Capture deletion failed; the next run retries it", id, error);
       if (budget.left < 1) break;
@@ -299,6 +325,13 @@ export async function sweepOrphanedPrefixes(env: Pick<ApiEnv, "DB" | "BUCKET">,
     deleted += doomed.length;
   }
   return deleted;
+}
+// ---- S10: video multipart uploads (spec §7.11) -------------------------------------------------------
+type VideoUpload = Pick<Job, "video_key" | "video_upload_id">;
+/** Never throws: an upload that cannot be aborted now is expired by R2's default seven-day lifecycle rule. */
+async function abortVideoUpload(bucket: R2Bucket, key: string, uploadId: string) {
+  try { await bucket.resumeMultipartUpload(key, uploadId).abort(); }
+  catch (error) { console.error("Could not abort a video upload; R2 expires it after seven days", key, error); }
 }
 /** A writer stored `key` and now commits it: if the commit throws, the object goes with it (§7.10). */
 async function committing<T>(bucket: R2Bucket, key: string, commit: () => Promise<T>) {
@@ -490,6 +523,114 @@ async function objectResponse(env: ApiEnv, key: string, mime: string, name?: str
   } });
 }
 
+type VideoPart = { part_number: unknown; etag: unknown };
+const REPLACED_UPLOAD = "This video upload was replaced or cancelled. Start the upload again.";
+/**
+ * S10 (ADR-0009, spec §7.11): the owner's video, uploaded through R2 multipart. `job` is this owner's
+ * capture (loaded and 404ed by the caller, so another owner never gets here).
+ *   POST   video/upload             start or restart → { upload, part_bytes, parts }
+ *   PUT    video/parts/{n}?upload=  part n, exactly its size → { part_number, etag }
+ *   POST   video/complete?upload=   { parts: [{ part_number, etag }] } for parts 1..N → { ok }
+ *   DELETE video/upload?upload=     abort → { ok }
+ *   GET    video                    the stored video (the owner's copy; shares never serve it)
+ * The upload id lives on the row (`video_upload_id`), the only place R2 lets us keep it. Every upload
+ * writes a key of its own that nothing reads until the commit UPDATE records it, and every write is
+ * conditional on `status='uploading'`, so nothing changes the video once the capture is submitted (I5).
+ */
+async function handleVideo(request: Request, env: ApiEnv, job: Job, rest: string[], url: URL, deadline: number): Promise<Response> {
+  if (job.source_kind !== "video") fail("Video not found.", 404);
+  const route = rest.join("/");
+  const mime = job.video_mime ?? "video/mp4";
+  if (route === "" && request.method === "GET") {
+    if (!job.video_uploaded || !job.video_key) fail("Video not found.", 404);
+    return objectResponse(env, job.video_key, mime, url.searchParams.has("download") ? `spatial-capture.${VIDEO_TYPES[mime] ?? "mp4"}` : undefined);
+  }
+  const bytes = job.video_bytes ?? 0;
+  const parts = videoParts(bytes);
+  const closed = () => fail("This capture no longer accepts a video.", 409);
+  if (route === "complete" && request.method === "POST" && job.video_uploaded && !job.video_upload_id && job.status === "uploading") {
+    await request.body?.cancel().catch(() => {});
+    return json({ ok: true }); // a retried complete whose first response was lost
+  }
+  if (job.status !== "uploading" || job.video_uploaded) closed();
+  if (route === "upload" && request.method === "POST") {
+    const key = `${job.id}/video/${crypto.randomUUID()}.${VIDEO_TYPES[mime] ?? "mp4"}`;
+    let upload: R2MultipartUpload;
+    try { upload = await env.BUCKET.createMultipartUpload(key, { httpMetadata: { contentType: mime } }); }
+    catch { fail(RETRY_UPLOAD, 503); }
+    // Compare-and-swap on the upload this request saw: of two concurrent starts exactly one wins, and a
+    // start that loses to a delete or a completed upload changes nothing.
+    let claimed: D1Result;
+    try {
+      claimed = await env.DB.prepare("UPDATE captures SET video_key=?,video_upload_id=? WHERE id=? AND status='uploading' AND source_kind='video' AND video_uploaded=0 AND video_upload_id IS ?")
+        .bind(key, upload.uploadId, job.id, job.video_upload_id).run();
+    } catch (error) { await abortVideoUpload(env.BUCKET, key, upload.uploadId); throw error; }
+    if (!claimed.meta.changes) {
+      await abortVideoUpload(env.BUCKET, key, upload.uploadId);
+      fail("The video upload changed meanwhile. Please retry.", 409);
+    }
+    // The upload this one replaced (a reload, another tab) can no longer complete through this API.
+    if (job.video_upload_id && job.video_key) await abortVideoUpload(env.BUCKET, job.video_key, job.video_upload_id);
+    return json({ upload: upload.uploadId, part_bytes: VIDEO_PART_BYTES, parts }, 201);
+  }
+  // The remaining routes act on the upload the client started; another tab's (replaced) upload gets 409.
+  if (!job.video_upload_id || !job.video_key || url.searchParams.get("upload") !== job.video_upload_id) fail(REPLACED_UPLOAD, 409);
+  const key = job.video_key;
+  const uploadId = job.video_upload_id;
+  if (route === "upload" && request.method === "DELETE") {
+    const cleared = await env.DB.prepare("UPDATE captures SET video_key=NULL,video_upload_id=NULL WHERE id=? AND status='uploading' AND video_upload_id=?")
+      .bind(job.id, uploadId).run();
+    if (cleared.meta.changes) await abortVideoUpload(env.BUCKET, key, uploadId);
+    return json({ ok: true });
+  }
+  const upload = env.BUCKET.resumeMultipartUpload(key, uploadId);
+  // An R2 call failed: if the row moved on, the upload is gone for good (409); otherwise retry (503).
+  const r2Failed = async (): Promise<never> => {
+    const current = await env.DB.prepare("SELECT status,video_upload_id FROM captures WHERE id=?").bind(job.id).first<Pick<Job, "status" | "video_upload_id">>();
+    if (current?.status !== "uploading" || current.video_upload_id !== uploadId) fail(REPLACED_UPLOAD, 409);
+    fail(RETRY_UPLOAD, 503);
+  };
+  if (rest[0] === "parts" && rest.length === 2 && request.method === "PUT") {
+    const n = /^[1-9]\d{0,5}$/.test(rest[1]) ? Number(rest[1]) : 0;
+    if (n < 1 || n > parts) fail(`Video part numbers run from 1 to ${parts}.`);
+    const expected = videoPartBytes(bytes, n);
+    const declared = request.headers.get("content-length");
+    if (declared !== null && Number(declared) !== expected) fail(`Video part ${n} must be exactly ${expected} bytes.`);
+    const body = await boundedBody(request, expected);
+    if (body.length !== expected) fail(`Video part ${n} must be exactly ${expected} bytes.`);
+    if (n === 1 && !isVideo(body)) fail("This file is not an MP4 or MOV video.");
+    if (Date.now() > deadline) fail(RETRY_UPLOAD, 503); // S7: never store past the request deadline
+    let part: R2UploadedPart;
+    try { part = await upload.uploadPart(n, body); } catch { return r2Failed(); }
+    return json({ part_number: part.partNumber, etag: part.etag });
+  }
+  if (route === "complete" && request.method === "POST") {
+    const input = await readJson(request) as { parts?: VideoPart[] } | null;
+    const list = input && typeof input === "object" ? input.parts : undefined;
+    if (!Array.isArray(list) || list.length !== parts || list.some((part, index) => !part || typeof part !== "object" ||
+      part.part_number !== index + 1 || typeof part.etag !== "string" || !part.etag || part.etag.length > 256)) fail(`Send all ${parts} video parts, in order, with their etags.`);
+    if (Date.now() > deadline) fail(RETRY_UPLOAD, 503); // completing is what stores the object
+    let object: R2Object;
+    try { object = await upload.complete(list.map(part => ({ partNumber: part.part_number as number, etag: part.etag as string }))); }
+    catch { return r2Failed(); }
+    if (object.size !== bytes) {
+      await env.BUCKET.delete(key).catch(error => console.error("Could not delete a mis-sized video", key, error));
+      await env.DB.prepare("UPDATE captures SET video_key=NULL,video_upload_id=NULL WHERE id=? AND video_upload_id=?").bind(job.id, uploadId).run();
+      fail("The uploaded video does not match its declared size. Start the upload again.");
+    }
+    // S7: committing() deletes the object if the UPDATE throws; a commit that loses (deleted, replaced)
+    // deletes it too. The key is this upload's own, so no other upload's object is ever touched.
+    const committed = await committing(env.BUCKET, key, () => env.DB.prepare("UPDATE captures SET video_uploaded=1,video_upload_id=NULL WHERE id=? AND status='uploading' AND video_upload_id=? AND video_key=?")
+      .bind(job.id, uploadId, key).run());
+    if (!committed.meta.changes) {
+      await env.BUCKET.delete(key).catch(error => console.error("Could not delete an uncommitted video", key, error));
+      closed();
+    }
+    return json({ ok: true });
+  }
+  fail("Not found.", 404);
+}
+
 export async function handleApi(request: Request, env: ApiEnv): Promise<Response> {
   const deadline = Date.now() + REQUEST_DEADLINE_MS; // S7: stores after this are refused (§7.10)
   try {
@@ -515,10 +656,14 @@ export async function handleApi(request: Request, env: ApiEnv): Promise<Response
         // Expire dead attempts first so their captures can be resubmitted.
         await sweepStaleLeases(env.DB, now);
         const lease = crypto.randomUUID();
-        const job = await env.DB.prepare("UPDATE captures SET status='aligning',lease=?,spz_key=NULL,spz_bytes=NULL,gc_pending=1,aligning_at=?,updated_at=? WHERE id=(SELECT id FROM captures WHERE status='queued' ORDER BY created_at LIMIT 1) AND status='queued' RETURNING id,image_count").bind(lease, now, now).first();
+        const job = await env.DB.prepare("UPDATE captures SET status='aligning',lease=?,spz_key=NULL,spz_bytes=NULL,gc_pending=1,aligning_at=?,updated_at=? WHERE id=(SELECT id FROM captures WHERE status='queued' ORDER BY created_at LIMIT 1) AND status='queued' RETURNING id,image_count,source_kind,video_bytes,video_mime")
+          .bind(lease, now, now).first<{ id: string; image_count: number; source_kind: string; video_bytes: number | null; video_mime: string | null }>();
         if (!job) return json({ job: null });
+        const { video_bytes: bytes, video_mime: mime, ...claimed } = job;
+        // S10: a video job has no images; the worker downloads `worker/{id}/video` and extracts frames.
+        if (job.source_kind === "video") return json({ job: { ...claimed, lease, images: [], video: { bytes, mime } } });
         const images = await env.DB.prepare("SELECT id,name,mime FROM images WHERE capture_id=? AND uploaded=1 ORDER BY id").bind(job.id).all();
-        return json({ job: { ...job, lease, images: images.results } });
+        return json({ job: { ...claimed, lease, images: images.results } });
       }
       const job = await env.DB.prepare("SELECT * FROM captures WHERE id=?").bind(path[2] ?? "").first<Job>();
       const lease = request.headers.get("x-job-lease") ?? "";
@@ -547,6 +692,11 @@ export async function handleApi(request: Request, env: ApiEnv): Promise<Response
         const image = await env.DB.prepare("SELECT * FROM images WHERE id=? AND capture_id=? AND uploaded=1").bind(path[4] ?? "", job.id).first<ImageRow>();
         if (!image) fail("Photo not found.", 404);
         return objectResponse(env, imageKey(job.id, image), image.mime);
+      }
+      // S10: the source video, to the attempt holding the lease (never to shares or other owners).
+      if (path[3] === "video" && path.length === 4 && request.method === "GET") {
+        if (job.source_kind !== "video" || !job.video_uploaded || !job.video_key) fail("Video not found.", 404);
+        return objectResponse(env, job.video_key, job.video_mime ?? "video/mp4");
       }
       if (path[3] === "status" && request.method === "PATCH") {
         const input = await readJson(request);
@@ -637,7 +787,17 @@ export async function handleApi(request: Request, env: ApiEnv): Promise<Response
       return json({ captures: results });
     }
     if (path.length === 2 && request.method === "POST") {
-      const input = validateManifest(await readJson(request));
+      const body = await readJson(request);
+      // S10 (ADR-0009): one MP4/MOV instead of a photo manifest. The 12–200 photo rule is the photo path's.
+      if (body && typeof body === "object" && (body as Record<string, unknown>).source === "video") {
+        let input: ReturnType<typeof validateVideoManifest>;
+        try { input = validateVideoManifest(body); } catch (error) { fail(error instanceof Error ? error.message : "Invalid capture."); }
+        const id = crypto.randomUUID();
+        await env.DB.prepare("INSERT INTO captures (id,owner,name,status,created_at,updated_at,image_count,source_kind,video_bytes,video_mime,keep_video) VALUES (?,?,?,'uploading',?,?,0,'video',?,?,?)")
+          .bind(id, owner, input.name, now, now, input.video.bytes, input.video.mime, input.keepVideo ? 1 : 0).run();
+        return json({ id, video: { part_bytes: VIDEO_PART_BYTES, parts: videoParts(input.video.bytes) } }, 201);
+      }
+      const input = validateManifest(body);
       const id = crypto.randomUUID();
       const images = input.images.map((image, index) => ({ ...image, id: `${String(index).padStart(4, "0")}-${crypto.randomUUID()}` }));
       // D1 batch is transactional: a partial manifest cannot enter the queue.
@@ -677,16 +837,17 @@ export async function handleApi(request: Request, env: ApiEnv): Promise<Response
     // went stale was expired just above, so a dead attempt never blocks a delete.
     if (path.length === 3 && request.method === "DELETE") {
       // For a `deleting` row, gc_pending=1 means objects may remain; updated_at starts the grace window.
-      const started = await env.DB.prepare("UPDATE captures SET status='deleting',lease=NULL,gc_pending=1,updated_at=? WHERE id=? AND owner=? AND status IN ('uploading','queued','ready','failed')")
-        .bind(now, id, owner).run();
-      if (!started.meta.changes) {
+      // S10: RETURNING hands the purge an in-flight video upload to abort (the row keeps it until emptied).
+      const started = await env.DB.prepare("UPDATE captures SET status='deleting',lease=NULL,gc_pending=1,updated_at=? WHERE id=? AND owner=? AND status IN ('uploading','queued','ready','failed') RETURNING video_key,video_upload_id")
+        .bind(now, id, owner).first<VideoUpload>();
+      if (!started) {
         const current = await loadOwned();
         if (current && active.includes(current.status)) fail("This capture is being processed. You can delete it once it is ready or has failed.", 409);
         fail("Capture not found.", 404);
       }
       try {
         // Done for the owner once the prefix is empty; the tombstone row goes after the grace window.
-        if (await purgeCapture(env, id, now, { left: PURGE_SUBREQUESTS_INLINE }) !== "more") return json({ deleted: true });
+        if (await purgeCapture(env, id, now, { left: PURGE_SUBREQUESTS_INLINE }, started) !== "more") return json({ deleted: true });
       } catch (error) { console.error("Capture deletion will be finished by the cron", id, error); }
       // Already hidden everywhere; the cron removes what is left within a few minutes.
       return json({ deleted: true, pending: true }, 202);
@@ -694,7 +855,8 @@ export async function handleApi(request: Request, env: ApiEnv): Promise<Response
     // S8: share links (ADR-0010, spec §7.9). `job` was loaded for this owner, so another owner never
     // reaches its links (404 above); worker/share.ts scopes every query to this capture.
     if (path[3] === "shares") return handleOwnerShares(request, env, job, path.slice(4), now);
-    if (path[3] === "images") {
+    if (path[3] === "video") return await handleVideo(request, env, job, path.slice(4), url, deadline); // S10
+    if (path[3] === "images" && job.source_kind !== "video") {
       const image = await env.DB.prepare("SELECT * FROM images WHERE id=? AND capture_id=?").bind(path[4] ?? "", id).first<ImageRow>();
       if (!image) fail("Photo not found.", 404);
       if (request.method === "GET" && image.uploaded) return objectResponse(env, imageKey(id, image), image.mime);
@@ -726,12 +888,13 @@ export async function handleApi(request: Request, env: ApiEnv): Promise<Response
     if (path[3] === "submit" && request.method === "POST") {
       if (!["uploading", "failed"].includes(job.status)) return json({ status: job.status });
       // One conditional statement keeps I2 atomic. Per-attempt metrics reset so they describe this run.
-      const result = await env.DB.prepare("UPDATE captures SET status='queued',error=NULL,lease=NULL,queued_at=?,aligning_at=NULL,training_at=NULL,exporting_at=NULL,failed_at=NULL,alignment_ratio=NULL,updated_at=? WHERE id=? AND status IN ('uploading','failed') AND image_count=(SELECT COUNT(*) FROM images WHERE capture_id=captures.id AND uploaded=1)")
+      // S10: a video capture is complete once its multipart upload completed (and its video still exists).
+      const result = await env.DB.prepare("UPDATE captures SET status='queued',error=NULL,lease=NULL,queued_at=?,aligning_at=NULL,training_at=NULL,exporting_at=NULL,failed_at=NULL,alignment_ratio=NULL,updated_at=? WHERE id=? AND status IN ('uploading','failed') AND (CASE WHEN source_kind='video' THEN video_uploaded=1 AND video_key IS NOT NULL AND video_upload_id IS NULL ELSE image_count=(SELECT COUNT(*) FROM images WHERE capture_id=captures.id AND uploaded=1) END)")
         .bind(now, now, id).run();
       if (!result.meta.changes) {
         const current = await loadOwned();
         if (current && !["uploading", "failed"].includes(current.status)) return json({ status: current.status });
-        fail("Upload all photos before starting reconstruction.", 409);
+        fail(job.source_kind === "video" ? "Upload the video before starting reconstruction." : "Upload all photos before starting reconstruction.", 409);
       }
       return json({ status: "queued" });
     }

@@ -29,6 +29,42 @@ export function validateManifest(value: unknown): { name: string; images: ImageI
   if (total > MAX_TOTAL_BYTES) throw new Error("Keep the complete capture under 1 GB.");
   return { name, images };
 }
+// ---- S10 (ADR-0009): video source ------------------------------------------------------------------
+/**
+ * One phone clip per capture. 1 GiB matches the photo path's total and covers about 2.5 min of 4K60 HEVC
+ * or 8 min of 1080p30 H.264 (spec §7.11); the worker additionally refuses clips over 10 minutes.
+ */
+export const MAX_VIDEO_BYTES = 1024 * 1024 * 1024;
+/**
+ * Multipart part size. R2 needs at least 5 MiB for every part but the last; 8 MiB keeps one buffered
+ * part well inside Worker memory and bounds a 1 GiB video to 128 parts (R2 allows 10,000).
+ */
+export const VIDEO_PART_BYTES = 8 * 1024 * 1024;
+export const MAX_VIDEO_PARTS = Math.ceil(MAX_VIDEO_BYTES / VIDEO_PART_BYTES);
+export const VIDEO_TYPES: Record<string, "mp4" | "mov"> = { "video/mp4": "mp4", "video/quicktime": "mov" };
+export type VideoInput = { name: string; bytes: number; mime: string };
+export const videoParts = (bytes: number) => Math.ceil(bytes / VIDEO_PART_BYTES);
+/** Exact size of part `n` (1-based) of a video of `bytes` bytes: every part is full except the last. */
+export const videoPartBytes = (bytes: number, n: number) =>
+  n < videoParts(bytes) ? VIDEO_PART_BYTES : bytes - VIDEO_PART_BYTES * (videoParts(bytes) - 1);
+export function validateVideoManifest(value: unknown): { name: string; video: VideoInput; keepVideo: boolean } {
+  if (!value || typeof value !== "object") throw new Error("Invalid capture.");
+  const input = value as Record<string, unknown>;
+  const name = validateName(input.name);
+  const video = input.video as VideoInput | undefined;
+  if (!video || typeof video !== "object" || Array.isArray(video)) throw new Error("Choose one MP4 or MOV video.");
+  if (typeof video.name !== "string" || !video.name.length || video.name.length > 255) throw new Error("Invalid video filename.");
+  if (typeof video.mime !== "string" || !Object.hasOwn(VIDEO_TYPES, video.mime)) throw new Error("Use an MP4 or MOV video.");
+  if (!Number.isSafeInteger(video.bytes) || video.bytes < 16 || video.bytes > MAX_VIDEO_BYTES) throw new Error("Keep the video under 1 GB.");
+  if (input.keep_video !== undefined && typeof input.keep_video !== "boolean") throw new Error("Invalid capture.");
+  return { name, video: { name: video.name, bytes: video.bytes, mime: video.mime }, keepVideo: input.keep_video === true };
+}
+/** ISO base media (MP4) and QuickTime files are a sequence of atoms; the first is one of these. */
+const VIDEO_ATOMS = new Set(["ftyp", "wide", "free", "skip", "mdat", "moov", "pnot"]);
+export function isVideo(bytes: Uint8Array) {
+  return bytes.length >= 8 && VIDEO_ATOMS.has(String.fromCharCode(...bytes.subarray(4, 8)));
+}
+// ---- end S10 ----------------------------------------------------------------------------------------
 export function isImage(bytes: Uint8Array, mime: string) {
   if (mime === "image/jpeg") return bytes.length > 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
   return bytes.length > 8 && [137, 80, 78, 71, 13, 10, 26, 10].every((b, i) => bytes[i] === b);

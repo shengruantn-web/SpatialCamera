@@ -1179,5 +1179,140 @@ raise AssertionError('stage must be interrupted')
         process.wait.assert_called_once_with()
 
 
+class VideoJobTests(unittest.TestCase):
+    """S10 (ADR-0009): a video job extracts frames as a stage, then runs the photo pipeline unchanged."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.client = worker.Worker("http://localhost", "t" * 32, 7000, backend="brush",
+                                    ffmpeg="/opt/ff/ffmpeg", ffprobe="/opt/ff/ffprobe")
+        self.job = {"id": "capture", "lease": "lease", "images": [], "source_kind": "video",
+                    "video": {"bytes": 4, "mime": "video/quicktime"}}
+        self.patches = []
+        self.stages = []
+        self.stack = contextlib.ExitStack()
+        self.addCleanup(self.stack.close)
+        self.output = self.stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+        self.stack.enter_context(mock.patch.object(worker.sys, "platform", "linux"))
+        self.stack.enter_context(mock.patch.object(worker.tempfile, "mkdtemp", side_effect=self.mkdtemp))
+
+    def mkdtemp(self, **kwargs):
+        job = self.root / "job"
+        job.mkdir()
+        return str(job)
+
+    def urlopen(self, request, timeout):
+        if request.method == "PATCH":
+            self.patches.append(json.loads(request.data))
+        if request.method == "GET" and "/images/" in request.full_url:
+            raise AssertionError("a video job has no photos to download")
+        return io.BytesIO(b"{}")
+
+    def download(self, path, destination, lease, expected=None):
+        self.downloaded = (path, destination, lease, expected)
+        destination.write_bytes(b"\0\0\0\x20")
+
+    def stage(self, frames=10, registered=8, extraction_error=None):
+        def run(command, log_path, stage, lost, **kwargs):
+            root = log_path.parent
+            self.stages.append((stage, Path(command[1]).name, kwargs))
+            if Path(command[1]).name == "video_frames.py":
+                self.assertEqual(stage, "aligning")
+                self.assertEqual(command[command.index("--ffmpeg") + 1], "/opt/ff/ffmpeg")
+                self.assertEqual(command[command.index("--ffprobe") + 1], "/opt/ff/ffprobe")
+                self.assertTrue((root / "source.mov").exists())
+                report = Path(command[command.index("--report") + 1])
+                if extraction_error:
+                    report.write_text(json.dumps({"error": extraction_error}))
+                    raise RuntimeError("Aligning failed. Try sharper photos with more overlap and a still subject.")
+                photos = Path(command[3])
+                for index in range(frames):
+                    (photos / f"frame_{index:05d}.jpg").write_bytes(b"jpg")
+                report.write_text(json.dumps({"selected": frames}))
+            elif stage == "aligning":
+                self.assertFalse((root / "source.mov").exists(), "the video is gone once frames are extracted")
+                self.assertEqual(len(list((root / "photos").iterdir())), frames)
+                (root / "dataset").mkdir()
+                (root / "dataset/alignment.json").write_text(json.dumps({"registered": registered}))
+                (root / "dataset/transforms.json").write_text(json.dumps({"frames": [{}] * registered}))
+            elif stage == "training" and self.client.backend == "nerfstudio":
+                (root / "outputs").mkdir()
+                (root / "outputs/config.yml").write_text("checkpoint")
+            else:
+                (root / "export").mkdir(exist_ok=True)
+                (root / "export/result.ply").write_bytes(ply_bytes())
+        return run
+
+    def process(self, which=lambda name: f"/found/{name}", **stage):
+        with mock.patch.object(worker.urllib.request, "urlopen", side_effect=self.urlopen), \
+                mock.patch.object(worker.shutil, "which", side_effect=which), \
+                mock.patch.object(self.client, "download", side_effect=self.download) as download, \
+                mock.patch.object(self.client, "run", side_effect=self.stage(**stage)) as run:
+            self.client.process(self.job)
+        return download, run
+
+    def test_frames_are_extracted_as_a_stage_and_the_ratio_uses_the_frame_count(self):
+        download, _ = self.process(frames=10, registered=8)
+        self.assertEqual(self.downloaded[0], "capture/video")
+        self.assertEqual(self.downloaded[2:], ("lease", 4))
+        self.assertEqual([(stage, name) for stage, name, _ in self.stages],
+                         [("aligning", "video_frames.py"), ("aligning", "mac_pipeline.py"), ("training", "undistorted")])
+        self.assertEqual(self.stages[0][2].get("timeout"), 3600)
+        training = [body for body in self.patches if body["status"] == "training"]
+        self.assertEqual(training, [{"status": "training", "error": None, "metrics": {"alignment_ratio": 0.8}}])
+        self.assertIn("Completed capture", self.output.getvalue())
+        self.assertFalse((self.root / "job").exists())
+
+    def test_missing_ffmpeg_fails_only_the_video_job_with_a_clear_message(self):
+        download, run = self.process(which=lambda name: None if "/ff/" in name else name)
+        download.assert_not_called()
+        run.assert_not_called()
+        failed = self.patches[-1]
+        self.assertEqual(failed["status"], "failed")
+        self.assertIn("ffmpeg and ffprobe are not installed on the GPU worker", failed["error"])
+
+    def test_extraction_errors_reach_the_owner(self):
+        self.process(extraction_error="This video is longer than ten minutes. Trim it.")
+        self.assertEqual(self.patches[-1], {"status": "failed", "error": "This video is longer than ten minutes. Trim it."})
+        self.assertEqual(len(self.stages), 1)
+
+    def test_nerfstudio_threshold_counts_extracted_frames(self):
+        self.client.backend = "nerfstudio"
+        self.process(frames=20, registered=11)  # 11 < 60% of 20
+        self.assertEqual(self.patches[-1]["status"], "failed")
+        self.assertIn("Too few photos could be aligned", self.patches[-1]["error"])
+
+    def test_download_streams_to_a_file_and_checks_the_size(self):
+        body = b"v" * (3 * 1024 * 1024 + 5)
+        seen = []
+        def urlopen(request, timeout):
+            seen.append(request)
+            return io.BytesIO(body)
+        destination = self.root / "video.mp4"
+        with mock.patch.object(worker.urllib.request, "urlopen", side_effect=urlopen), \
+                mock.patch.dict(os.environ, {"SPATIAL_GATEWAY_HEADERS": "{}"}):
+            self.client.download("capture/video", destination, "lease", len(body))
+            self.assertEqual(destination.read_bytes(), body)
+            with self.assertRaisesRegex(RuntimeError, "incomplete"):
+                self.client.download("capture/video", destination, "lease", len(body) + 1)
+        self.assertEqual(seen[0].full_url, "http://localhost/api/worker/capture/video")
+        self.assertEqual(seen[0].get_header("X-job-lease"), "lease")
+        self.assertEqual(seen[0].get_header("Authorization"), "Bearer " + "t" * 32)
+
+    def test_startup_only_warns_when_ffmpeg_is_missing(self):
+        with mock.patch.object(worker.importlib.util, "find_spec", return_value=object()), \
+                mock.patch.object(worker.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")), \
+                mock.patch.object(sys, "argv", [worker.__file__, "--backend", "brush", "--once", "--recovery-dir", str(self.root)]), \
+                mock.patch.dict(os.environ, {"WORKER_TOKEN": "t" * 32, "SPATIAL_GATEWAY_HEADERS": "{}"}), \
+                mock.patch.object(worker.signal, "signal"), \
+                mock.patch.object(worker.shutil, "which", side_effect=lambda name: None if name.startswith("ff") else "/fake/brush"), \
+                mock.patch.object(worker.urllib.request, "urlopen", return_value=io.BytesIO(b'{"job": null}')):
+            runpy.run_path(worker.__file__, run_name="__main__")
+        self.assertIn("Warning: ffmpeg and ffprobe not found; video captures will fail", self.output.getvalue())
+        self.assertIn("No queued captures.", self.output.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

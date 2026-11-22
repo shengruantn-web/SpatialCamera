@@ -1,7 +1,7 @@
 # Spec: Capture state machine and worker protocol
 
-**Status**: draft — documents behaviour at commit `5d136af` plus the Brush backend, updated for shipment S2 (API integrity + hot path: T2, T3, T6, T7 and the API half of T1), S5 (SPZ delivery, §7.6), S8 (share links and embeds, §7.9) and S7 (rename, delete and retention, §7.10). §5 lists known defects; §6 lists the target changes; §7 describes storage and concurrency as implemented.
-**Related**: PRD R2–R3, ADR-0001, ADR-0003, ADR-0005, ADR-0007
+**Status**: draft — documents behaviour at commit `5d136af` plus the Brush backend, updated for shipment S2 (API integrity + hot path: T2, T3, T6, T7 and the API half of T1), S5 (SPZ delivery, §7.6), S8 (share links and embeds, §7.9), S7 (rename, delete and retention, §7.10) and S10 (video input, §7.11). §5 lists known defects; §6 lists the target changes; §7 describes storage and concurrency as implemented.
+**Related**: PRD R1.5, R2–R3, ADR-0001, ADR-0003, ADR-0005, ADR-0007, ADR-0009
 
 ## 1. Capture states
 
@@ -43,10 +43,15 @@ All routes require the `oai-authenticated-user-email` header (or `LOCAL_DEV` on 
 |---|---|---|
 | GET | `/api/health` | `{ storage, processor }`; processor = worker seen in last 90 s |
 | GET | `/api/captures` | Owner's latest 100 captures |
-| POST | `/api/captures` | Create manifest `{ name, images[{name,bytes,mime}] }` → `{ id, images[{id,…}] }` |
-| GET | `/api/captures/:id` | Capture + image upload flags. The capture includes `uploaded_count` (the stored counter while `uploading`; `image_count` in every later state, which I2 and I5 make exact), the stage timestamps (`queued_at` … `failed_at`, ms or null), `alignment_ratio` (0–1 or null), `result_bytes` (the PLY) and `spz_bytes` (the SPZ, or null when the result is PLY-only). Never includes `lease`, `result_key` or object keys |
+| POST | `/api/captures` | Create manifest `{ name, images[{name,bytes,mime}] }` → `{ id, images[{id,…}] }`. S10: or one video, `{ name, source: "video", keep_video?, video: {name,bytes,mime} }` → `{ id, video: { part_bytes, parts } }` (§7.11) |
+| GET | `/api/captures/:id` | Capture + image upload flags. The capture includes `uploaded_count` (the stored counter while `uploading`; `image_count` in every later state, which I2 and I5 make exact), the stage timestamps (`queued_at` … `failed_at`, ms or null), `alignment_ratio` (0–1 or null), `result_bytes` (the PLY) and `spz_bytes` (the SPZ, or null when the result is PLY-only). Never includes `lease`, `result_key` or object keys. S10 adds `source_kind` (`photos`\|`video`), `video_bytes`, `video_uploaded`, `keep_video` and `video_stored`, which is 1 while the source video exists. `video_stored` is derived, so the key never leaves the server |
 | PUT | `/api/captures/:id/images/:imageId` | Upload bytes; must match manifest size and JPEG/PNG signature. Only while `uploading`; a PUT that loses a race with submit returns 409 and changes nothing (§7.2) |
-| POST | `/api/captures/:id/submit` | `uploading`/`failed` → `queued` |
+| POST | `/api/captures/:id/submit` | `uploading`/`failed` → `queued`. A video capture needs a completed video upload (§7.11) |
+| POST | `/api/captures/:id/video/upload` | S10: start (or restart) the video's R2 multipart upload → 201 `{ upload, part_bytes, parts }`. Only while `uploading` and before an upload has completed. A restart aborts the upload it replaces |
+| PUT | `/api/captures/:id/video/parts/:n?upload=` | S10: part `n` (1…`parts`), exactly `part_bytes` long (the last part is the remainder) → `{ part_number, etag }`. Part 1 must start with an MP4/MOV box. 409 if `upload` is not the row's current upload |
+| POST | `/api/captures/:id/video/complete?upload=` | S10: `{ parts: [{ part_number, etag }] }` for every part, in order → `{ ok }`. Commits the video (I5). A retry after success returns 200 |
+| DELETE | `/api/captures/:id/video/upload?upload=` | S10: abort the current upload → `{ ok }` |
+| GET | `/api/captures/:id/video[?download]` | S10: the stored video, for its owner only. 404 once it has been deleted (§7.11) |
 | GET | `/api/captures/:id/scene?v=<ready_at>` | What the viewer loads when `ready`: the SPZ if the attempt published one, otherwise the PLY. `X-Splat-Format: spz\|ply`. Cached `private, max-age=31536000, immutable` only when `v` equals the capture's `ready_at` (a resubmit changes it, so the URL changes); otherwise `private, no-store` (§7.6) |
 | GET | `/api/captures/:id/result.ply[?download]` | The PLY archive (full precision) when `ready`, read from `result_key`; `?download` adds `Content-Disposition: attachment` |
 | PATCH | `/api/captures/:id` | (S7) Rename: `{ name }`, trimmed, 1–80 characters (the create rule, `validateName`), else 400 → `{ capture }`. Any state but `deleting`; `updated_at` is not changed (it is the lease clock) |
@@ -72,7 +77,8 @@ All routes require `Authorization: Bearer <WORKER_TOKEN>` (≥ 32 chars, compare
 
 | Method | Route | Purpose |
 |---|---|---|
-| POST | `/api/worker/claim` | Atomically claim oldest `queued` → `{ job: { id, image_count, lease, images[] } \| null }` |
+| POST | `/api/worker/claim` | Atomically claim oldest `queued` → `{ job: { id, image_count, source_kind, lease, images[], video? } \| null }`. S10: a video job has `images: []` and `video: { bytes, mime }` |
+| GET | `/api/worker/:id/video` | S10: download the source video (lease holder only) |
 | GET | `/api/worker/:id/images/:imageId` | Download a source photo |
 | PATCH | `/api/worker/:id/status` | `{ status, error?, metrics? }` — heartbeat (same stage), advance one stage, or `failed`. Optional `metrics: { alignment_ratio }` (number 0–1, else 400; unknown keys ignored; a missing value keeps the stored one) |
 | PUT | `/api/worker/:id/result.spz` | Optional, before `result`: SPZ, `Content-Length` 1 B–48 MB, stored under its own key in the attempt's folder and recorded on the row, but **not** published. Same lease, freshness and 409 rules as `result`; a repeat after `ready` returns 200 and changes nothing; 400 for a body that is not a complete, valid SPZ (§7.6) |
@@ -146,6 +152,7 @@ Mac backend notes (S4; measured in `docs/plan/runs/2026-11-22-mac-dryrun.md` and
 | `{id}/attempts/{attempt}/result.{uuid}.spz` | Worker `result.spz` PUT, a fresh key per request | `captures.spz_key`, served only when the capture is `ready` and `spz_bytes` is non-null |
 | `{id}/attempts/{attempt}/result.ply`, `result.spz` | Results published before per-request keys | `result_key`; the SPZ beside it when `spz_key` is NULL and `spz_bytes` is not |
 | `{id}/result.ply` | Pre-S2 results only | Fallback when `result_key` is NULL |
+| `{id}/video/{uuid}.mp4\|mov` | S10: owner multipart upload, with a fresh key each time an upload starts | `captures.video_key` once `video_uploaded=1` (§7.11) |
 
 Leases are bearer secrets, so they never appear in object keys. No key under `attempts/` is ever written twice, so a key, once referenced by the row, names fixed bytes (C2). Unreferenced keys left by failed or superseded attempts are collected (§7.7).
 
@@ -185,7 +192,7 @@ The same sweep also clears `lease` on up to 100 `failed` rows that still hold on
 
 The API runs no DDL. The schema lives in `db/schema.ts`; `npm run db:generate` emits SQL into `drizzle/`, which the build packages into `dist/.openai/drizzle` for the host to apply. Locally, `node db/migrate.mjs` (run automatically as `predev`, or as `npm run db:migrate:local`) applies pending migrations to the `vinext dev` database (`.wrangler/state/v3`), recording them in `d1_migrations` (the table `wrangler d1 migrations apply` uses). Before applying a pending migration it checks whether the tables, columns and indexes it creates already exist (`sqlite_master`, `PRAGMA table_info`). If all of them do, as in a pre-migration database whose tables came from the old runtime DDL, or one where the SQL was run with `wrangler d1 execute --file`, it records the migration as applied without running it. If only some exist, it stops with a message that lists what is present and what is missing. Migration `0001_api_integrity_hot_path` adds `uploaded_count`, `result_key`, the stage timestamps, `alignment_ratio`, `images.object_key` and the four indexes.
 
-Migrations are schema-only, as the host requires: no `UPDATE` backfills or seed data, and an added column's default is a constant. The code is correct on un-backfilled legacy rows instead: a NULL `result_key` on a `ready` row reads `{id}/result.ply` (§7.1); `uploaded_count` is recounted on every image upload (§7.2) and reported as `image_count` once past `uploading`; and the sweep clears leftover leases (§7.4). `uploaded_count` is maintained on upload, so list and detail reads need no per-row COUNT. Migration `0002_spz_result` (S5) adds the nullable `captures.spz_bytes`; existing rows read NULL, meaning "PLY only", which is exactly what they are. Migration `0003_attempt_keys_gc` (S5 review) adds the nullable `captures.spz_key` (NULL on older rows, which then read the SPZ beside their PLY, §7.1), `gc_pending` (integer, default 0) and the index `captures_gc_pending_idx (gc_pending, updated_at)`. Rows that predate it are never marked, so their leftover attempts, if any, stay until a later claim of the same capture.
+Migrations are schema-only, as the host requires: no `UPDATE` backfills or seed data, and an added column's default is a constant. The code is correct on un-backfilled legacy rows instead: a NULL `result_key` on a `ready` row reads `{id}/result.ply` (§7.1); `uploaded_count` is recounted on every image upload (§7.2) and reported as `image_count` once past `uploading`; and the sweep clears leftover leases (§7.4). `uploaded_count` is maintained on upload, so list and detail reads need no per-row COUNT. Migration `0002_spz_result` (S5) adds the nullable `captures.spz_bytes`; existing rows read NULL, meaning "PLY only", which is exactly what they are. Migration `0003_attempt_keys_gc` (S5 review) adds the nullable `captures.spz_key` (NULL on older rows, which then read the SPZ beside their PLY, §7.1), `gc_pending` (integer, default 0) and the index `captures_gc_pending_idx (gc_pending, updated_at)`. Rows that predate it are never marked, so their leftover attempts, if any, stay until a later claim of the same capture. Migration `0005_video_source` (S10) adds these columns to `captures` (§7.11): `source_kind` (text, default `'photos'`, so every existing row is a photo capture); the nullable `video_key`, `video_upload_id`, `video_bytes` and `video_mime`; and `video_uploaded` and `keep_video` (integer, default 0).
 
 The worker’s alignment ratio is persisted by the status PATCH using `alignment_ratio=COALESCE(?,alignment_ratio)`. The training transition supplies it for both backends; heartbeat and exporting requests omit it and preserve the value. A new submission clears it (§3).
 
@@ -315,6 +322,59 @@ The budget is a fixed `ORPHAN_SWEEP_SUBREQUESTS` = 5, so one orphaned prefix (�
 **Rename** is `UPDATE captures SET name=? WHERE id=? AND owner=? AND status!='deleting' RETURNING …`; it is not progress, so `updated_at` is unchanged and polling picks it up through the name in `pollSignature`.
 
 **UI.** Each library row has rename and delete buttons (`aria-label` naming the capture). While the capture is processed (`aligning`/`training`/`exporting`), or this tab is uploading it, they are `aria-disabled` and say "Available once processing finishes" (or "…the upload finishes"); they stay focusable so the reason is announced. Rename opens a modal dialog with a labelled input (Enter saves, Esc cancels); delete opens a confirmation that names the capture and says it cannot be undone, with Cancel focused. Focus returns to the triggering button, or to the list heading after a delete; outcomes are announced in a polite status region.
+
+### 7.11 Video input (S10, ADR-0009, PRD R1.5)
+
+A capture is either photos or one video, recorded in `captures.source_kind`. A video capture has no `images` rows (`image_count` is 0). The GPU worker turns the video into frames and then runs the unchanged photo pipeline.
+
+**Bounds.**
+- Formats: MP4 (`video/mp4`) or MOV (`video/quicktime`), from 16 B to 1 GiB (`MAX_VIDEO_BYTES`).
+- MIME types: when the file type is empty, the browser sends `video/quicktime` for a `.mov` name and `video/mp4` for `.mp4` or `.m4v`.
+- Parts: `VIDEO_PART_BYTES` is 8 MiB, because R2 needs at least 5 MiB for every part but the last. A capture therefore has at most 128 parts, and the last part is the remainder.
+- Contents: the server checks only part 1's first box type (`ftyp`, `moov`, `mdat`, `wide`, `free`, `skip` or `pnot`), not the codec. A file ffmpeg cannot decode fails the job with a message instead.
+- Length: clips over ten minutes fail at extraction.
+
+**Upload.** Workers cannot hold a 1 GB request body (ADR-0002), so the video goes through R2 multipart. Each part passes through the API. There are no presigned URLs, so no R2 credentials or CORS rules are needed.
+1. `POST /api/captures` with `source: "video"` stores `video_bytes`, `video_mime` and `keep_video`. The part count follows from the size and is fixed from then on.
+2. `POST video/upload` creates a multipart upload under a fresh key `{id}/video/{uuid}.{ext}`. It records `video_key` and `video_upload_id` with a compare-and-swap on the upload id this request read (`video_upload_id IS ?`, `status='uploading'`, `video_uploaded=0`).
+   - Of two concurrent starts, exactly one wins. The loser aborts its own upload and gets 409.
+   - The winner aborts the upload it replaced, from another tab or before a reload. That upload's later parts and its completion get 409.
+3. `PUT video/parts/:n?upload=` checks the part's size exactly, against both `Content-Length` and the body it read. It stores nothing past the request deadline (§7.10). The client sends 3 parts at a time and retries each with backoff. A part may be sent again, and R2 keeps the last copy.
+4. `POST video/complete?upload=` requires every part's etag, in order. R2's `complete` creates the object.
+   - The object's size is checked against `video_bytes`. If it differs, the object is deleted.
+   - Otherwise one conditional UPDATE (`status='uploading' AND video_upload_id=? AND video_key=?`) sets `video_uploaded=1` and clears the upload id.
+   - If that UPDATE loses or throws, the object is deleted (`committing()`, §7.10).
+   - If the first response was lost, a retried complete sees `video_uploaded=1` and returns 200.
+5. `POST submit` accepts a video capture only when `video_uploaded=1`, `video_key` is set and no upload is open; this is I2's counterpart. Every write requires `uploading`, so no route writes the video after submit, and I5 holds for videos.
+
+The upload id lives only on the row, because a Worker cannot list a bucket's open multipart uploads in R2. To resume an interrupted upload, the owner opens the capture from the library and picks the same file again. The UI checks the size, then starts a new upload that replaces the old one. A completed upload that was never submitted only needs submit.
+
+**Abandoned uploads.** Parts are not objects, so the prefix listings in §7.7 and §7.10 cannot see them. A restart and a delete each abort the open upload; a failed abort is logged and never retried. **The bucket relies on R2's default lifecycle rule, which aborts incomplete multipart uploads after 7 days.** That rule is the backstop for failed aborts and for uploads that were simply abandoned. Keep it (or an equivalent) on the production bucket. Without it, abandoned parts accumulate and are billed as storage, with no other path to clean them up.
+
+**Deletion (S7).** The delete's flip returns `video_key` and `video_upload_id` (`RETURNING`). `purgeCapture` aborts that upload before its first listing, at a cost of one subrequest, and only starts when 4 remain. No route completes an upload once the row is `deleting`, so that listing sees every object the upload could still produce. The cron's purge reads the same columns, and emptying a tombstone clears `video_upload_id`. The completed video lives under `{id}/`, so the purge and the orphan sweep already cover it.
+
+**Worker stage.** Claim returns a video job as `{ …, source_kind: "video", images: [], video: { bytes, mime } }`. While the capture is `aligning`, the worker's `extract_frames` (`gpu-worker/worker.py`) does three things:
+1. It streams `GET /api/worker/:id/video` to `source.mov` or `source.mp4` in the job folder and checks its size.
+2. It runs `gpu-worker/video_frames.py` as a stage subprocess: in its own process group, with the heartbeat, a 1 h timeout, and output in `frames.log`. The script:
+   - reads the duration and frame rate with ffprobe;
+   - decodes candidates with ffmpeg at min(source fps, 600 / duration) fps, auto-rotated to the display orientation and scaled to at most 1920 px on the long edge;
+   - scores each candidate for sharpness (variance of the Laplacian on a grayscale copy at most 640 px wide) and computes a 64-bit dHash;
+   - cuts the clip into equal windows and keeps the sharpest candidate of each, then drops picks blurrier than a fraction of the median and near-duplicates of the previous pick;
+   - runs three passes, strictest first: (150 windows, 0.35 × median, Hamming distance ≤ 4), then (200, 0.2, ≤ 2), then (200, 0, identical frames only). It stops at the first pass that keeps at least 100 frames; otherwise it uses the pass that kept the most.
+
+   The output is therefore 100–200 frames when the clip allows it, and never more than 200. Fewer than 12 frames fails the job with a message for the owner.
+3. It deletes the downloaded video and aligns `photos/frame_00000.jpg…` exactly as for a photo capture. `alignment_ratio` and the registration floor (`max(8, 0.6 × n)`) count the selected frames.
+
+A worker without ffmpeg or ffprobe warns at start-up and fails only video jobs ("…not installed on the GPU worker. Install ffmpeg…"); photo jobs are unaffected. `--ffmpeg` and `--ffprobe` choose the binaries.
+
+**Retention (deviation from ADR-0009).** ADR-0009 says the video is deleted once frames are extracted. Instead, it is deleted when the capture is published:
+- Attempt collection (§7.7) deletes everything under `{id}/video/` for a `ready` video capture, or everything but `video_key` when `keep_video=1`. It runs right after the `result` PUT, or otherwise from the cron. It clears `video_key` in the same statement as `gc_pending` and reserves 2 more subrequests for this.
+- A failed capture keeps its video, so the owner can retry without uploading it again.
+- A capture the owner deletes loses its video along with everything else.
+
+Deleting at extraction would need a new call from the worker to the API, and a failed alignment or training run would then need a fresh upload. `video_stored` tells the UI whether the video still exists. The owner chooses `keep_video` at upload ("Keep the original video") and cannot change it afterwards in this shipment.
+
+**Shares.** No share route serves the video. The public routes (§7.9) serve only the scene, the PLY download and `info`, and the share query (`SHARED_SELECT`) reads no video column. Only two routes read `video_key`: the owner's `GET video`, behind the owner lookup, and the worker's `GET :id/video`, for the lease holder.
 
 ## 8. Client-side preparation (S6, R1.3, R1.6)
 

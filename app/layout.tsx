@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import "./globals.css";
 import "./share.css"; // S8 share links
+import "./video.css"; // S10 video captures
 
 export const metadata: Metadata = {
   title: "Spatial Camera — Places worth keeping",
