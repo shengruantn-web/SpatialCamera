@@ -1,8 +1,8 @@
 # ADR-0009: Accept video input and select frames on the worker
 
 **Date**: 2026-11-16
-**Status**: proposed
-**Deciders**: project owner (pending)
+**Status**: accepted (2026-11-22)
+**Deciders**: project owner (accepted 2026-11-22)
 
 ## Context
 

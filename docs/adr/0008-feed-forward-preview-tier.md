@@ -1,8 +1,8 @@
 # ADR-0008: Add a feed-forward preview tier before optimisation-based training
 
 **Date**: 2026-11-16
-**Status**: proposed
-**Deciders**: project owner (pending)
+**Status**: accepted (2026-11-22)
+**Deciders**: project owner (accepted 2026-11-22)
 
 ## Context
 

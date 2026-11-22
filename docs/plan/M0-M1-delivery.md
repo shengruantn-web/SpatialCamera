@@ -1,4 +1,4 @@
-# Delivery plan: M0 "Prove the loop" + M1 "Fast to view"
+# Delivery plan: M0–M4
 
 **Owner**: orchestrator (Claude Opus 5.5) · **Started**: 2026-11-22 · **Branch**: `m0-m1-delivery` (local commits only; no push without approval)
 **Source of truth**: [PRD](../PRD.md), [capture-pipeline spec](../specs/capture-pipeline.md), [ADRs](../adr/README.md)
@@ -26,10 +26,27 @@ Every shipment also requires: `npm run typecheck`, `npm run lint`, `npm test` an
 | S4 | Mac end-to-end proof (G2) | Claude | `setup:mac` works; a public photo set (≥ 30 photos) reaches `ready` via local dev server + `worker:mac`; screenshot of the result in the viewer; D7 resolved (fixed or confirmed fine); timings recorded in a run log |
 | S5 | Fast to view (G5) | Codex + Claude | Worker uploads SPZ (+ PLY archive); viewer loads SPZ with `onProgress`, one renderer reused; uploads 4-way concurrent; polling backs off when idle; size of S4 scene measured before/after |
 
-## Not in scope here (needs owner decision or hardware)
+## M2–M4 (approved 2026-11-22: ADRs 0008–0010 accepted, PRD §9 resolved)
 
-- CUDA/Nerfstudio validation — no NVIDIA GPU on this machine; needs a Linux GPU or RunPod access.
-- M2–M4 (HEIC/video/preview tier/sharing) — PRD open questions 1–4 and ADRs 0008–0010 await acceptance.
+| Goal | Outcome | Refs |
+|---|---|---|
+| G6 Easier capture | iPhone photos (HEIC), phone camera capture, and video all work; bad photos flagged before upload | M2, R1.3–R1.6, ADR-0009 |
+| G7 Instant preview | A labelled preview appears before the refined result, from a model whose licence permits our use | M3, R3.7, ADR-0008 |
+| G8 Keep and share | Rename and delete captures (deleting removes the R2 objects); opt-in, revocable share links and embeds that never expose source photos | M4, R5.3, R5.4, ADR-0010 |
+
+| # | Shipment | Wave | Definition of done |
+|---|---|---|---|
+| S6 | HEIC + pre-upload checks (R1.3, R1.6) | 1 (now; client only) | HEIC/HEIF converted to JPEG in the browser before upload (lazy-loaded decoder; EXIF orientation kept). Blur check (variance of Laplacian on a downscaled copy) and near-duplicate check (perceptual hash) warn without blocking. Unit tests for the pure functions |
+| S7 | Rename/delete + retention (R5.3) | 2 (after S5) | Owner can rename and delete. Delete is refused while leased. It removes D1 rows and every R2 object under the capture prefix (images, attempts, archives), in bounded batches. Miniflare tests |
+| S8 | Share links + embed (ADR-0010) | 2 (after S5) | `shares` table (hashed 128-bit token, revoked_at) via a schema-only migration. Owner creates and revokes links. `/s/:token` read-only viewer + SPZ only; `/s/:token/embed` iframe view. Never source photos or PLY unless the owner opts in. Cache headers, rate limit, view count. Miniflare tests, including a revoked token returning 404 immediately |
+| S9 | Phone camera capture (R1.4) | 3 | `capture` input plus an in-page guided shooting mode on mobile (shot counter, overlap hint). Works in iOS Safari and Android Chrome (checked with device emulation) |
+| S10 | Video input (ADR-0009) | 3 | Upload of one MP4/MOV through R2 multipart, `source_kind` column. Worker extracts frames with ffmpeg and picks the sharpest per window, dropping near-duplicates, 100–200 frames. Video deleted after extraction unless the owner keeps it. Worker + API tests; one real phone-style clip processed end to end on the Mac |
+| S11 | Preview tier (ADR-0008) | 3, gated | Licence and feasibility report first. If a model passes: `previewing` stage + `preview.spz` with per-attempt keys, labelled "Preview" in the UI, refine continues after. Validated end to end only where a CUDA GPU is available; otherwise shipped behind a worker flag with protocol tests and the gap stated |
+
+## Not in scope here (needs hardware or owner decision)
+
+- CUDA/Nerfstudio validation and the S11 model run: no NVIDIA GPU on this machine. Needs a Linux GPU or RunPod access.
+- WebXR (R5.5) and the v1 metric targets (PRD §5) remain open.
 
 ## Status log
 

@@ -1,13 +1,13 @@
 # Spatial Camera — Product Requirements (DRAFT)
 
 **Status**: draft, reconstructed from `README.md`, the code at commit `5d136af`, and the 2026-11-16 progress review. Items marked **[OPEN]** need a product owner decision.
-**Last updated**: 2026-11-16
+**Last updated**: 2026-11-22
 
 ## 1. Problem
 
 People want to keep a place or object "as it felt", not as a flat photo. Gaussian splatting can turn ordinary photos into an explorable 3D scene, but today it needs a CUDA machine, command-line tools, and expertise in capture technique. Most casual captures fail silently at camera alignment.
 
-## 2. Target users **[OPEN]**
+## 2. Target users
 
 | Persona | Need | Priority |
 |---|---|---|
@@ -51,7 +51,7 @@ Status key: ✅ done · 🟡 partial · ❌ missing (as of 2026-11-16)
 | R3.4 | Report real stages: aligning → training → exporting | ✅ |
 | R3.5 | Actionable failure messages; one-click retry | ✅ |
 | R3.6 | Retries reuse completed stages and never discard a finished splat | ❌ |
-| R3.7 | Fast preview tier (feed-forward) before refined result **[OPEN]** | ❌ |
+| R3.7 | Fast preview tier (feed-forward) before refined result (ADR-0008) | ❌ |
 
 ### J4 View
 | ID | Requirement | Status |
@@ -110,9 +110,11 @@ Status key: ✅ done · 🟡 partial · ❌ missing (as of 2026-11-16)
 | M3 Instant preview | Feed-forward preview tier (ADR-0008) | Preview < 2 min |
 | M4 Share | Delete/rename, share links, embeds | Opt-in sharing live |
 
-## 9. Open questions
+## 9. Open questions (resolved 2026-11-22)
 
-1. Who is the primary persona, and is mobile-first capture in scope for v1?
-2. Is the feed-forward preview worth a second model to operate and license?
-3. Retention: how long are source photos kept after a successful splat?
-4. Does sharing require anonymous viewers, or signed-in viewers only?
+The owner accepted ADRs 0008–0010 on 2026-11-22. Q2 and Q4 follow from those ADRs. Q1 and Q3 adopt this PRD's working assumptions and can be overridden.
+
+1. **Persona and mobile capture** (default, overridable): the memory keeper is the primary persona. Mobile capture (R1.4) and video (R1.5) are in v1 scope as part of M2.
+2. **Preview tier**: yes (ADR-0008). Before shipping, the chosen model's licence must be checked and permit our use. A model that fails the check is not shipped.
+3. **Retention** (default, overridable): source photos stay until the owner deletes the capture (R5.3). A source video is deleted once frames are extracted, unless the owner chooses to keep it (ADR-0009).
+4. **Sharing**: anonymous viewers via opt-in, revocable share tokens (ADR-0010). Source photos and the PLY are never served on share links unless the owner enables it.
