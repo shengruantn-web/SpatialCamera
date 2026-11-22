@@ -6,6 +6,7 @@ import { ArrowUpRight, ArrowRight, Plus, Scan, Images, X, Check, ChevronRight, C
 import SplatViewer, { type SceneSource } from "./SplatViewer";
 import { type Capture, stages, statusLabels } from "../lib/types";
 import { MAX_IMAGE_BYTES, MAX_IMAGES, MAX_TOTAL_BYTES, MIN_IMAGES } from "../lib/validation";
+import { hasActiveCapture, nextPollDelay, pollSignature, POLL_MIN_MS, putWithRetry, runPool, UPLOAD_CONCURRENCY } from "../lib/client";
 
 const sample: SceneSource = { url: "https://sparkjs.dev/assets/splats/butterfly.spz", name: "The butterfly", sample: true };
 type Selected = { file: File; url: string };
@@ -38,22 +39,52 @@ export default function Studio() {
   const guideRef = useRef<HTMLDialogElement>(null);
   const active = captures.find(c => c.id === activeId);
   const totalBytes = files.reduce((sum, item) => sum + item.file.size, 0);
+  const wake = useRef<() => void>(() => {});
   const refresh = useCallback(async () => {
     try {
       const [list, health] = await Promise.all([api<{ captures: Capture[] }>("captures"), api<{ processor: boolean }>("health")]);
       setCaptures(list.captures); setProcessor(health.processor); setServerError("");
-    } catch (e) { setServerError((e as Error).message); }
+      return { signature: pollSignature(list.captures, health.processor), active: hasActiveCapture(list.captures) };
+    } catch (e) {
+      setServerError((e as Error).message);
+      return { signature: `error:${(e as Error).message}`, active: true }; // keep checking until the server answers
+    }
   }, []);
-  // Initial asynchronous fetch and subsequent polling synchronize server-owned state.
-  // eslint-disable-next-line react-hooks/set-state-in-effect
-  useEffect(() => { refresh(); const timer = setInterval(refresh, 5000); return () => clearInterval(timer); }, [refresh]);
+  // Adaptive polling of server-owned state: every 2 s after a change, backing off to 20 s while nothing
+  // changes, paused while the tab is hidden, and stopped once no capture is in flight. `wake` (user
+  // actions, tab focus) refreshes at once and resets the backoff.
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let delay = POLL_MIN_MS;
+    let last = "";
+    let running = false;
+    let stopped = false;
+    async function tick() {
+      clearTimeout(timer); timer = undefined;
+      if (running) return;
+      running = true;
+      const { signature, active } = await refresh();
+      running = false;
+      if (stopped) return;
+      delay = nextPollDelay(delay, signature !== last); last = signature;
+      if (active && !document.hidden) timer = setTimeout(tick, delay);
+    }
+    wake.current = () => { last = ""; void tick(); };
+    const onVisible = () => { if (!document.hidden) wake.current(); };
+    document.addEventListener("visibilitychange", onVisible);
+    void tick();
+    return () => { stopped = true; clearTimeout(timer); document.removeEventListener("visibilitychange", onVisible); wake.current = () => {}; };
+  }, [refresh]);
   useEffect(() => { filesRef.current = files; }, [files]);
   useEffect(() => () => filesRef.current.forEach(item => URL.revokeObjectURL(item.url)), []);
   useEffect(() => { if (guide) guideRef.current?.showModal(); else guideRef.current?.close(); }, [guide]);
   const activeStatus = active?.status;
   const activeName = active?.name;
   const readyId = active?.id;
-  const displaySource = useMemo(() => activeStatus === "ready" ? { name: activeName!, url: `/api/captures/${readyId}/result.ply` } : source, [readyId, activeStatus, activeName, source]);
+  const readyAt = active?.ready_at;
+  // The scene route serves the compact SPZ when the worker delivered one (else the PLY); `v` names the
+  // published version, so the browser may cache it as immutable.
+  const displaySource = useMemo(() => activeStatus === "ready" ? { name: activeName!, url: `/api/captures/${readyId}/scene?v=${readyAt}` } : source, [readyId, readyAt, activeStatus, activeName, source]);
   useEffect(() => {
     const prevent = (e: BeforeUnloadEvent) => { e.preventDefault(); };
     if (busy) window.addEventListener("beforeunload", prevent);
@@ -87,22 +118,26 @@ export default function Studio() {
       const manifest = resume ?? await api<{ id: string; images: ManifestImage[] }>("captures", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name, images: files.map(({ file }) => ({ name: file.name, bytes: file.size, mime: file.type })) }) });
       setResume(manifest); setActiveId(manifest.id);
       const latest = await api<{ images: ManifestImage[] }>(`captures/${manifest.id}`);
-      let done = latest.images.filter((image: ManifestImage) => image.uploaded).length;
-      setProgress(Math.round(done / manifest.images.length * 100));
-      for (const image of latest.images as ManifestImage[]) {
-        if (image.uploaded) continue;
+      // Progress counts bytes of photos the server has confirmed, so it never runs ahead of storage.
+      const total = latest.images.reduce((sum, image) => sum + image.bytes, 0) || 1;
+      let done = latest.images.reduce((sum, image) => sum + (image.uploaded ? image.bytes : 0), 0);
+      setProgress(Math.round(done / total * 100));
+      const pending = latest.images.filter(image => !image.uploaded).map(image => {
         const selected = files.find(({ file }) => file.name === image.name && file.size === image.bytes);
         if (!selected) throw new Error(`Reselect the original photo: ${image.name}`);
-        await api(`captures/${manifest.id}/images/${image.id}`, { method: "PUT", body: selected.file, headers: { "Content-Type": image.mime } });
-        done++; setProgress(Math.round(done / manifest.images.length * 100));
-      }
-      await api(`captures/${manifest.id}/submit`, { method: "POST" }); await refresh();
+        return { image, file: selected.file };
+      });
+      await runPool(pending, UPLOAD_CONCURRENCY, async ({ image, file }) => {
+        await putWithRetry(`/api/captures/${manifest.id}/images/${image.id}`, file, image.mime);
+        done += image.bytes; setProgress(Math.round(done / total * 100));
+      });
+      await api(`captures/${manifest.id}/submit`, { method: "POST" }); await refresh(); wake.current();
       files.forEach(item => URL.revokeObjectURL(item.url)); setFiles([]); setResume(null);
     } catch (e) { setError((e as Error).message); await refresh(); }
     finally { setBusy(false); }
   }
   async function openCapture(capture: Capture) {
-    clear(); setActiveId(capture.id); setTab("studio");
+    clear(); setActiveId(capture.id); setTab("studio"); wake.current();
     if (capture.status === "uploading") {
       try { const detail = await api<{ images: ManifestImage[] }>(`captures/${capture.id}`); setResume({ id: capture.id, images: detail.images }); setName(capture.name); }
       catch (e) { setError((e as Error).message); }
@@ -110,7 +145,7 @@ export default function Studio() {
   }
   async function retry() {
     if (!active) return; setBusy(true); setError("");
-    try { await api(`captures/${active.id}/submit`, { method: "POST" }); await refresh(); }
+    try { await api(`captures/${active.id}/submit`, { method: "POST" }); wake.current(); }
     catch (e) { setError((e as Error).message); } finally { setBusy(false); }
   }
   const processing = active && active.status !== "uploading" && !busy;
@@ -122,7 +157,7 @@ export default function Studio() {
     </header>
     <main>
       <section className="intro"><div><div className="eyebrow"><span className="orange-dot" /> FROM PHOTOGRAPHS TO PRESENCE</div><h1>{tab === "studio" ? <>Places worth <em>keeping.</em></> : <>Your little <em>worlds.</em></>}</h1></div><p>{tab === "studio" ? <>Turn a set of photos into a world you can explore.<br />Capture the details. Keep the feeling.</> : <>Every capture, in one place.<br />Return whenever you like.</>}</p></section>
-      {serverError && <div className="notice error" role="alert"><AlertCircle size={16} />{serverError}<button onClick={refresh}>Try again</button></div>}
+      {serverError && <div className="notice error" role="alert"><AlertCircle size={16} />{serverError}<button onClick={() => wake.current()}>Try again</button></div>}
       {tab === "studio" ? <div className="studio-grid">
         <section className="capture-panel" aria-label="Create a capture">
           <div className="panel-heading"><span className="step-number">01</span><h2>{processing ? "Your capture" : resume ? "Resume your upload" : "Start with your photos"}</h2>{(files.length > 0 || active) && !busy && <button className="icon-button" aria-label="Start a new capture" title="Start a new capture" onClick={clear}><Plus size={18} /></button>}</div>
@@ -135,7 +170,8 @@ export default function Studio() {
             })}</ol>}
             {error && <div className="notice error" role="alert">{error}</div>}
             {active.status === "failed" && <button className="primary" onClick={retry}><RotateCcw size={16} /> Retry reconstruction</button>}
-            {active.status === "ready" && <a className="primary" href={`/api/captures/${active.id}/result.ply?download`}><Download size={16} /> Download splat</a>}
+            {active.status === "ready" && <a className="primary" href={`/api/captures/${active.id}/result.ply?download`}><Download size={16} /> Download PLY{active.result_bytes ? ` · ${formatBytes(active.result_bytes)}` : ""}</a>}
+            {active.status === "ready" && active.spz_bytes ? <p className="privacy-note">The viewer streams a {formatBytes(active.spz_bytes)} SPZ; the PLY is the full-precision archive.</p> : null}
             <button className="text-button" onClick={clear}>Start another capture <ArrowRight size={15} /></button>
           </div> : <>
             <p className="panel-description">One place, from different angles.<br />We’ll put the pieces together.</p>
