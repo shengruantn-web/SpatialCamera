@@ -8,6 +8,13 @@
       "when": 1790759175895,
       "tag": "0000_parched_spencer_smythe",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1795355857445,
+      "tag": "0001_api_integrity_hot_path",
+      "breakpoints": true
     }
   ]
 }

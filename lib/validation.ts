@@ -32,3 +32,12 @@ export function isGaussianPly(header: string) {
     ["x", "y", "z", "opacity", "scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3", "f_dc_0", "f_dc_1", "f_dc_2"].every(
       key => new RegExp(`property float ${key}\\r?\\n`).test(header));
 }
+/** Optional `metrics` in a worker status PATCH. Unknown keys are ignored; known keys are range-checked. */
+export function parseWorkerMetrics(value: unknown): { alignmentRatio: number | null } {
+  if (value === undefined || value === null) return { alignmentRatio: null };
+  if (typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid worker metrics.");
+  const ratio = (value as Record<string, unknown>).alignment_ratio;
+  if (ratio === undefined || ratio === null) return { alignmentRatio: null };
+  if (typeof ratio !== "number" || !Number.isFinite(ratio) || ratio < 0 || ratio > 1) throw new Error("Invalid worker metrics: alignment_ratio must be a number from 0 to 1.");
+  return { alignmentRatio: ratio };
+}

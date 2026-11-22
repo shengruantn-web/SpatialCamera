@@ -12,6 +12,8 @@ const { d1, r2 } = hostingConfig;
 const localBindingConfig = {
   main: "./worker/index.ts",
   compatibility_flags: ["nodejs_compat"],
+  // Stale-lease sweep (worker/index.ts `scheduled`). The claim path also sweeps.
+  triggers: { crons: ["*/5 * * * *"] },
   d1_databases: d1
     ? [
         {

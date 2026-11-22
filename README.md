@@ -20,7 +20,7 @@ Node 22.13+ required (Node 24 recommended).
 
 ```sh
 npm install
-npm run dev -- --host 127.0.0.1 --port 3000
+npm run dev -- --host 127.0.0.1 --port 3000   # predev applies pending drizzle/ migrations to the local D1 first
 ```
 
 The Cloudflare development environment persists D1/R2 data under `.wrangler/`. `.dev.vars` supplies Worker bindings locally; `.env.example` documents the same keys. For a fresh checkout create `.dev.vars` with `LOCAL_DEV="true"` and optionally `WORKER_TOKEN="your-strong-random-token"`. The checked-in example token is empty. Never set LOCAL_DEV on a hosted site. Hosted requests require the trusted Sites `oai-authenticated-user-email` header.
@@ -58,14 +58,16 @@ All endpoints require `Authorization: Bearer <WORKER_TOKEN>`. After claiming, se
 | --- | --- | --- |
 | POST | `/api/worker/claim` | Atomically claim the oldest queued capture; returns job or null |
 | GET | `/api/worker/:id/images/:imageId` | Download a source photo |
-| PATCH | `/api/worker/:id/status` | Heartbeat/stage: aligning → training → exporting, or failed |
-| PUT | `/api/worker/:id/result` | Upload a Gaussian PLY; completes the job |
+| PATCH | `/api/worker/:id/status` | Heartbeat/stage: aligning → training → exporting, or failed. Optional `metrics: { alignment_ratio }` (0–1) |
+| PUT | `/api/worker/:id/result` | Upload a Gaussian PLY; completes the job. Safe to retry: a repeat from the lease that completed the job returns 200 |
+
+Each attempt's result is stored under its own key and published atomically, so a stale attempt can't overwrite a finished scene. Photos can't change after submit. Stale leases are expired by a Cron Trigger every 5 minutes, by the claim path, and when the capture is read. Details are in [the capture pipeline spec](docs/specs/capture-pipeline.md) §7.
 
 The prototype limits captures to 12–200 photos, 20 MB per image, 1 GB total, and 90 MB per returned PLY. JPEG/PNG signatures are checked on upload and decoding is checked in the browser; deeper image validation happens in the reconstruction tools. GPU jobs should run in an isolated environment. Large datasets, video extraction, compressed SPZ delivery, camera metadata ingestion, deletion controls, and public sharing are future work.
 
 ## Hosting and architecture
 
-The Sites vinext starter produces a Cloudflare Worker. `.openai/hosting.json` declares DB (D1) and BUCKET (R2). `worker/api.ts` handles capture and worker routes; the remainder goes through vinext. Drizzle migrations live in `drizzle/`; runtime initialization also creates missing tables with single-statement prepared queries.
+The Sites vinext starter produces a Cloudflare Worker. `.openai/hosting.json` declares DB (D1) and BUCKET (R2). `worker/api.ts` handles capture and worker routes; the remainder goes through vinext. The schema comes only from the Drizzle migrations in `drizzle/` (edit `db/schema.ts`, then `npm run db:generate`). The build packages them for the host, and the API never runs DDL. Locally, `npm run dev` applies them first through its `predev` hook (idempotent, and it creates `.wrangler/` on a fresh checkout); `npm run db:migrate:local` runs the same step by itself. The Worker also exports a `scheduled` handler for the stale-lease Cron Trigger, configured in `vite.config.ts`.
 
 Cloudflare hosts the web app, metadata, and files; Gaussian-splat training runs on the separate CUDA host. Browser requests cannot choose worker commands or file paths. User-facing responses never include worker tokens or leases.
 
