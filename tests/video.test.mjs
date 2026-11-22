@@ -66,6 +66,11 @@ async function start(id, headers) {
   return (await response.json()).upload;
 }
 const putPart = (id, upload, n, bytes, headers) => request(`captures/${id}/video/parts/${n}?upload=${encodeURIComponent(upload)}`, 'PUT', bytes, headers);
+// A refusal that comes before the body is read may close the connection while the client is still
+// sending an 8 MiB part, which fetch reports as EPIPE/ECONNRESET (as for the oversized SPZ in api.test.mjs).
+const refusal = promise => promise.then(response => response.status, error => error?.cause?.code ?? error?.code ?? String(error));
+const refused = (status, got) => [status, 'ECONNRESET', 'EPIPE', 'UND_ERR_SOCKET'].includes(got);
+const tiny = Buffer.alloc(16); // for refusals that do not depend on the body
 const complete = (id, upload, parts, headers) => request(`captures/${id}/video/complete?upload=${encodeURIComponent(upload)}`, 'POST', { parts }, headers);
 /** Creates, uploads every part and completes; returns the capture id and the file. */
 async function uploadedVideo(length = PART + MiB, extra = {}, seed = 1) {
@@ -142,19 +147,20 @@ test('parts: owner-only, numbers bounded by the declared size, exact sizes, MP4/
     assert.equal((await request(`captures/${id}/${route[0]}`, route[1], undefined, as(''))).status, 401, `anonymous ${route.join(' ')}`);
   }
   assert.equal((await request(`captures/${id}/video/upload`, 'POST', undefined, { origin: 'https://attacker.example' })).status, 403);
-  assert.equal((await putPart(id, "not-started", 1, file.subarray(0, PART))).status, 409, "nothing started yet");
+  assert.equal((await putPart(id, "not-started", 1, tiny)).status, 409, "nothing started yet");
   const upload = await start(id);
   assert.ok(upload && !upload.includes('/'));
   assert.equal((await row(id)).video_key.startsWith(`${id}/video/`), true, 'objects live under {id}/ (S7 purge and orphan sweep)');
 
-  for (const n of ['0', '3', '-1', '1.5', 'abc', '01', '9999999']) assert.equal((await putPart(id, upload, n, file.subarray(0, PART))).status, 400, `part ${n}`);
-  assert.equal((await putPart(id, upload, 1, file.subarray(0, PART - 1))).status, 400, 'part 1 one byte short');
-  assert.equal((await putPart(id, upload, 2, file.subarray(PART, length - 1))).status, 400, 'last part one byte short');
-  assert.equal((await putPart(id, upload, 2, Buffer.concat([file.subarray(PART), Buffer.alloc(1)]))).status, 400, 'last part one byte long');
+  for (const n of ['0', '3', '-1', '1.5', 'abc', '01', '9999999']) assert.equal((await putPart(id, upload, n, tiny)).status, 400, `part ${n}`);
+  for (const [n, body, what] of [[1, file.subarray(0, PART - 1), 'part 1 one byte short'], [2, file.subarray(PART, length - 1), 'last part one byte short'], [2, Buffer.concat([file.subarray(PART), Buffer.alloc(1)]), 'last part one byte long'], [1, tiny, 'part 1 far too short']]) {
+    const got = await refusal(putPart(id, upload, n, body));
+    assert.ok(refused(400, got), `${what} (got ${got})`);
+  }
   const notVideo = Buffer.alloc(PART, 7);
   assert.equal((await putPart(id, upload, 1, notVideo)).status, 400, 'part 1 must start like an MP4/MOV');
-  assert.equal((await putPart(id, `${upload}x`, 1, file.subarray(0, PART))).status, 409, 'another upload id');
-  assert.equal((await putPart(id, upload, 1, file.subarray(0, PART), as(stranger))).status, 404);
+  assert.equal((await putPart(id, `${upload}x`, 1, tiny)).status, 409, 'another upload id');
+  assert.equal((await putPart(id, upload, 1, tiny, as(stranger))).status, 404);
 
   // Parts may arrive in any order; complete needs exactly 1..N with their etags.
   const second = await (await putPart(id, upload, 2, file.subarray(PART))).json();
@@ -178,7 +184,7 @@ test('parts: owner-only, numbers bounded by the declared size, exact sizes, MP4/
   assert.equal((await row(id)).video_upload_id, null);
   // Once complete the video is fixed: no new upload, part or abort.
   assert.equal((await request(`captures/${id}/video/upload`, 'POST')).status, 409);
-  assert.equal((await putPart(id, upload, 1, file.subarray(0, PART))).status, 409);
+  assert.equal((await putPart(id, upload, 1, tiny)).status, 409);
   assert.equal((await request(`captures/${id}/video/upload?upload=${upload}`, 'DELETE')).status, 409);
   const owned = await request(`captures/${id}/video?download`);
   assert.equal(owned.status, 200);
@@ -199,7 +205,7 @@ test('restart and abort: a replaced upload is aborted and can no longer be used'
   const second = await start(id); // a reload, or another tab
   assert.notEqual(second, first);
   assert.notEqual((await row(id)).video_key, firstKey, 'every upload writes a key of its own');
-  assert.equal((await putPart(id, first, 2, file.subarray(PART))).status, 409);
+  assert.equal((await putPart(id, first, 2, tiny)).status, 409);
   assert.equal((await complete(id, first, [part, { part_number: 2, etag: 'x' }])).status, 409);
   await assert.rejects(bucket.resumeMultipartUpload(firstKey, first).uploadPart(2, file.subarray(PART)), 'the replaced upload was aborted in R2');
 
@@ -208,7 +214,7 @@ test('restart and abort: a replaced upload is aborted and can no longer be used'
   const after = await row(id);
   assert.equal(after.video_upload_id, null);
   assert.equal(after.video_key, null);
-  assert.equal((await putPart(id, second, 1, file.subarray(0, PART))).status, 409);
+  assert.equal((await putPart(id, second, 1, tiny)).status, 409);
   assert.deepEqual(await listKeys(`${id}/`), []);
   // A fresh start after an abort works.
   const third = await start(id);
@@ -227,7 +233,7 @@ test('a video job: claim hands the worker the video, publish deletes it, inputs 
   assert.equal(job.image_count, 0);
   // After submit nothing about the video can change.
   assert.equal((await request(`captures/${id}/video/upload`, 'POST')).status, 409);
-  assert.equal((await putPart(id, 'any', 1, file.subarray(0, PART))).status, 409);
+  assert.equal((await putPart(id, 'any', 1, tiny)).status, 409);
   assert.equal((await complete(id, 'any', [])).status, 409);
   assert.equal((await request(`captures/${id}/video/upload?upload=any`, 'DELETE')).status, 409);
 
@@ -306,7 +312,7 @@ test('delete aborts an in-flight upload and removes a completed video', async ()
   assert.equal((await request(`captures/${id}`, 'DELETE')).status, 200);
   await assert.rejects(bucket.resumeMultipartUpload(key, upload).uploadPart(2, file.subarray(PART)), 'the upload was aborted');
   assert.equal((await row(id)).video_upload_id, null);
-  assert.equal((await putPart(id, upload, 2, file.subarray(PART))).status, 404, 'the capture is gone for its owner');
+  assert.equal((await putPart(id, upload, 2, tiny)).status, 404, 'the capture is gone for its owner');
   assert.equal((await complete(id, upload, [])).status, 404);
   assert.deepEqual(await listKeys(`${id}/`), []);
 
