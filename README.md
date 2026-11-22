@@ -9,7 +9,7 @@ A web-first photo-to-Gaussian-splat prototype. Capture photos are stored on the 
 - Warn-only checks before upload: blurry or low-detail photos, near-duplicates, and fewer than 30 usable photos.
 - Persistent capture manifests in D1, image/result storage in R2, and owner-scoped APIs.
 - Resumable uploads: reselect the original files from an incomplete capture.
-- Rename and delete captures from the library (S7). Delete asks for confirmation, removes the photos, results and records for good, and is refused while a GPU worker holds the capture. Captures are kept until deleted. A very large capture disappears at once and its files are removed by the 5-minute cron (see [spec §7.9](docs/specs/capture-pipeline.md)).
+- Rename and delete captures from the library (S7). Delete asks for confirmation, removes the photos, results and records for good, and is refused while a GPU worker holds the capture. Captures are kept until deleted. A very large capture disappears at once and its files are removed by the 5-minute cron; a hidden tombstone record stays for an hour so that late uploads are still refused, then the cron removes it (see [spec §7.9](docs/specs/capture-pipeline.md)).
 - A durable job queue with atomic claims, worker leases, real stage reporting, and stale-job recovery.
 - Interactive splat viewing, orbit/pan/zoom, rotation, reset, and fullscreen. Finished captures stream as compressed SPZ (about 7× smaller than the PLY) with real download progress, and the full-precision PLY stays available as a download. One WebGL context is reused across scenes.
 - Status polling backs off from 2 s to 20 s while nothing changes, resets on any change or action, and stops once no capture is processing.

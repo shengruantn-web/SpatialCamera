@@ -1,18 +1,15 @@
 "use client";
 /* Local object URLs must stay in the browser; Next image optimization cannot access them. */
 /* eslint-disable @next/next/no-img-element */
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowUpRight, ArrowRight, Plus, Scan, Images, X, Check, ChevronRight, CircleHelp, Box, LoaderCircle, Cloud, LockKeyhole, RotateCcw, Download, Camera, Footprints, Sun, Layers, AlertCircle } from "lucide-react";
+import { type FormEvent /* S7 */, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ArrowUpRight, ArrowRight, Plus, Scan, Images, X, Check, ChevronRight, CircleHelp, Box, LoaderCircle, Cloud, LockKeyhole, RotateCcw, Download, Camera, Footprints, Sun, Layers, AlertCircle, Pencil, Trash2 /* S7 */ } from "lucide-react";
 import SplatViewer, { type SceneSource } from "./SplatViewer";
 import { type Capture, stages, statusLabels } from "../lib/types";
-import { MAX_IMAGE_BYTES, MAX_IMAGES, MAX_TOTAL_BYTES, MIN_IMAGES } from "../lib/validation";
+import { MAX_IMAGE_BYTES, MAX_IMAGES, MAX_TOTAL_BYTES, MIN_IMAGES, MAX_NAME_LENGTH, validateName /* S7 */ } from "../lib/validation";
 import { createPoller, hasActiveCapture, latestOnly, pollSignature, putWithRetry, runPool, UPLOAD_CONCURRENCY } from "../lib/client";
 import PrepWarnings from "./PrepWarnings"; // S6 capture prep
 import { useCapturePrep } from "./useCapturePrep"; // S6 capture prep
 import { useDropGuard } from "./useDropGuard"; // S6 capture prep
-import type { FormEvent } from "react"; // S7 rename/delete
-import { Pencil, Trash2 } from "lucide-react"; // S7 rename/delete
-import { MAX_NAME_LENGTH, validateName } from "../lib/validation"; // S7 rename/delete
 
 const sample: SceneSource = { url: "https://sparkjs.dev/assets/splats/butterfly.spz", name: "The butterfly", sample: true };
 type Selected = { file: File; url: string };
@@ -21,7 +18,7 @@ const formatBytes = (n: number) => n < 1024 * 1024 ? `${Math.round(n / 1024)} KB
 async function api<T = unknown>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`/api/${path}`, init);
   const data = await response.json().catch(() => ({ error: "The server could not be reached. Please try again." })) as T & { error?: string };
-  if (!response.ok) throw new Error(data.error ?? "Request failed.");
+  if (!response.ok) throw Object.assign(new Error(data.error ?? "Request failed."), { status: response.status }); // S7: status, so a delete can treat 404 as done
   return data;
 }
 export default function Studio() {
@@ -51,18 +48,29 @@ export default function Studio() {
   const uploadAbort = useRef<AbortController | null>(null);
   const order = useRef(latestOnly());
   const shown = useRef("");
+  // S7: a poll that started before a delete or rename finished must not bring back the row or the old name.
+  const deletedIds = useRef(new Set<string>());
+  const renamed = useRef(new Map<string, { name: string; at: number }>());
   // Every read of server state is numbered, so a slow response can never overwrite a newer one; and an
   // unchanged state skips the re-render (polls repeat every few seconds while a capture is in flight).
   const refresh = useCallback(async () => {
     const n = order.current.begin();
+    const started = performance.now(); // S7
     try {
       const [list, health] = await Promise.all([api<{ captures: Capture[] }>("captures"), api<{ processor: boolean }>("health")]);
-      const signature = pollSignature(list.captures, health.processor);
+      // S7: drop rows this tab deleted; keep a confirmed new name until a poll that began after the rename answers.
+      const captures = list.captures.filter(c => !deletedIds.current.has(c.id)).map(c => {
+        const pending = renamed.current.get(c.id);
+        if (!pending) return c;
+        if (started > pending.at) { renamed.current.delete(c.id); return c; }
+        return { ...c, name: pending.name };
+      });
+      const signature = pollSignature(captures, health.processor);
       if (order.current.accept(n)) {
-        if (signature !== shown.current) { shown.current = signature; setCaptures(list.captures); setProcessor(health.processor); }
+        if (signature !== shown.current) { shown.current = signature; setCaptures(captures); setProcessor(health.processor); }
         setServerError("");
       }
-      return { signature, active: hasActiveCapture(list.captures) };
+      return { signature, active: hasActiveCapture(captures) };
     } catch (e) {
       if (order.current.accept(n)) setServerError((e as Error).message);
       return { signature: `error:${(e as Error).message}`, active: true }; // keep checking until the server answers
@@ -201,6 +209,7 @@ export default function Studio() {
   const manageCancel = useRef<HTMLButtonElement>(null);
   const manageReturn = useRef<HTMLElement | null>(null);
   const libraryHeading = useRef<HTMLHeadingElement>(null);
+  const backdropDown = useRef(false);
   useEffect(() => {
     const dialog = manageRef.current;
     if (!dialog) return;
@@ -231,13 +240,17 @@ export default function Studio() {
     setManaging(true); setManageError("");
     try {
       const { capture } = await api<{ capture: Capture }>(`captures/${id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: next }) });
+      renamed.current.set(id, { name: capture.name, at: performance.now() });
       setCaptures(current => current.map(c => c.id === id ? { ...c, name: capture.name } : c));
       if (resume?.id === id) setName(capture.name);
       setManageNotice(`Renamed to “${capture.name}”.`);
       setManaging(false); setManage(null);
       requestAnimationFrame(() => manageReturn.current?.focus());
       wake.current();
-    } catch (err) { setManageError((err as Error).message); setManaging(false); }
+    } catch (err) {
+      setManageError((err as Error).message); setManageNotice(`Could not rename: ${(err as Error).message}`);
+      setManaging(false); wake.current(); // the capture may have changed meanwhile (for example, processing began)
+    }
   }
   async function confirmDelete() {
     if (!manage || managing) return;
@@ -245,14 +258,27 @@ export default function Studio() {
     setManaging(true); setManageError("");
     try {
       // 200 when everything is gone; 202 when the cron finishes a large capture. Either way it is gone for the owner.
-      await api(`captures/${id}`, { method: "DELETE" });
+      // A 404 means it is already gone (another tab, or a retry after a lost response), which is the same outcome.
+      try { await api(`captures/${id}`, { method: "DELETE" }); }
+      catch (err) { if ((err as { status?: number }).status !== 404) throw err; }
+      deletedIds.current.add(id);
       if (activeId === id) clear();
       setCaptures(current => current.filter(c => c.id !== id));
       setManageNotice(`Deleted “${deletedName}”.`);
       setManaging(false); setManage(null);
       requestAnimationFrame(() => libraryHeading.current?.focus());
       wake.current();
-    } catch (err) { setManageError((err as Error).message); setManaging(false); wake.current(); }
+    } catch (err) {
+      setManageError((err as Error).message); setManageNotice(`Could not delete: ${(err as Error).message}`);
+      setManaging(false); wake.current();
+    }
+  }
+  // The browser may close a modal dialog on a repeated Escape even when cancel is prevented. While a request
+  // runs, reopen it so its outcome stays visible; otherwise treat the close as a cancel and sync the state.
+  function onManageClose() {
+    if (!manage) return;
+    if (managing) { manageRef.current?.showModal(); (manage.kind === "rename" ? manageInput : manageCancel).current?.focus(); }
+    else closeManage();
   }
   // ── end S7
   const processing = active && active.status !== "uploading" && !busy;
@@ -322,8 +348,10 @@ export default function Studio() {
       { icon: Sun, title: "Keep the world still.", text: "Use even light. Avoid people moving through the scene, mirrors, glass, and featureless walls. Keep zoom and exposure consistent." },
       { icon: Cloud, title: "Upload once. Come back to explore.", text: "Photos are stored privately. A connected GPU worker estimates camera positions and trains your splat. Timing depends on scene size and hardware." },
     ].map(({ icon: Icon, title, text }) => <div key={title}><span><Icon size={21} /></span><section><h3>{title}</h3><p>{text}</p></section></div>)}</div><div className="notice">Time-lapse capture works when you move between photos. For a place changing over days, create a separate capture for each visit.</div><button className="primary" onClick={() => setGuide(false)}>Ready to capture <ArrowRight size={16} /></button></div></dialog>
-    {/* ── S7 rename/delete dialog: Esc or a backdrop click cancels (not while a request runs). */}
-    <dialog ref={manageRef} className="manage-dialog" aria-labelledby="manage-title" aria-describedby={manage?.kind === "delete" ? "manage-description" : undefined} onCancel={e => { e.preventDefault(); closeManage(); }} onClick={e => { if (e.target === e.currentTarget) closeManage(); }}>
+    {/* ── S7 rename/delete dialog: Esc or a click on the backdrop cancels (not while a request runs). */}
+    <dialog ref={manageRef} className="manage-dialog" aria-labelledby="manage-title" aria-describedby={manage?.kind === "delete" ? "manage-description" : undefined} onCancel={e => { e.preventDefault(); closeManage(); }} onClose={onManageClose}
+      onPointerDown={e => { backdropDown.current = e.target === e.currentTarget; }}
+      onClick={e => { const fromBackdrop = backdropDown.current; backdropDown.current = false; if (fromBackdrop && e.target === e.currentTarget) closeManage(); /* a drag from the input that ends on the backdrop is not a cancel */ }}>
       {manage && <div className="manage">
         {manage.kind === "rename" ? <form onSubmit={submitRename} noValidate>
           <h2 id="manage-title">Rename capture</h2>

@@ -187,43 +187,60 @@ export const PURGE_SUBREQUESTS_INLINE = 30;
 export const PURGE_SUBREQUESTS_PER_RUN = 20;
 const PURGE_CAPTURES_PER_RUN = 5;
 /**
- * Removes every object under `{id}/` (uploads, legacy images, attempts, published and legacy results),
- * then the image rows and the capture row, in that order, so a row exists for as long as any object may.
- * Runs only on a row already `deleting`: from then on every writer's conditional UPDATE fails and the
- * writer deletes the object it just stored (§7.2, §7.3), so an object stored after a listing below either
- * belongs to a write that committed before the status flip (so it was stored before, and is listed) or
- * removes itself. Returns true when the capture is gone; false when the budget ran out first.
+ * No request that stores an object may do so later than this after it started (image PUTs check before
+ * storing, result PUTs before each chunk and before completing the stream), so a request admitted before
+ * a capture turned `deleting` has stored whatever it will ever store within this time of the flip.
  */
-async function purgeCapture(env: Pick<ApiEnv, "DB" | "BUCKET">, id: string, budget: Budget) {
-  // A page needs a list and a delete, and the final batch one more.
+export const REQUEST_DEADLINE_MS = 30 * 60_000;
+/**
+ * How long a deleted capture's row is kept as a tombstone after the status flip: longer than any admitted
+ * request can live (REQUEST_DEADLINE_MS plus slack), so the final listing, taken after it, sees every
+ * object a late writer stored, even one whose own cleanup failed (I7).
+ */
+export const PURGE_GRACE_MS = 60 * 60_000;
+type PurgeOutcome = "more" | "emptied" | "removed";
+/**
+ * Removes every object under `{id}/` (uploads, legacy images, attempts, published and legacy results).
+ * Runs only on a `deleting` row; `since` is its `updated_at` (the flip, or later). When a listing comes
+ * back with nothing left over, the image rows go and the capture row stays as a tombstone with
+ * `gc_pending=0` ("emptied"), unless that listing started after the grace window: then no request can
+ * store under the prefix any more, the bucket is clean for good, and the capture row goes too ("removed").
+ * "more" when the budget ran out first.
+ */
+async function purgeCapture(env: Pick<ApiEnv, "DB" | "BUCKET">, id: string, since: number, budget: Budget): Promise<PurgeOutcome> {
+  // A page needs a list and a delete, and the final statement one more.
   while (budget.left >= 3) {
+    const listedAt = Date.now();
     spend(budget);
     // No cursor: what this deletes is gone, so the next listing starts at what is left.
     const listing = await env.BUCKET.list({ prefix: `${id}/`, limit: PURGE_LIST_LIMIT });
     if (listing.objects.length) { spend(budget); await env.BUCKET.delete(listing.objects.map(object => object.key)); }
     if (listing.truncated) continue;
     spend(budget);
-    await env.DB.batch([
-      env.DB.prepare("DELETE FROM images WHERE capture_id=? AND EXISTS (SELECT 1 FROM captures WHERE id=? AND status='deleting')").bind(id, id),
-      env.DB.prepare("DELETE FROM captures WHERE id=? AND status='deleting'").bind(id),
-    ]);
-    return true;
+    const images = env.DB.prepare("DELETE FROM images WHERE capture_id=? AND EXISTS (SELECT 1 FROM captures WHERE id=? AND status='deleting')").bind(id, id);
+    if (listedAt - since > PURGE_GRACE_MS) {
+      await env.DB.batch([images, env.DB.prepare("DELETE FROM captures WHERE id=? AND status='deleting'").bind(id)]);
+      return "removed";
+    }
+    await env.DB.batch([images, env.DB.prepare("UPDATE captures SET gc_pending=0 WHERE id=? AND status='deleting'").bind(id)]);
+    return "emptied";
   }
-  return false;
+  return "more";
 }
 /**
- * Cron: finishes deletions the DELETE request could not complete, oldest first. A capture whose purge
- * throws has its `updated_at` moved forward so it goes behind the others next time. Returns how many
- * captures were removed.
+ * Cron: deleted captures that may still hold objects (`gc_pending` 1) and tombstones past the grace
+ * window, oldest first; tombstones inside the window cost nothing. A capture whose purge throws has its
+ * `updated_at` moved forward so it goes behind the others next time (which only lengthens its grace).
+ * Returns how many capture rows were removed.
  */
 export async function purgeDeletedCaptures(env: Pick<ApiEnv, "DB" | "BUCKET">, { budget = { left: PURGE_SUBREQUESTS_PER_RUN } }: { budget?: Budget } = {}) {
   spend(budget);
-  const { results } = await env.DB.prepare("SELECT id FROM captures WHERE status='deleting' ORDER BY updated_at LIMIT ?")
-    .bind(PURGE_CAPTURES_PER_RUN).all<{ id: string }>();
+  const { results } = await env.DB.prepare("SELECT id,updated_at FROM captures WHERE status='deleting' AND (gc_pending>0 OR updated_at<?) ORDER BY updated_at LIMIT ?")
+    .bind(Date.now() - PURGE_GRACE_MS, PURGE_CAPTURES_PER_RUN).all<{ id: string; updated_at: number }>();
   let removed = 0;
-  for (const { id } of results) {
+  for (const { id, updated_at: since } of results) {
     if (budget.left < 3) break;
-    try { if (await purgeCapture(env, id, budget)) removed++; }
+    try { if (await purgeCapture(env, id, since, budget) === "removed") removed++; }
     catch (error) {
       console.error("Capture deletion failed; the next run retries it", id, error);
       if (budget.left < 1) break;
@@ -233,6 +250,14 @@ export async function purgeDeletedCaptures(env: Pick<ApiEnv, "DB" | "BUCKET">, {
     }
   }
   return removed;
+}
+/** A writer stored `key` and now commits it: if the commit throws, the object goes with it (§7.9). */
+async function committing<T>(bucket: R2Bucket, key: string, commit: () => Promise<T>) {
+  try { return await commit(); }
+  catch (error) {
+    await bucket.delete(key).catch(cleanupError => console.error("Could not delete an uncommitted object", key, cleanupError));
+    throw error;
+  }
 }
 // ---- end S7 ---------------------------------------------------------------------------------------
 const imageKey = (captureId: string, image: ImageRow) => image.object_key ?? `${captureId}/images/${image.id}`;
@@ -338,7 +363,8 @@ const SPZ: SplatFormat = {
   },
 };
 class InvalidSplat extends Error {}
-async function storeSplat(request: Request, bucket: R2Bucket, key: string, format: SplatFormat = PLY) {
+async function storeSplat(request: Request, bucket: R2Bucket, key: string, format: SplatFormat = PLY, deadline = Infinity) {
+  const late = () => { if (Date.now() > deadline) throw new Error("The upload outlived the request deadline."); }; // S7 (§7.9)
   const length = Number(request.headers.get("content-length"));
   if (!Number.isSafeInteger(length) || length <= 0 || length > format.max) fail(`Supply a ${format.label} with Content-Length between 1 byte and ${format.max / 1024 / 1024} MB.`, 413);
   const reader = request.body?.getReader();
@@ -365,6 +391,7 @@ async function storeSplat(request: Request, bucket: R2Bucket, key: string, forma
     // Each chunk is checked before it is forwarded, and the stream is closed only after the whole check
     // passes, so a rejected upload aborts the R2 put instead of completing it.
     const forward = async (chunk: Uint8Array<ArrayBuffer>) => {
+      late(); // S7
       received += chunk.length;
       if (received > length) throw new Error("Body longer than its Content-Length.");
       if (!(await check.write(chunk))) throw new InvalidSplat();
@@ -376,6 +403,7 @@ async function storeSplat(request: Request, bucket: R2Bucket, key: string, forma
       // A short body is a broken connection (retryable), not a bad file: judged before the content.
       if (received !== length) throw new Error("Body shorter than its Content-Length.");
       if (!(await check.end())) throw new InvalidSplat();
+      late(); // S7: closing the stream is what completes the object
       await writer.close();
     } catch (error) { check.abort(); await writer.abort(error).catch(() => {}); throw error; }
   };
@@ -414,6 +442,7 @@ async function objectResponse(env: ApiEnv, key: string, mime: string, name?: str
 }
 
 export async function handleApi(request: Request, env: ApiEnv): Promise<Response> {
+  const deadline = Date.now() + REQUEST_DEADLINE_MS; // S7: stores after this are refused (§7.9)
   try {
     const url = new URL(request.url);
     const path = url.pathname.split("/").filter(Boolean);
@@ -499,43 +528,44 @@ export async function handleApi(request: Request, env: ApiEnv): Promise<Response
         // duplicate PUT won), the published objects are other keys: drop only ours and acknowledge.
         // Otherwise the attempt has lost its lease and nothing it stored can ever be published.
         const unpublished = async (ownKey: string, at: number) => {
+          // S7: our own key first, by name. deleteAttempt below lists one page, which need not include it
+          // (many late PUTs of one attempt); what it misses is left to GC or the deletion tombstone sweep.
+          await env.BUCKET.delete(ownKey).catch(error => console.error("Could not delete unrecorded result", ownKey, error));
           const current = await env.DB.prepare("SELECT status,result_key FROM captures WHERE id=?").bind(job.id).first<Pick<Job, "status" | "result_key">>();
-          if (current?.status === "ready" && inDir(current.result_key, dir)) {
-            await env.BUCKET.delete(ownKey).catch(error => console.error("Could not delete duplicate result", ownKey, error));
-            return json({ ok: true });
-          }
+          if (current?.status === "ready" && inDir(current.result_key, dir)) return json({ ok: true });
           await deleteAttempt(env.BUCKET, dir, "unpublished attempt");
           await expireCapture(env.DB, job.id, at);
           fail("Job lease expired.", 409);
         };
         if (path[3] === "result.spz") {
           const spzKey = uploadKeyIn(dir, "spz");
-          const bytes = await storeSplat(request, env.BUCKET, spzKey, SPZ);
+          const bytes = await storeSplat(request, env.BUCKET, spzKey, SPZ, deadline); // S7: deadline
           // Recorded on the row, not published: the attempt's PLY PUT publishes it. The UPDATE holds only
           // while this lease is live and still exporting, so a recorded SPZ can never replace a published
           // one, and an SPZ that loses that race was never referenced (C2). Same batch, same snapshot:
           // the SELECT names the SPZ this one replaces.
           const done = Date.now();
-          const [previous, recorded] = await env.DB.batch([
+          // S7: committing() deletes the object if the batch throws.
+          const [previous, recorded] = await committing(env.BUCKET, spzKey, () => env.DB.batch([
             env.DB.prepare("SELECT spz_key FROM captures WHERE id=?").bind(job.id),
             env.DB.prepare("UPDATE captures SET spz_key=?,spz_bytes=? WHERE id=? AND lease=? AND status='exporting' AND updated_at>=?")
               .bind(spzKey, bytes, job.id, lease, done - LEASE_TTL_MS),
-          ]);
+          ]));
           if (!recorded.meta.changes) return await unpublished(spzKey, done);
           const replaced = (previous.results[0] as { spz_key: string | null } | undefined)?.spz_key;
           if (replaced && replaced !== spzKey) await env.BUCKET.delete(replaced).catch(error => console.error("Could not delete replaced SPZ", replaced, error));
           return json({ ok: true });
         }
         const key = uploadKeyIn(dir, "ply");
-        const bytes = await storeSplat(request, env.BUCKET, key, PLY);
+        const bytes = await storeSplat(request, env.BUCKET, key, PLY, deadline); // S7: deadline
         // The lease must still be fresh when the upload completes, not just when it started: an
         // attempt that stopped heartbeating mid-upload has expired even if no sweep has run yet.
         // (The worker heartbeats throughout the upload, so a live long upload stays fresh.)
         // The SPZ this attempt recorded (claim cleared any earlier one) publishes in the same statement,
         // so a capture is never ready with one format of one attempt and the other of another.
         const done = Date.now();
-        const result = await env.DB.prepare("UPDATE captures SET status='ready',result_key=?,result_bytes=?,ready_at=?,updated_at=MAX(updated_at,?),lease=NULL,error=NULL WHERE id=? AND lease=? AND status='exporting' AND updated_at>=?")
-          .bind(key, bytes, done, done, job.id, lease, done - LEASE_TTL_MS).run();
+        const result = await committing(env.BUCKET, key, () => env.DB.prepare("UPDATE captures SET status='ready',result_key=?,result_bytes=?,ready_at=?,updated_at=MAX(updated_at,?),lease=NULL,error=NULL WHERE id=? AND lease=? AND status='exporting' AND updated_at>=?")
+          .bind(key, bytes, done, done, job.id, lease, done - LEASE_TTL_MS).run()); // S7: committing()
         if (!result.meta.changes) return await unpublished(key, done);
         // Earlier attempts' leftovers go now; anything this misses stays marked for the cron (C3).
         await collectPublished(env, job.id).catch(error => console.error("Attempt garbage collection failed", job.id, error));
@@ -597,7 +627,8 @@ export async function handleApi(request: Request, env: ApiEnv): Promise<Response
     // with no live lease, and a claim moves only a `queued` row, so exactly one of them wins. A lease that
     // went stale was expired just above, so a dead attempt never blocks a delete.
     if (path.length === 3 && request.method === "DELETE") {
-      const started = await env.DB.prepare("UPDATE captures SET status='deleting',lease=NULL,gc_pending=0,updated_at=? WHERE id=? AND owner=? AND status IN ('uploading','queued','ready','failed')")
+      // For a `deleting` row, gc_pending=1 means objects may remain; updated_at starts the grace window.
+      const started = await env.DB.prepare("UPDATE captures SET status='deleting',lease=NULL,gc_pending=1,updated_at=? WHERE id=? AND owner=? AND status IN ('uploading','queued','ready','failed')")
         .bind(now, id, owner).run();
       if (!started.meta.changes) {
         const current = await loadOwned();
@@ -605,7 +636,8 @@ export async function handleApi(request: Request, env: ApiEnv): Promise<Response
         fail("Capture not found.", 404);
       }
       try {
-        if (await purgeCapture(env, id, { left: PURGE_SUBREQUESTS_INLINE })) return json({ deleted: true });
+        // Done for the owner once the prefix is empty; the tombstone row goes after the grace window.
+        if (await purgeCapture(env, id, now, { left: PURGE_SUBREQUESTS_INLINE }) !== "more") return json({ deleted: true });
       } catch (error) { console.error("Capture deletion will be finished by the cron", id, error); }
       // Already hidden everywhere; the cron removes what is left within a few minutes.
       return json({ deleted: true, pending: true }, 202);
@@ -623,11 +655,13 @@ export async function handleApi(request: Request, env: ApiEnv): Promise<Response
         // capture is still `uploading`. A PUT that loses to submit deletes its object and gets 409, so
         // a queued/claimed capture's referenced bytes are never overwritten.
         const key = `${id}/uploads/${image.id}/${crypto.randomUUID()}`;
+        if (Date.now() > deadline) fail(RETRY_UPLOAD, 503); // S7: never store past the request deadline (§7.9)
         await env.BUCKET.put(key, bytes, { httpMetadata: { contentType: image.mime } }).catch(() => fail(RETRY_UPLOAD, 503));
-        const [marked] = await env.DB.batch([
+        // S7: committing() deletes the object if the batch throws.
+        const [marked] = await committing(env.BUCKET, key, () => env.DB.batch([
           env.DB.prepare("UPDATE images SET uploaded=1,object_key=? WHERE id=? AND capture_id=? AND EXISTS (SELECT 1 FROM captures WHERE id=? AND status='uploading')").bind(key, image.id, id, id),
           env.DB.prepare("UPDATE captures SET uploaded_count=(SELECT COUNT(*) FROM images WHERE capture_id=? AND uploaded=1) WHERE id=? AND status='uploading'").bind(id, id),
-        ]);
+        ]));
         if (!marked.meta.changes) {
           await env.BUCKET.delete(key).catch(error => console.error("Could not delete rejected upload", key, error));
           fail("This capture no longer accepts photos.", 409);

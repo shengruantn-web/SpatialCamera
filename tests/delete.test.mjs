@@ -1,6 +1,7 @@
 // S7: rename, delete and retention (spec §7.9). Own Miniflare instance, same harness as api.test.mjs.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { build } from 'esbuild';
 import { Miniflare } from 'miniflare';
 import { applyMigrations } from '../db/migrate.mjs';
@@ -26,15 +27,20 @@ before(async () => {
     // Counts every D1 and R2 call (each is a subrequest).
     const counting = (env, ops) => {
       const count = fn => (...args) => { ops.count++; return fn(...args); };
-      const statement = stmt => ({ bind: (...args) => statement(stmt.bind(...args)), first: count((...args) => stmt.first(...args)), all: count(() => stmt.all()), run: count(() => stmt.run()) });
+      const statement = stmt => ({ raw: stmt, bind: (...args) => statement(stmt.bind(...args)), first: count((...args) => stmt.first(...args)), all: count(() => stmt.all()), run: count(() => stmt.run()) });
       return { ...env,
-        DB: { prepare: sql => statement(env.DB.prepare(sql)), batch: count(statements => env.DB.batch(statements)) },
+        DB: { prepare: sql => statement(env.DB.prepare(sql)), batch: count(statements => env.DB.batch(statements.map(s => s.raw))) },
         BUCKET: { list: count(options => env.BUCKET.list(options)), delete: count(keys => env.BUCKET.delete(keys)) } };
     };
+    // "x-test-fail: batch,delete" makes this request's D1 batches and/or R2 deletes throw.
+    const broken = (target, method, what) => new Proxy(target, { get: (t, key) => key === method ? async () => { throw new Error('test: ' + what + ' failed'); } : t[key].bind(t) });
     export default {fetch(request, env, ctx) {
       const url = new URL(request.url);
       const page = Number(request.headers.get('x-test-r2-page') || url.searchParams.get('page') || 0);
-      const scoped = page ? { ...env, BUCKET: paged(env.BUCKET, page) } : env;
+      const fail = (request.headers.get('x-test-fail') || '').split(',');
+      let scoped = page ? { ...env, BUCKET: paged(env.BUCKET, page) } : env;
+      if (fail.includes('batch')) scoped = { ...scoped, DB: broken(scoped.DB, 'batch', 'D1 batch') };
+      if (fail.includes('delete')) scoped = { ...scoped, BUCKET: broken(scoped.BUCKET, 'delete', 'R2 delete') };
       if (url.pathname === '/__test/purge') {
         const ops = { count: 0 };
         return purgeDeletedCaptures(counting(scoped, ops)).then(removed => Response.json({ removed, ops: ops.count }));
@@ -63,6 +69,13 @@ const rows = async id => {
 };
 const status = async id => (await (await db()).prepare('SELECT status FROM captures WHERE id=?').bind(id).first())?.status;
 const makeStale = async id => (await db()).prepare('UPDATE captures SET updated_at=? WHERE id=?').bind(Date.now() - 11 * 60_000, id).run();
+/** A deleted capture is kept as a hidden tombstone: status `deleting`, no image rows. */
+const tombstone = async id => {
+  assert.equal(await status(id), 'deleting');
+  assert.equal((await rows(id)).images, 0);
+};
+/** Moves a tombstone's deletion time back past PURGE_GRACE_MS (1 hour). */
+const pastGrace = async id => (await db()).prepare("UPDATE captures SET updated_at=? WHERE id=? AND status='deleting'").bind(Date.now() - 61 * 60_000, id).run();
 async function createCapture(name) { return (await request('captures', 'POST', manifest(name))).json(); }
 async function uploadedCapture(name) {
   const capture = await createCapture(name);
@@ -154,7 +167,7 @@ test('delete removes the rows and every object under the capture, and only for i
   assert.equal(deleted.status, 200);
   assert.deepEqual(await deleted.json(), { deleted: true });
   assert.deepEqual(await listKeys(`${capture.id}/`), []);
-  assert.deepEqual(await rows(capture.id), { capture: 0, images: 0 });
+  await tombstone(capture.id);
   assert.deepEqual(await listKeys(`${neighbour.id}/`), neighbourKeys, 'other captures are untouched');
   assert.equal((await rows(neighbour.id)).images, 12);
   assert.equal((await request(`captures/${capture.id}`)).status, 404);
@@ -168,7 +181,18 @@ test('delete removes the rows and every object under the capture, and only for i
   assert.equal((await request(`captures/${queued.id}/submit`, 'POST')).status, 200);
   assert.equal((await request(`captures/${queued.id}`, 'DELETE')).status, 200);
   assert.equal((await (await worker('claim', 'POST', {})).json()).job, null);
-  assert.deepEqual(await rows(queued.id), { capture: 0, images: 0 });
+  await tombstone(queued.id);
+
+  // Tombstones are left alone inside the grace window and removed after it; live captures are untouched.
+  const live = await uploadedCapture('Live');
+  const liveKeys = await listKeys(`${live.id}/`);
+  await cron();
+  for (const id of [capture.id, neighbour.id, queued.id]) await tombstone(id);
+  for (const id of [capture.id, neighbour.id, queued.id]) await pastGrace(id);
+  await cron();
+  for (const id of [capture.id, neighbour.id, queued.id]) assert.deepEqual(await rows(id), { capture: 0, images: 0 });
+  assert.deepEqual(await rows(live.id), { capture: 1, images: 12 });
+  assert.deepEqual(await listKeys(`${live.id}/`), liveKeys);
 });
 
 test('delete is refused while the capture is leased, and allowed once the lease has expired', async () => {
@@ -186,7 +210,7 @@ test('delete is refused while the capture is leased, and allowed once the lease 
   // A dead attempt never blocks a delete: its lease is expired on the way in.
   await makeStale(capture.id);
   assert.equal((await request(`captures/${capture.id}`, 'DELETE')).status, 200);
-  assert.deepEqual(await rows(capture.id), { capture: 0, images: 0 });
+  await tombstone(capture.id);
   assert.deepEqual(await listKeys(`${capture.id}/`), []);
 });
 
@@ -220,9 +244,14 @@ test('a capture with more objects than one request may delete is hidden at once 
   assert.ok(afterRun > 0 && afterRun < afterRequest, `${afterRun} objects left after a run`);
   assert.equal(await status(capture.id), 'deleting', 'the rows stay until the objects are gone');
 
-  // The real cron (1000 keys per page) finishes it, rows last.
+  // The real cron (1000 keys per page) empties it; the capture row stays as a tombstone.
   await cron();
   assert.deepEqual(await listKeys(`${capture.id}/`), []);
+  await tombstone(capture.id);
+  assert.deepEqual(await purgeRun(1000), { removed: 0, ops: 1 }, 'a tombstone inside the grace window costs one query');
+  // After the grace window: one final listing, then the row.
+  await pastGrace(capture.id);
+  assert.deepEqual(await purgeRun(1000), { removed: 1, ops: 3 });
   assert.deepEqual(await rows(capture.id), { capture: 0, images: 0 });
   assert.deepEqual(await purgeRun(1000), { removed: 0, ops: 1 }, 'nothing left to do: one query');
 });
@@ -237,7 +266,7 @@ test('a worker PUT or heartbeat after a delete fails and leaves nothing behind',
   // The attempt stalls past its lease; the owner deletes the capture.
   await makeStale(capture.id);
   assert.equal((await request(`captures/${capture.id}`, 'DELETE')).status, 200);
-  assert.deepEqual(await rows(capture.id), { capture: 0, images: 0 });
+  await tombstone(capture.id);
   // The upload completes: it must lose, and remove the object it stored after the purge.
   late.send(result.subarray(result.length - 10));
   late.end();
@@ -247,7 +276,13 @@ test('a worker PUT or heartbeat after a delete fails and leaves nothing behind',
   assert.equal((await worker(`${job.id}/result`, 'PUT', splat(4), job.lease)).status, 409);
   await settle();
   assert.deepEqual(await listKeys(`${capture.id}/`), []);
-  assert.deepEqual(await rows(capture.id), { capture: 0, images: 0 }, 'nothing recreated a row');
+  await tombstone(capture.id); // nothing revived it or recreated an image row
+  await pastGrace(capture.id);
+  await cron();
+  assert.deepEqual(await rows(capture.id), { capture: 0, images: 0 });
+  // Once the row is gone there is no job to write under.
+  assert.equal((await worker(`${job.id}/result`, 'PUT', splat(5), job.lease)).status, 409);
+  assert.deepEqual(await listKeys(`${capture.id}/`), []);
 });
 
 test('an image PUT racing a delete leaves nothing behind', async () => {
@@ -269,6 +304,57 @@ test('an image PUT racing a delete leaves nothing behind', async () => {
     assert.equal((await listKeys(`${capture.id}/uploads/${target.id}/`)).length, 0, 'the racing upload removed its own object');
     if (pending) await cron();
     assert.deepEqual(await listKeys(`${capture.id}/`), []);
+    await tombstone(capture.id);
+  }
+});
+
+test('an object stored after the purge whose commit and cleanup both fail is removed by the tombstone sweep (I7)', async () => {
+  for (const failures of ['batch', 'batch,delete']) {
+    const capture = await createCapture(`Late writer, ${failures}`);
+    const target = capture.images[0];
+    // Admitted while uploading, paused before storing.
+    const late = heldRequest(`captures/${capture.id}/images/${target.id}`, { 'oai-authenticated-user-email': owner, 'x-test-fail': failures }, png.length);
+    late.send(png.subarray(0, 10));
+    await settle();
+    const deleted = await request(`captures/${capture.id}`, 'DELETE');
+    assert.equal(deleted.status, 200, 'the purge finished and the owner is told so');
+    await tombstone(capture.id);
+    // The PUT now stores, and its D1 batch throws.
+    late.send(png.subarray(10));
+    late.end();
+    assert.equal((await late.response).status, 500);
+    const stored = await listKeys(`${capture.id}/uploads/${target.id}/`);
+    if (failures === 'batch') {
+      assert.deepEqual(stored, [], 'a commit that throws deletes the object it stored');
+      continue;
+    }
+    // Its cleanup failed too: the object exists, but the tombstone still names the prefix.
+    assert.equal(stored.length, 1);
+    await cron();
+    assert.equal(stored.length, (await listKeys(`${capture.id}/uploads/${target.id}/`)).length, 'left alone inside the grace window');
+    await tombstone(capture.id);
+    await pastGrace(capture.id);
+    await cron();
+    assert.deepEqual(await listKeys(`${capture.id}/`), [], 'the final sweep found and removed it');
     assert.deepEqual(await rows(capture.id), { capture: 0, images: 0 });
   }
+});
+
+test('a rejected result PUT deletes its own object even when its attempt holds more than one page of keys', async () => {
+  const { capture, job } = await queuedAndClaimed('Crowded attempt');
+  await toExporting(job);
+  const dir = `${capture.id}/attempts/${createHash('sha256').update(job.lease).digest('hex').slice(0, 32)}`;
+  // 150 keys that sort before `result.*`: one 100-key page of the attempt is all strays.
+  const bucket = await mf.getR2Bucket('BUCKET');
+  await Promise.all(Array.from({ length: 150 }, (_, i) => bucket.put(`${dir}/a${String(i).padStart(3, '0')}`, 'stray')));
+  const result = splat(6);
+  const late = heldRequest(`worker/${capture.id}/result`, { authorization: `Bearer ${token}`, 'x-job-lease': job.lease }, result.length);
+  late.send(result.subarray(0, result.length - 10));
+  await settle();
+  await makeStale(capture.id);
+  late.send(result.subarray(result.length - 10));
+  late.end();
+  assert.equal((await late.response).status, 409);
+  assert.deepEqual((await listKeys(`${dir}/`)).filter(key => key.startsWith(`${dir}/result.`)), [], 'its own object went by name');
+  assert.equal(await status(capture.id), 'failed');
 });
