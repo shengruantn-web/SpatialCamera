@@ -17,7 +17,7 @@ spec.loader.exec_module(pipeline)
 
 try:
     import numpy as np
-except ImportError:  # CI's worker job installs no third-party packages
+except ImportError:
     np = None
 try:
     from PIL import Image, JpegImagePlugin
