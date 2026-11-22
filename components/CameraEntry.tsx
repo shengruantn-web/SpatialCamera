@@ -39,6 +39,7 @@ const touchSnapshot = () => showCameraEntry({
 });
 const serverSnapshot = () => false;
 const keyOf = (file: NamedFile) => `${file.name}:${file.size}`;
+const stemOf = (name: string) => name.replace(/\.[^.]*$/, "");
 
 export default function CameraEntry({ selection, disabled, onAdd }: Props) {
   const touch = useSyncExternalStore(subscribe, touchSnapshot, serverSnapshot);
@@ -46,8 +47,10 @@ export default function CameraEntry({ selection, disabled, onAdd }: Props) {
   const [notice, setNotice] = useState("");
   /** Photos handed to the queue that Studio has not taken in yet. */
   const [pending, setPending] = useState<File[]>([]);
-  /** Guided-mode photos: they exist only in this tab, which the note under the buttons says. */
-  const [guided] = useState(() => new WeakSet<File>());
+  /** Names (without extension, so a HEIC converted to JPEG still counts) of photos that resume
+   * after a reload cannot match: guided shots, which exist only in this tab, and camera-app photos
+   * renamed to avoid a clash. The note under the buttons says so while the selection holds one. */
+  const [unrecoverable] = useState(() => new Set<string>());
   const input = useRef<HTMLInputElement>(null);
   const guidedButton = useRef<HTMLButtonElement>(null);
   const queue = useRef<Promise<void>>(Promise.resolve());
@@ -55,7 +58,7 @@ export default function CameraEntry({ selection, disabled, onAdd }: Props) {
   // The selection as Studio will hold it once the queue drains (Studio drops name + size repeats).
   const known = [...new Map([...selection, ...pending].map(file => [keyOf(file), file])).values()];
   const budget = { count: known.length, bytes: known.reduce((sum, file) => sum + file.size, 0) };
-  const holdsGuided = known.some(file => guided.has(file));
+  const holdsUnrecoverable = known.some(file => unrecoverable.has(stemOf(file.name)));
 
   // Studio takes one add at a time and reads its selection from a ref updated after render, so each
   // add waits for the previous one and a tick.
@@ -78,7 +81,7 @@ export default function CameraEntry({ selection, disabled, onAdd }: Props) {
     setOpen(true);
   }
   function returnFocus() { requestAnimationFrame(() => guidedButton.current?.focus()); }
-  function addGuided(shots: File[]) { shots.forEach(shot => guided.add(shot)); enqueue(shots); }
+  function addGuided(shots: File[]) { shots.forEach(shot => unrecoverable.add(stemOf(shot.name))); enqueue(shots); }
 
   if (!touch) return null;
   return <div className="camera-entry">
@@ -86,19 +89,21 @@ export default function CameraEntry({ selection, disabled, onAdd }: Props) {
       onChange={e => {
         const picked = Array.from(e.target.files ?? []);
         e.target.value = "";
-        // Original names stay (the resume matcher pairs files by name + size); only a name another
-        // photo already uses (iOS: every photo is image.jpg) gets a deterministic suffix.
+        // Original names stay (the resume matcher pairs files by name + size); only a name a
+        // different photo already uses (iOS: every photo is image.jpg) gets a deterministic suffix.
         const taken: NamedFile[] = [...known];
         enqueue(picked.map(file => {
           const name = cameraAppFileName(file, taken);
-          taken.push({ name, size: file.size });
-          return name === file.name ? file : new File([file], name, { type: file.type, lastModified: file.lastModified });
+          taken.push({ name, size: file.size, lastModified: file.lastModified });
+          if (name === file.name) return file;
+          unrecoverable.add(stemOf(name));
+          return new File([file], name, { type: file.type, lastModified: file.lastModified });
         }));
       }} />
     <button ref={guidedButton} type="button" className="camera-entry-button main" aria-disabled={disabled || undefined} onClick={openGuided}><Aperture size={18} /><span className="camera-entry-label"><strong>Take photos</strong><small>guided camera</small></span></button>
     <button type="button" className="camera-entry-button" aria-disabled={disabled || undefined} onClick={() => { if (!disabled) openCameraApp(); }}><Camera size={17} /> Camera app</button>
     {notice && <p className="camera-entry-notice" role="status">{notice}</p>}
-    {holdsGuided && <p className="camera-entry-note">Guided-camera photos are kept only in this tab and can’t be recovered after a reload. Upload before you close it.</p>}
+    {holdsUnrecoverable && <p className="camera-entry-note">Guided-camera photos, and camera photos renamed because the name was taken, can’t be recovered after a reload. Upload before you close this tab.</p>}
     {open && <CameraCapture selection={budget}
       onClose={shots => { setOpen(false); addGuided(shots); returnFocus(); }}
       onUseCameraApp={shots => { openCameraApp(); setOpen(false); addGuided(shots); }} />}

@@ -66,31 +66,44 @@ test('cameraFileName is unique per session and position and sorts in shooting or
 });
 
 test('cameraAppFileName keeps the original name unless another photo in the selection uses it', () => {
-  const photo = (name, size, lastModified = 1700000000123, type = 'image/jpeg') => ({ name, size, lastModified, type });
+  const T = 1700000000123;
+  const photo = (name, size, lastModified = T, type = 'image/jpeg') => ({ name, size, lastModified, type });
+  const had = (name, size, lastModified = T) => ({ name, size, lastModified });
   // No clash: the name the resume matcher will look for stays exactly as picked.
   assert.equal(m.cameraAppFileName(photo('IMG_20261123_101530.jpg', 5000), []), 'IMG_20261123_101530.jpg');
-  assert.equal(m.cameraAppFileName(photo('image.jpg', 5000), [{ name: 'other.jpg', size: 5000 }]), 'image.jpg');
-  assert.equal(m.cameraAppFileName(photo('IMG_0001.HEIC', 9000, 1, ''), [{ name: 'IMG_0002.HEIC', size: 9000 }]), 'IMG_0001.HEIC');
-  // Same name and size is the same photo picked again: the name stays, so Studio drops the repeat.
-  assert.equal(m.cameraAppFileName(photo('image.jpg', 5000), [{ name: 'image.jpg', size: 5000 }]), 'image.jpg');
+  assert.equal(m.cameraAppFileName(photo('image.jpg', 5000), [had('other.jpg', 5000)]), 'image.jpg');
+  assert.equal(m.cameraAppFileName(photo('IMG_0001.HEIC', 9000, 1, ''), [had('IMG_0002.HEIC', 9000, 1)]), 'IMG_0001.HEIC');
+  // Name, size and lastModified all equal: the same photo picked again; the name stays and Studio drops the repeat.
+  assert.equal(m.cameraAppFileName(photo('image.jpg', 5000), [had('image.jpg', 5000)]), 'image.jpg');
   // iOS repeats image.jpg for a different photo: a suffix from the file's own time and size.
-  assert.equal(m.cameraAppFileName(photo('image.jpg', 6000), [{ name: 'image.jpg', size: 5000 }]), 'image-1700000000123-6000.jpg');
-  assert.equal(m.cameraAppFileName(photo('IMG_0001.HEIC', 7000, 42, ''), [{ name: 'IMG_0001.HEIC', size: 1 }]), 'IMG_0001-42-7000.HEIC');
+  assert.equal(m.cameraAppFileName(photo('image.jpg', 6000), [had('image.jpg', 5000)]), `image-${T}-6000.jpg`);
+  assert.equal(m.cameraAppFileName(photo('IMG_0001.HEIC', 7000, 42, ''), [had('IMG_0001.HEIC', 1, 42)]), 'IMG_0001-42-7000.HEIC');
+});
+
+test('cameraAppFileName keeps two different photos with the same name and size (different lastModified)', () => {
+  const first = { name: 'image.jpg', size: 5000, lastModified: 1700000000000, type: 'image/jpeg' };
+  const second = { ...first, lastModified: 1700000009999 };
+  const firstName = m.cameraAppFileName(first, []);
+  const secondName = m.cameraAppFileName(second, [{ name: firstName, size: first.size, lastModified: first.lastModified }]);
+  assert.equal(firstName, 'image.jpg');
+  assert.equal(secondName, 'image-1700000009999-5000.jpg');
+  // Studio's name + size key no longer collides, so it keeps both.
+  assert.notEqual(`${firstName}:${first.size}`, `${secondName}:${second.size}`);
 });
 
 test('cameraAppFileName is deterministic, so picking the same photo again gives the same name', () => {
-  const selection = [{ name: 'image.jpg', size: 5000 }];
+  const selection = [{ name: 'image.jpg', size: 5000, lastModified: 1 }];
   const again = { name: 'image.jpg', size: 6000, lastModified: 1700000000123, type: 'image/jpeg' };
   const first = m.cameraAppFileName(again, selection);
   assert.equal(m.cameraAppFileName(again, selection), first);
-  // Once it is in the selection, picking it again keeps the suffixed name (same name and size: a repeat).
-  assert.equal(m.cameraAppFileName(again, [...selection, { name: first, size: 6000 }]), first);
-  // The suffixed name itself taken by a different photo: -2, -3, …
-  assert.equal(m.cameraAppFileName(again, [...selection, { name: first, size: 1 }]), 'image-1700000000123-6000-2.jpg');
-  assert.equal(m.cameraAppFileName(again, [...selection, { name: first, size: 1 }, { name: 'image-1700000000123-6000-2.jpg', size: 2 }]), 'image-1700000000123-6000-3.jpg');
+  // Once in the selection, picking it again (name, size, lastModified all equal) returns that name: Studio drops the repeat.
+  assert.equal(m.cameraAppFileName(again, [...selection, { name: first, size: 6000, lastModified: again.lastModified }]), first);
+  // The suffixed name itself taken by a different photo (even one of the same size): -2, -3, …
+  assert.equal(m.cameraAppFileName(again, [...selection, { name: first, size: 1, lastModified: 1 }]), 'image-1700000000123-6000-2.jpg');
+  assert.equal(m.cameraAppFileName(again, [...selection, { name: first, size: 6000, lastModified: 2 }, { name: 'image-1700000000123-6000-2.jpg', size: 2, lastModified: 2 }]), 'image-1700000000123-6000-3.jpg');
   // A missing name or extension falls back to the MIME type's.
   assert.equal(m.cameraAppFileName({ name: '', size: 10, lastModified: 0, type: 'image/png' }, []), 'image.png');
-  assert.equal(m.cameraAppFileName({ name: '1700000000000', size: 10, lastModified: 5, type: 'image/png' }, [{ name: '1700000000000', size: 11 }]), '1700000000000-5-10.png');
+  assert.equal(m.cameraAppFileName({ name: '1700000000000', size: 10, lastModified: 5, type: 'image/png' }, [{ name: '1700000000000', size: 11, lastModified: 5 }]), '1700000000000-5-10.png');
 });
 
 // ── capture limits ───────────────────────────────────────────────────────────────────────────

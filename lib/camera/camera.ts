@@ -72,22 +72,24 @@ export function cameraFileName(sessionStart: Date, position: number, extension =
 }
 
 const KNOWN_EXTENSIONS: Record<string, string> = { "image/jpeg": "jpg", "image/png": "png", "image/heic": "heic", "image/heif": "heif" };
-export type NamedFile = { name: string; size: number };
+export type NamedFile = { name: string; size: number; lastModified: number };
 /**
  * The name a photo from the `capture` file input (the camera app) joins the selection under. The
  * original name is kept whenever it can be: the resume-after-reload matcher (§8.1) pairs reselected
- * files with the manifest by exact name and size, so `IMG_20261123_101530.jpg` must stay that. Only
- * a name already used in the selection by a *different* photo (iOS calls every camera photo
- * `image.jpg`) is made unique, as `<stem>-<lastModified>-<size>.<ext>` (with `-2`, `-3`, … if even
- * that is taken). The result depends only on the file and the selection, so picking the same file
- * again gives the same name, and Studio's name + size check drops the repeat. A photo with the same
- * name *and* size as one in the selection keeps its name for the same reason.
+ * files with the manifest by exact name and size, so `IMG_20261123_101530.jpg` must stay that. A
+ * file counts as *the same photo* as one in the selection only when name, size and lastModified all
+ * match; it keeps that name, and Studio's name + size check drops the repeat. Any other use of the
+ * name (iOS calls every camera photo `image.jpg`, and two of them can have the same byte size) makes
+ * it unique, as `<stem>-<lastModified>-<size>.<ext>` (with `-2`, `-3`, … if even that is taken by a
+ * different photo), so Studio never mistakes a different photo for a repeat. The result depends only
+ * on the file and the selection, so picking the same file again gives the same name.
  */
-export function cameraAppFileName(file: NamedFile & { type: string; lastModified: number }, existing: readonly NamedFile[]): string {
+export function cameraAppFileName(file: NamedFile & { type: string }, existing: readonly NamedFile[]): string {
   const match = /\.([a-z0-9]{2,5})$/i.exec(file.name);
   const extension = match ? match[1] : KNOWN_EXTENSIONS[file.type.toLowerCase()] ?? "jpg";
   const name = file.name || `image.${extension}`;
-  const clash = (candidate: string) => existing.some(other => other.name === candidate && other.size !== file.size);
+  const samePhoto = (other: NamedFile) => other.size === file.size && other.lastModified === file.lastModified;
+  const clash = (candidate: string) => existing.some(other => other.name === candidate && !samePhoto(other));
   if (!clash(name)) return name;
   const stem = match ? name.slice(0, -match[0].length) : name;
   const base = `${stem}-${Math.max(0, Math.floor(file.lastModified || 0))}-${file.size}`;
