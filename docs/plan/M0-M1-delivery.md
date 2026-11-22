@@ -1,6 +1,6 @@
 # Delivery plan: M0–M4
 
-**Owner**: orchestrator (Claude Opus 5.5) · **Started**: 2026-11-22 · **Branch**: `m0-m1-delivery` (local commits only; no push without approval)
+**Owner**: orchestrator (Claude Opus 5.5) · **Started**: 2026-11-22 · **Branch**: `m0-m1-delivery` (pushed to `origin` after each shipment; push approved 2026-11-22)
 **Source of truth**: [PRD](../PRD.md), [capture-pipeline spec](../specs/capture-pipeline.md), [ADRs](../adr/README.md)
 
 ## Goals
@@ -56,3 +56,5 @@ Every shipment also requires: `npm run typecheck`, `npm run lint`, `npm test` an
 | 2026-11-22 | S2 | `81b799a`: done. typecheck/lint/build pass, 17/17 Miniflare tests. Codex review: 5 findings (1 high: backfills in a hosted migration), all fixed and re-verified. Open: whether Sites honours `triggers.crons` (claim-path and per-row expiry cover it if not) |
 | 2026-11-22 | S1 | Done. 55 worker tests pass on Python 3.12/3.13/3.14 (macOS) and 3.12 (Linux container); signal/process-group tests 0 failures in 144 runs at 48-way parallelism (plus 576 by the fixing agent). Four rounds: Codex implemented; python-reviewer found 9 then 4 issues; orchestrator stress testing exposed a signal-inside-`Popen`/`poll` race (orphaned stage, deadlock), fixed with safe-point signal deferral and deterministic regression tests |
 | 2026-11-22 | S3 | Done. `.github/workflows/ci.yml` (Node: typecheck, lint, test, build; Python 3.12: py_compile + unittest). Same commands pass locally. First GitHub run (45036504886, on push of `cb331c4`): web ✅ worker ✅ |
+| 2026-11-22 | S11 research | `5322765`: licence report in `docs/research/2026-11-22-preview-model-licences.md`. No pose-free feed-forward model passes the commercial gate. Proposed path: Apache-licensed pose estimation, then a short Brush/gsplat run as the preview. ADR-0008 amendment awaits the owner |
+| 2026-11-22 | S5 | In review. React review: ship after fixes (2 high, 4 medium). Codex server review confirmed 3 issues before it was killed: truncated SPZ passes validation, an in-flight SPZ PUT can change published bytes, orphaned SPZ when the worker dies. Fixes sent to the S5 agent |
