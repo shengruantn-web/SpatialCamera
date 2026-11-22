@@ -49,10 +49,50 @@ export function classifyByNameAndType(name: string, mime: string): "heic" | "not
   return "unknown";
 }
 
-/** "IMG_0001.HEIC" → "IMG_0001.jpg". */
+/**
+ * Name for a converted photo: "IMG_0001.HEIC" → "IMG_0001.heic.jpg" (review L4). Keeping the
+ * original extension means it cannot collide with a real "IMG_0001.jpg" from the same camera
+ * roll, and it is deterministic, so adding the same HEIC again de-duplicates by name and size.
+ */
 export function jpegName(name: string): string {
-  const base = name.replace(/\.[^./\\]*$/, "");
-  return `${base || "photo"}.jpg`;
+  const match = /^(.*?)(\.[^./\\]*)?$/.exec(name)!;
+  const stem = match[1] || "photo", ext = (match[2] ?? "").toLowerCase();
+  return ext === ".jpg" ? `${stem}.jpg` : `${stem}${ext}.jpg`;
+}
+
+/**
+ * `name`, or "stem (2).ext", "stem (3).ext", … — the first name that no *other* photo uses.
+ * `taken` maps names already in the selection (and earlier in this batch) to their byte sizes.
+ * A name held by a photo of the same size is returned unchanged: that is the same photo added
+ * again, and the caller's name + size check drops it.
+ */
+export function uniqueName(name: string, size: number, taken: ReadonlyMap<string, ReadonlySet<number>>): string {
+  const dot = name.lastIndexOf(".");
+  const stem = dot > 0 ? name.slice(0, dot) : name, ext = dot > 0 ? name.slice(dot) : "";
+  for (let n = 1; ; n++) {
+    const candidate = n === 1 ? name : `${stem} (${n})${ext}`;
+    const sizes = taken.get(candidate);
+    if (!sizes || sizes.has(size)) return candidate;
+  }
+}
+
+type Named = { name: string; size: number };
+const addName = (index: Map<string, Set<number>>, { name, size }: Named) => index.set(name, (index.get(name) ?? new Set<number>()).add(size));
+
+/**
+ * Final names for one add: `batch[i].converted` marks JPEGs made from HEIC, which get a
+ * `uniqueName` against the photos already selected, the batch's other files, and the converted
+ * photos named before them. Other files keep their names (Studio's name + size check handles them).
+ */
+export function convertedNames(selected: readonly Named[], batch: readonly (Named & { converted: boolean })[]): string[] {
+  const taken = new Map<string, Set<number>>();
+  [...selected, ...batch.filter(item => !item.converted)].forEach(item => addName(taken, item));
+  return batch.map(item => {
+    if (!item.converted) return item.name;
+    const name = uniqueName(item.name, item.size, taken);
+    addName(taken, { name, size: item.size });
+    return name;
+  });
 }
 
 export type EncodeAttempt = { quality: number; scale: number };

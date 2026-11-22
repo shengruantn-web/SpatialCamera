@@ -59,6 +59,7 @@ async function encode(bitmap: ImageBitmap): Promise<{ blob: Blob; attempt: Encod
     const width = Math.max(1, Math.round(bitmap.width * attempt.scale));
     const height = Math.max(1, Math.round(bitmap.height * attempt.scale));
     const canvas = new OffscreenCanvas(width, height);
+    // Review L1: sRGB canvas, no ICC in the output; a Display-P3 profile from heif-decode.ts would be applied here.
     const ctx = canvas.getContext("2d");
     if (!ctx) throw new ConversionError("This browser cannot convert HEIC photos. " + EXPORT_HINT);
     ctx.fillStyle = "#fff"; // JPEG has no alpha; flatten any transparency onto white.

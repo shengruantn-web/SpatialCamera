@@ -18,6 +18,11 @@ export async function decodeHeif(lib: LibHeif, bytes: Uint8Array, maxPixels = In
     if (!images.length) throw new HeifDecodeError("No decodable image in this HEIC file.");
     try {
       const primary = images.find(image => image.is_primary()) ?? images[0];
+      // Colour (review L1, known limitation): the pixels are passed on as if sRGB. iPhone HEICs are
+      // Display P3, signalled by an nclx and/or ICC `colr` box. libheif-js 1.23.5 has no JS wrapper
+      // for it; reading it here would mean the C exports _heif_image_handle_get_color_profile_type /
+      // _get_raw_color_profile(_size) on `primary.handle` with a _malloc'd buffer, and passing the
+      // result to encode() in heic.worker.ts (canvas colorSpace "display-p3" or an APP2 ICC segment).
       const width = primary.get_width(), height = primary.get_height();
       if (width * height > maxPixels) throw new HeifTooLargeError(width, height);
       const pixels = await new Promise<HeifPixels | null>(resolve =>
@@ -29,6 +34,7 @@ export async function decodeHeif(lib: LibHeif, bytes: Uint8Array, maxPixels = In
     }
   } finally {
     // Free the native context now rather than on the next decode; WASM memory is not GC'd.
+    // decoder.decoder and heif_context_free are libheif-js internals (exact pin 1.23.5); guarded by the "private members" test in tests/capture-prep.test.mjs.
     if (decoder.decoder) lib.heif_context_free(decoder.decoder);
     decoder.decoder = null;
   }

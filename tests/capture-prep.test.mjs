@@ -187,11 +187,34 @@ test('HEIC detection by extension, MIME type and leading bytes', () => {
   assert.equal(m.sniffHeic(new Uint8Array(readFileSync('tests/fixtures/rotated-90cw.heic').subarray(0, 64))), true);
 });
 
-test('jpegName swaps the extension', () => {
-  assert.equal(m.jpegName('IMG_0001.HEIC'), 'IMG_0001.jpg');
-  assert.equal(m.jpegName('my.trip.heif'), 'my.trip.jpg');
+test('jpegName keeps the original extension so it cannot clash with a real JPEG of the same stem', () => {
+  assert.equal(m.jpegName('IMG_0001.HEIC'), 'IMG_0001.heic.jpg');
+  assert.equal(m.jpegName('my.trip.heif'), 'my.trip.heif.jpg');
   assert.equal(m.jpegName('noext'), 'noext.jpg');
-  assert.equal(m.jpegName('.heic'), 'photo.jpg');
+  assert.equal(m.jpegName('.heic'), 'photo.heic.jpg');
+});
+
+test('uniqueName / convertedNames: converted photos get distinct names; re-adding the same HEIC still de-duplicates', () => {
+  // A HEIC plus a different-size JPEG of the same stem, in one batch and across adds.
+  const heic = { name: m.jpegName('IMG_0001.HEIC'), size: 200, converted: true };
+  const real = { name: 'IMG_0001.jpg', size: 100, converted: false };
+  assert.deepEqual(m.convertedNames([], [real, heic]), ['IMG_0001.jpg', 'IMG_0001.heic.jpg']);
+  assert.deepEqual(m.convertedNames([{ name: 'IMG_0001.jpg', size: 100 }], [heic]), ['IMG_0001.heic.jpg']);
+  // Re-adding the same HEIC: same name and size as the selected copy, so Studio's name + size check drops it.
+  const selected = [{ name: 'IMG_0001.jpg', size: 100 }, { name: 'IMG_0001.heic.jpg', size: 200 }];
+  assert.deepEqual(m.convertedNames(selected, [heic]), ['IMG_0001.heic.jpg']);
+  // A different photo already holds the name (e.g. IMG_0001.HEIC and IMG_0001.heic from two folders).
+  const other = { name: 'IMG_0001.heic.jpg', size: 300, converted: true };
+  assert.deepEqual(m.convertedNames(selected, [other]), ['IMG_0001.heic (2).jpg']);
+  assert.deepEqual(m.convertedNames([], [heic, other, { ...other, size: 400 }]), ['IMG_0001.heic.jpg', 'IMG_0001.heic (2).jpg', 'IMG_0001.heic (3).jpg']);
+  // A non-HEIC file anywhere in the batch counts as taken.
+  assert.deepEqual(m.convertedNames([], [heic, { name: 'IMG_0001.heic.jpg', size: 5, converted: false }]), ['IMG_0001.heic (2).jpg', 'IMG_0001.heic.jpg']);
+  // After Studio's name + size de-duplication, every remaining name is unique, so the upload and
+  // resume matcher (name, size) maps each manifest row to exactly one file.
+  const batch = [heic, other, real], names = m.convertedNames(selected, batch);
+  const kept = new Map([...selected, ...batch.map((f, i) => ({ name: names[i], size: f.size }))].map(f => [`${f.name}:${f.size}`, f.name]));
+  assert.deepEqual([...kept.values()].sort(), ['IMG_0001.heic (2).jpg', 'IMG_0001.heic.jpg', 'IMG_0001.jpg']);
+  assert.equal(m.uniqueName('noext', 1, new Map([['noext', new Set([2])]])), 'noext (2)');
 });
 
 test('nextEncodeAttempt walks the quality ladder, then downscales, then gives up', () => {
@@ -230,6 +253,32 @@ test('libheif (separate glue + .wasm, as shipped) decodes the HEIC fixture uprig
   // Pixel cap: refused from libheif's reported size, before the RGBA buffer is allocated.
   await assert.rejects(m.decodeHeif(lib, new Uint8Array(readFileSync('tests/fixtures/rotated-90cw.heic')), 1000),
     e => e instanceof m.HeifTooLargeError && e.width * e.height === 48 * 64);
+});
+
+test('libheif-js private members used by decodeHeif still exist (fails on an upgrade that drops them)', async () => {
+  // heif-decode.ts frees the native context itself via decoder.decoder + lib.heif_context_free,
+  // neither of which is public libheif-js API. Keep the exact pin; re-check this test before bumping it.
+  const require = createRequire(import.meta.url);
+  assert.equal(JSON.parse(readFileSync('package.json', 'utf8')).dependencies['libheif-js'], '1.23.5', 'exact pin');
+  assert.equal(require('libheif-js/package.json').version, '1.23.5');
+  const lib = await require('libheif-js/libheif-wasm/libheif.js')({ wasmBinary: readFileSync(require.resolve('libheif-js/libheif-wasm/libheif.wasm')) });
+  assert.equal(typeof lib.HeifDecoder, 'function');
+  assert.equal(typeof lib.heif_context_free, 'function');
+  const decoder = new lib.HeifDecoder();
+  assert.ok(Object.hasOwn(decoder, 'decoder'), 'HeifDecoder#decoder');
+  assert.equal(decoder.decoder, null);
+  const fixture = new Uint8Array(readFileSync('tests/fixtures/rotated-90cw.heic'));
+  const images = decoder.decode(fixture);
+  assert.equal(images.length, 1);
+  assert.ok(decoder.decoder !== null && typeof decoder.decoder === 'object', 'the embind-wrapped native heif_context');
+  images.forEach(image => image.free());
+  lib.heif_context_free(decoder.decoder);
+  decoder.decoder = null;
+  // With the field cleared, the next decode allocates a fresh context instead of freeing ours twice.
+  const again = decoder.decode(fixture);
+  assert.equal(again.length, 1);
+  again.forEach(image => image.free());
+  lib.heif_context_free(decoder.decoder);
 });
 
 // ── header sizes (dimensions.ts) ──────────────────────────────────────────────────────────

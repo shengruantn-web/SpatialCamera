@@ -14,7 +14,7 @@
  *    conversion dropped.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { classifyByNameAndType, jpegName, sniffHeic } from "../lib/capture-prep/heic";
+import { classifyByNameAndType, convertedNames, jpegName, sniffHeic } from "../lib/capture-prep/heic";
 import { buildPrepReport, type PrepReport } from "../lib/capture-prep/metrics";
 import { analysisPool, heicPool, prepSupported } from "../lib/capture-prep/pool";
 import type { ConversionStage } from "../lib/capture-prep/protocol";
@@ -158,7 +158,12 @@ export function useCapturePrep(files: readonly { file: File }[]): CapturePrep {
       update(key, { status: "done", bytes: jpeg.size, quality: result.quality, scale: result.scale });
       return jpeg;
     }));
-    return alive() ? results.filter((file): file is File => file !== null) : [];
+    if (!alive()) return [];
+    // Review L4: a converted name must not clash with a different photo already selected or
+    // elsewhere in this batch (two uploads under one name confuse the resume matcher).
+    const kept = results.flatMap((file, i) => file ? [{ file, converted: flags[i] }] : []);
+    const names = convertedNames(live.current.map(item => item.file), kept.map(({ file, converted }) => ({ name: file.name, size: file.size, converted })));
+    return kept.map(({ file }, i) => names[i] === file.name ? file : new File([file], names[i], { type: file.type, lastModified: file.lastModified }));
   }, []);
 
   const cancelConversions = useCallback(() => add.current?.conversions.abort(), []);
