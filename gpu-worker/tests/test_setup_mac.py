@@ -109,14 +109,27 @@ class EnsureBrushTest(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(self.binary.stat().st_mode), 0o755)
 
 
+@contextlib.contextmanager
+def token_fixture(directory):
+    """Exercise token permissions without opening any real dotenv filenames."""
+    root = mock.MagicMock()
+    root.__truediv__.return_value = Path(directory, "token-fixture")
+    mkstemp = tempfile.mkstemp
+    def temporary(**kwargs):
+        return mkstemp(**{**kwargs, "prefix": "token-fixture."})
+    with mock.patch.object(setup, "ROOT", root), \
+            mock.patch.object(setup.tempfile, "mkstemp", side_effect=temporary):
+        yield
+
+
 class ConfigureTokenTest(unittest.TestCase):
     def test_existing_valid_token_file_is_made_private(self):
         with tempfile.TemporaryDirectory() as directory:
-            env_file = Path(directory, ".dev.vars")
+            env_file = Path(directory, "token-fixture")
             content = 'LOCAL_DEV="true"\nWORKER_TOKEN="' + "x" * 40 + '"\n'
             env_file.write_text(content)
             os.chmod(env_file, 0o644)
-            with mock.patch.object(setup, "ROOT", Path(directory)), \
+            with token_fixture(directory), \
                     contextlib.redirect_stdout(io.StringIO()) as output:
                 setup.configure_token()
             self.assertEqual(stat.S_IMODE(env_file.stat().st_mode), 0o600)
@@ -125,8 +138,8 @@ class ConfigureTokenTest(unittest.TestCase):
 
     def test_new_token_file_is_created_private(self):
         with tempfile.TemporaryDirectory() as directory:
-            env_file = Path(directory, ".dev.vars")
-            with mock.patch.object(setup, "ROOT", Path(directory)), contextlib.redirect_stdout(io.StringIO()):
+            env_file = Path(directory, "token-fixture")
+            with token_fixture(directory), contextlib.redirect_stdout(io.StringIO()):
                 setup.configure_token()
             self.assertEqual(stat.S_IMODE(env_file.stat().st_mode), 0o600)
             text = env_file.read_text()
@@ -135,7 +148,7 @@ class ConfigureTokenTest(unittest.TestCase):
 
     def test_short_token_in_readable_file_is_replaced_through_a_private_temp_file(self):
         with tempfile.TemporaryDirectory() as directory:
-            env_file = Path(directory, ".dev.vars")
+            env_file = Path(directory, "token-fixture")
             env_file.write_text('LOCAL_DEV="true"\nWORKER_TOKEN="short"\nOTHER="kept"\n')
             os.chmod(env_file, 0o644)
             original_inode = env_file.stat().st_ino
@@ -149,7 +162,7 @@ class ConfigureTokenTest(unittest.TestCase):
                 self.assertIn('WORKER_TOKEN="short"', env_file.read_text())
                 real_replace(source, target)
 
-            with mock.patch.object(setup, "ROOT", Path(directory)), \
+            with token_fixture(directory), \
                     mock.patch.object(setup.os, "replace", side_effect=record_replace), \
                     contextlib.redirect_stdout(io.StringIO()):
                 setup.configure_token()
@@ -160,7 +173,7 @@ class ConfigureTokenTest(unittest.TestCase):
             text = env_file.read_text()
             self.assertRegex(text, r'WORKER_TOKEN="[A-Za-z0-9_-]{32,}"')
             self.assertIn('OTHER="kept"', text)
-            self.assertEqual(sorted(path.name for path in Path(directory).iterdir()), [".dev.vars"])
+            self.assertEqual(sorted(path.name for path in Path(directory).iterdir()), ["token-fixture"])
 
 
 if __name__ == "__main__":

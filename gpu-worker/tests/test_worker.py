@@ -1,3 +1,4 @@
+import builtins
 import contextlib
 import http.client
 import http.server
@@ -5,6 +6,7 @@ import importlib.util
 import io
 import json
 import os
+import runpy
 from pathlib import Path
 import shutil
 import signal
@@ -153,7 +155,10 @@ class WorkerTests(unittest.TestCase):
             job_root.mkdir()
             return str(job_root)
 
-        def stage(command, log_path, current_stage, lease_lost):
+        def stage(command, log_path, current_stage, lease_lost, **kwargs):
+            if current_stage == "aligning":
+                (job_root / "dataset").mkdir()
+                (job_root / "dataset/alignment.json").write_text('{"registered": 0}')
             if current_stage == "training":
                 (job_root / "export" / "result.ply").write_bytes(data)
 
@@ -490,6 +495,175 @@ class WorkerTests(unittest.TestCase):
                     self.client.serve()
                 request.assert_called_once()
                 self.assertNotIn("Cannot reach job queue", self.output.getvalue())
+
+
+class WorkerFollowupTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.client = worker.Worker("http://localhost", "t" * 32, 7000, backend="brush")
+        self.job = {"id": "capture", "lease": "lease", "images": [
+            {"id": str(i), "mime": "image/jpeg"} for i in range(10)]}
+        self.output = io.StringIO()
+        self.stack = contextlib.ExitStack()
+        self.addCleanup(self.stack.close)
+        self.stack.enter_context(contextlib.redirect_stdout(self.output))
+        self.stack.enter_context(mock.patch.object(worker.sys, "platform", "linux"))
+
+    def stage(self, command, log_path, stage, lost, **kwargs):
+        root = log_path.parent
+        if stage == "aligning":
+            dataset = root / "dataset"
+            dataset.mkdir()
+            # One unreadable input is excluded from total by mac_pipeline, but
+            # must still count in the metric's denominator (8 / 10, not 8 / 9).
+            (dataset / "alignment.json").write_text(json.dumps({"registered": 8, "total": 9, "skipped": 1}))
+            (dataset / "transforms.json").write_text(json.dumps({"frames": [{}] * 8}))
+        elif stage == "training" and self.client.backend == "nerfstudio":
+            (root / "outputs").mkdir()
+            (root / "outputs/config.yml").write_text("checkpoint")
+        else:
+            (root / "export").mkdir(exist_ok=True)
+            (root / "export/result.ply").write_bytes(ply_bytes())
+
+    def process(self, stage=None):
+        self.root.joinpath("job").mkdir(exist_ok=True)
+        with mock.patch.object(worker.tempfile, "mkdtemp", return_value=str(self.root / "job")), \
+                mock.patch.object(self.client, "request", return_value=b"photo") as request, \
+                mock.patch.object(self.client, "run", side_effect=stage or self.stage) as run:
+            self.client.process(self.job)
+        return request, run
+
+    def test_brush_startup_checks_availability_without_importing_pycolmap(self):
+        imported = []
+        original_import = builtins.__import__
+        def tracked_import(name, *args, **kwargs):
+            if name == "pycolmap":
+                imported.append(name)
+                return mock.Mock()
+            return original_import(name, *args, **kwargs)
+        for available in (True, False):
+            with self.subTest(available=available), \
+                    mock.patch.object(builtins, "__import__", side_effect=tracked_import), \
+                    mock.patch.object(worker.importlib.util, "find_spec", return_value=object() if available else None) as find, \
+                    mock.patch.object(sys, "argv", [worker.__file__, "--backend", "brush", "--once", "--recovery-dir", str(self.root)]), \
+                    mock.patch.dict(os.environ, {"WORKER_TOKEN": "t" * 32, "SPATIAL_GATEWAY_HEADERS": "{}"}), \
+                    mock.patch.object(worker.signal, "signal"), \
+                    mock.patch.object(worker.shutil, "which", return_value="/fake/brush"), \
+                    mock.patch.object(worker.urllib.request, "urlopen", return_value=io.BytesIO(b'{"job": null}')), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                if available:
+                    runpy.run_path(worker.__file__, run_name="__main__")
+                else:
+                    with self.assertRaises(SystemExit) as raised:
+                        runpy.run_path(worker.__file__, run_name="__main__")
+                    self.assertEqual(raised.exception.code, 2)
+                self.assertEqual(imported, [])
+                find.assert_called_once_with("pycolmap")
+
+    def test_alignment_ratio_is_sent_in_training_request_for_both_backends(self):
+        for backend in ("brush", "nerfstudio"):
+            with self.subTest(backend=backend):
+                self.client.backend = backend
+                requests = []
+                def urlopen(request, timeout):
+                    if request.method == "PATCH":
+                        requests.append((request.full_url, request.get_header("X-job-lease"), json.loads(request.data)))
+                    return io.BytesIO(b"{}")
+                with mock.patch.object(worker.urllib.request, "urlopen", side_effect=urlopen), \
+                        mock.patch.object(self.client, "run", side_effect=self.stage):
+                    self.client.process(self.job)
+                training = [body for _, _, body in requests if body["status"] == "training"]
+                self.assertEqual(training, [{"status": "training", "error": None,
+                                             "metrics": {"alignment_ratio": 0.8}}])
+                self.assertTrue(all(url.endswith("/capture/status") and lease == "lease" for url, lease, _ in requests))
+                self.assertEqual(requests[-1][2]["status"], "exporting")
+
+    def test_brush_cwd_and_export_path_are_job_absolute_paths(self):
+        _, run = self.process()
+        training, = [call for call in run.call_args_list if call.args[2] == "training"]
+        self.assertEqual(training.kwargs.get("cwd"), self.root / "job")
+        command = training.args[0]
+        export = Path(command[command.index("--export-path") + 1])
+        self.assertTrue(export.is_absolute())
+        self.assertEqual(export, self.root / "job/export")
+        self.assertIn("Completed capture", self.output.getvalue())
+
+    def test_relative_brush_binary_still_resolves_from_launch_directory(self):
+        self.client = worker.Worker("http://localhost", "t" * 32, 7000,
+                                    backend="brush", brush=".local/bin/brush_app")
+        _, run = self.process()
+        training, = [call for call in run.call_args_list if call.args[2] == "training"]
+        self.assertEqual(training.args[0][0], str(Path(".local/bin/brush_app").resolve()))
+
+    def test_run_passes_cwd_to_subprocess(self):
+        process = mock.Mock(returncode=0)
+        process.poll.return_value = 0
+        with mock.patch.object(worker.subprocess, "Popen", return_value=process) as popen, \
+                mock.patch.object(worker, "terminate_process_group"):
+            self.client.run(["brush"], self.root / "stage.log", "training", threading.Event(), cwd=self.root)
+        self.assertEqual(popen.call_args.kwargs["cwd"], self.root)
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+
+    def test_caffeinate_lasts_through_job_and_is_reaped_on_every_exit(self):
+        for error in (None, RuntimeError("stage limit"), RuntimeError("lease lost"), SystemExit(143), KeyboardInterrupt()):
+            with self.subTest(error=error):
+                process = mock.Mock()
+                def stage(*args, **kwargs):
+                    process.terminate.assert_not_called()
+                    if error:
+                        raise error
+                    self.stage(*args, **kwargs)
+                with mock.patch.object(worker.sys, "platform", "darwin"), \
+                        mock.patch.object(worker.subprocess, "Popen", return_value=process) as popen:
+                    if isinstance(error, (SystemExit, KeyboardInterrupt)):
+                        with self.assertRaises(type(error)):
+                            self.process(stage)
+                    else:
+                        self.process(stage)
+                popen.assert_called_once_with(["caffeinate", "-i", "-w", str(os.getpid())],
+                                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                              start_new_session=True)
+                process.terminate.assert_called_once_with()
+                process.wait.assert_called_once_with(timeout=5)
+                self.assertFalse((self.root / "job").exists())
+
+    def test_missing_caffeinate_logs_once_and_jobs_still_complete(self):
+        with mock.patch.object(worker.sys, "platform", "darwin"), \
+                mock.patch.object(worker.subprocess, "Popen", side_effect=FileNotFoundError):
+            self.process()
+            self.process()
+        self.assertEqual(self.output.getvalue().count("keep-awake unavailable"), 1)
+        self.assertEqual(self.output.getvalue().count("Completed capture"), 2)
+
+    def test_non_macos_does_not_start_caffeinate(self):
+        with mock.patch.object(worker.subprocess, "Popen") as popen:
+            self.process()
+        popen.assert_not_called()
+
+    def test_caffeinate_cleanup_escalates_and_reaps(self):
+        process = mock.Mock()
+        process.wait.side_effect = [subprocess.TimeoutExpired("caffeinate", 5), 0]
+        with mock.patch.object(worker.sys, "platform", "darwin"), \
+                mock.patch.object(worker.subprocess, "Popen", return_value=process):
+            self.process()
+        process.kill.assert_called_once_with()
+        self.assertEqual(process.wait.call_args_list, [mock.call(timeout=5), mock.call()])
+
+    def test_signal_during_caffeinate_spawn_still_reaps_child(self):
+        signals = worker.ExitSignals()
+        process = mock.Mock()
+        def popen(*args, **kwargs):
+            signals.handle(signal.SIGTERM, None)
+            return process
+        with mock.patch.object(worker, "EXIT_SIGNALS", signals), \
+                mock.patch.object(worker.sys, "platform", "darwin"), \
+                mock.patch.object(worker.subprocess, "Popen", side_effect=popen), \
+                self.assertRaises(SystemExit):
+            self.process()
+        process.terminate.assert_called_once_with()
+        process.wait.assert_called_once_with(timeout=5)
 
 
 class MockWorkerTests(WorkerTests):
@@ -876,6 +1050,47 @@ with mock.patch.dict(os.environ, {{'WORKER_TOKEN': 't' * 32, 'SPATIAL_GATEWAY_HE
 """
                 fields = self.run_worker_script(script, marker, sig)
                 self.assertEqual(fields[1], "0", "stage child must start with no blocked signals")
+
+    def test_job_signal_reaps_caffeinate_outside_stage_group(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            marker, awake = root / "stage-pid", root / "awake-pid"
+            child = ("import os, sys, time; "
+                     "open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(60)")
+            script = f"""
+import worker, time
+worker.EXIT_SIGNALS.install()
+real_popen = subprocess.Popen
+
+def popen(command, **kwargs):
+    if command[0] == 'caffeinate':
+        process = real_popen([sys.executable, '-c', {child!r}, {str(awake)!r}], **kwargs)
+        deadline = time.monotonic() + 10
+        while not Path({str(awake)!r}).exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return process
+    return real_popen(command, **kwargs)
+
+class Client(worker.Worker):
+    def _process(self, job):
+        self.run([sys.executable, '-c', {child!r}, {str(marker)!r}],
+                 Path({str(root / 'stage.log')!r}), 'training', threading.Event(),
+                 poll_interval=0.01, terminate_timeout=0.1)
+
+with mock.patch.object(worker.sys, 'platform', 'darwin'), \\
+        mock.patch.object(worker.subprocess, 'Popen', side_effect=popen):
+    Client('http://localhost', 't' * 32, 7000).process({{}})
+"""
+            try:
+                self.run_worker_script(script, marker, signal.SIGTERM)
+                self.assertTrue(awake.exists(), "fake caffeinate did not start")
+                self.assert_stopped(int(awake.read_text()))
+            finally:
+                if awake.exists():
+                    try:
+                        os.kill(int(awake.read_text()), signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
 
     def test_signal_inside_popen_or_poll_still_terminates_stage_group(self):
         # Deterministically replays two races seen under load: a signal handled

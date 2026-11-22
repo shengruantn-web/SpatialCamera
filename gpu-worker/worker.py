@@ -230,9 +230,11 @@ class Worker:
         self.token = token
         self.iterations = iterations
         self.backend = backend
-        self.brush = brush
+        # Explicit relative binaries are relative to launch, not the job's cwd.
+        self.brush = str(Path(brush).resolve()) if os.path.dirname(brush) else brush
         self.max_resolution = max_resolution
         self.max_splats = max_splats
+        self.keep_awake_warned = False
         self.heartbeat_interval = heartbeat_interval
         self.retry_delays = tuple(retry_delays)
         self.recovery_dir = (Path(recovery_dir).expanduser() if recovery_dir is not None
@@ -356,7 +358,7 @@ class Worker:
         self.prune_recovery()
 
     def run(self, command, log_path, stage, lease_lost, timeout=7200,
-            poll_interval=2, terminate_timeout=10):
+            poll_interval=2, terminate_timeout=10, *, cwd=None):
         if lease_lost.is_set():
             raise RuntimeError("The processing lease was lost.")
         print(f"{stage.capitalize()}: {log_path.name}", flush=True)
@@ -364,7 +366,7 @@ class Worker:
         # EXIT_SIGNALS.sleep() or after terminate_process_group() returns.
         with log_path.open("wb") as log, EXIT_SIGNALS.deferred():
             process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT,
-                                       start_new_session=True)
+                                       start_new_session=True, cwd=cwd)
             try:
                 deadline = time.monotonic() + timeout
                 while process.poll() is None:
@@ -383,16 +385,48 @@ class Worker:
             raise RuntimeError(f"{stage.capitalize()} failed. Try sharper photos with more overlap and a still subject.")
 
     def process(self, job):
+        caffeinate = None
+        try:
+            # Defer signals across Popen's fork/return gap, just as for stages.
+            # The job itself stays interruptible (downloads, uploads, etc.).
+            with EXIT_SIGNALS.deferred():
+                if sys.platform == "darwin":
+                    try:
+                        caffeinate = subprocess.Popen(
+                            ["caffeinate", "-i", "-w", str(os.getpid())],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            start_new_session=True)
+                    except OSError as exc:
+                        if not self.keep_awake_warned:
+                            print(f"Mac keep-awake unavailable ({type(exc).__name__}); continuing without it.", flush=True)
+                            self.keep_awake_warned = True
+            self._process(job)
+        finally:
+            with EXIT_SIGNALS.deferred():
+                if caffeinate is not None:
+                    # This is our direct child, in a separate session from stages.
+                    # -w also releases the assertion if the worker dies abruptly.
+                    caffeinate.terminate()
+                    try:
+                        caffeinate.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        caffeinate.kill()
+                        caffeinate.wait()
+
+    def _process(self, job):
         job_id, lease = job["id"], job["lease"]
         stage = "aligning"
         stop = threading.Event()
         lease_lost = threading.Event()
         lock = threading.Lock()
 
-        def status(value, error=None):
+        def status(value, error=None, registered=None):
             nonlocal stage
+            payload = {"status": value, "error": error}
+            if registered is not None and job["images"]:
+                payload["metrics"] = {"alignment_ratio": registered / len(job["images"])}
             with lock:
-                self.request(f"{job_id}/status", "PATCH", {"status": value, "error": error}, lease)
+                self.request(f"{job_id}/status", "PATCH", payload, lease)
                 stage = value
 
         def heartbeat():
@@ -414,8 +448,8 @@ class Worker:
                         lease_lost.set()
                         return
 
-        def run(command, log_path):
-            self.run(command, log_path, stage, lease_lost)
+        def run(command, log_path, **kwargs):
+            self.run(command, log_path, stage, lease_lost, **kwargs)
 
         thread = threading.Thread(target=heartbeat, daemon=True)
         root = None
@@ -425,7 +459,7 @@ class Worker:
         try:
             try:
                 directory = tempfile.mkdtemp(prefix="spatial-capture-")
-                root = Path(directory)
+                root = Path(directory).resolve()
                 photos = root / "photos"
                 photos.mkdir()
                 for index, image in enumerate(job["images"]):
@@ -438,13 +472,14 @@ class Worker:
                 if self.backend == "brush":
                     run([sys.executable, str(Path(__file__).with_name("mac_pipeline.py")),
                          str(photos), str(dataset), "--max-resolution", str(self.max_resolution)], root / "alignment.log")
-                    status("training")
+                    alignment = json.loads((dataset / "alignment.json").read_text())
+                    status("training", registered=alignment["registered"])
                     exported.mkdir()
                     run([self.brush, str(dataset / "undistorted"),
                          "--total-steps", str(self.iterations), "--max-resolution", str(self.max_resolution),
                          "--max-splats", str(self.max_splats), "--sh-degree", "2",
                          "--export-every", str(self.iterations), "--export-path", str(exported),
-                         "--export-name", "result.ply"], root / "training.log")
+                         "--export-name", "result.ply"], root / "training.log", cwd=root)
                     status("exporting")
                 else:
                     run(["ns-process-data", "images", "--data", str(photos), "--output-dir", str(dataset)], root / "alignment.log")
@@ -452,7 +487,7 @@ class Worker:
                     registered = len(transforms.get("frames", []))
                     if registered < max(8, int(len(job["images"]) * 0.6)):
                         raise RuntimeError("Too few photos could be aligned. Add overlapping views and avoid blur, mirrors, and moving subjects.")
-                    status("training")
+                    status("training", registered=registered)
                     run(["ns-train", "splatfacto", "--data", str(dataset), "--output-dir", str(outputs),
                          "--max-num-iterations", str(self.iterations), "--vis", "tensorboard",
                          "--viewer.quit-on-train-completion", "True"], root / "training.log")
@@ -551,9 +586,9 @@ if __name__ == "__main__":
     if not 256 <= args.max_resolution <= 4096 or not 1000 <= args.max_splats <= 1000000:
         parser.error("Use resolution 256–4096 and 1,000–1,000,000 splats.")
     if args.backend == "brush":
-        try:
-            import pycolmap
-        except ImportError:
+        # Importing pycolmap installs signal handlers. Only the alignment
+        # subprocess may import it; the worker must retain EXIT_SIGNALS.
+        if importlib.util.find_spec("pycolmap") is None:
             parser.error("Missing pycolmap. Run npm run setup:mac first.")
     binaries = (args.brush,) if args.backend == "brush" else ("ns-process-data", "ns-train", "ns-export", "colmap", "ffmpeg", "nvidia-smi")
     for binary in binaries:
