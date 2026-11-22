@@ -1,5 +1,5 @@
 // Unit tests for the pure phone-camera logic (lib/camera/camera.ts, S9, PRD R1.4, spec §8.3):
-// shot-count guidance, file names, frame sizes, the takePhoto orientation check, availability and
+// shot-count guidance, file names, the capture budget, frame sizes, the takePhoto orientation check, availability and
 // error classification, the camera state machine, the touch-device check and the motion cue.
 import { test, before } from 'node:test';
 import assert from 'node:assert/strict';
@@ -8,7 +8,7 @@ import { build } from 'esbuild';
 let m;
 before(async () => {
   const result = await build({
-    stdin: { contents: `export * from "./lib/camera/camera.ts"; export { MIN_IMAGES, MAX_IMAGES, MAX_IMAGE_BYTES } from "./lib/validation.ts";`, resolveDir: process.cwd(), loader: 'ts' },
+    stdin: { contents: `export * from "./lib/camera/camera.ts"; export { MIN_IMAGES, MAX_IMAGES, MAX_IMAGE_BYTES, MAX_TOTAL_BYTES } from "./lib/validation.ts";`, resolveDir: process.cwd(), loader: 'ts' },
     bundle: true, write: false, format: 'esm', platform: 'neutral',
   });
   m = await import(`data:text/javascript;base64,${Buffer.from(result.outputFiles[0].text).toString('base64')}`);
@@ -65,13 +65,85 @@ test('cameraFileName is unique per session and position and sorts in shooting or
   assert.deepEqual(names.map(n => n.slice(-7, -4)), ['001', '002', '003', '010']);
 });
 
-test('capturedFileName replaces iOS "image.jpg" names but keeps the extension (HEIC stays detectable)', () => {
-  const when = new Date(2026, 0, 2, 3, 4, 5);
-  assert.equal(m.capturedFileName({ name: 'image.jpg', type: 'image/jpeg' }, when, 5), 'camera-20260102-030405-005.jpg');
-  assert.equal(m.capturedFileName({ name: 'IMG_0001.HEIC', type: '' }, when, 6), 'camera-20260102-030405-006.heic');
-  assert.equal(m.capturedFileName({ name: '1700000000000', type: 'image/png' }, when, 7), 'camera-20260102-030405-007.png');
-  assert.equal(m.capturedFileName({ name: 'blob', type: '' }, when, 8), 'camera-20260102-030405-008.jpg');
-  assert.notEqual(m.capturedFileName({ name: 'image.jpg', type: 'image/jpeg' }, when, 1), m.capturedFileName({ name: 'image.jpg', type: 'image/jpeg' }, when, 2));
+test('cameraAppFileName keeps the original name unless another photo in the selection uses it', () => {
+  const photo = (name, size, lastModified = 1700000000123, type = 'image/jpeg') => ({ name, size, lastModified, type });
+  // No clash: the name the resume matcher will look for stays exactly as picked.
+  assert.equal(m.cameraAppFileName(photo('IMG_20261123_101530.jpg', 5000), []), 'IMG_20261123_101530.jpg');
+  assert.equal(m.cameraAppFileName(photo('image.jpg', 5000), [{ name: 'other.jpg', size: 5000 }]), 'image.jpg');
+  assert.equal(m.cameraAppFileName(photo('IMG_0001.HEIC', 9000, 1, ''), [{ name: 'IMG_0002.HEIC', size: 9000 }]), 'IMG_0001.HEIC');
+  // Same name and size is the same photo picked again: the name stays, so Studio drops the repeat.
+  assert.equal(m.cameraAppFileName(photo('image.jpg', 5000), [{ name: 'image.jpg', size: 5000 }]), 'image.jpg');
+  // iOS repeats image.jpg for a different photo: a suffix from the file's own time and size.
+  assert.equal(m.cameraAppFileName(photo('image.jpg', 6000), [{ name: 'image.jpg', size: 5000 }]), 'image-1700000000123-6000.jpg');
+  assert.equal(m.cameraAppFileName(photo('IMG_0001.HEIC', 7000, 42, ''), [{ name: 'IMG_0001.HEIC', size: 1 }]), 'IMG_0001-42-7000.HEIC');
+});
+
+test('cameraAppFileName is deterministic, so picking the same photo again gives the same name', () => {
+  const selection = [{ name: 'image.jpg', size: 5000 }];
+  const again = { name: 'image.jpg', size: 6000, lastModified: 1700000000123, type: 'image/jpeg' };
+  const first = m.cameraAppFileName(again, selection);
+  assert.equal(m.cameraAppFileName(again, selection), first);
+  // Once it is in the selection, picking it again keeps the suffixed name (same name and size: a repeat).
+  assert.equal(m.cameraAppFileName(again, [...selection, { name: first, size: 6000 }]), first);
+  // The suffixed name itself taken by a different photo: -2, -3, …
+  assert.equal(m.cameraAppFileName(again, [...selection, { name: first, size: 1 }]), 'image-1700000000123-6000-2.jpg');
+  assert.equal(m.cameraAppFileName(again, [...selection, { name: first, size: 1 }, { name: 'image-1700000000123-6000-2.jpg', size: 2 }]), 'image-1700000000123-6000-3.jpg');
+  // A missing name or extension falls back to the MIME type's.
+  assert.equal(m.cameraAppFileName({ name: '', size: 10, lastModified: 0, type: 'image/png' }, []), 'image.png');
+  assert.equal(m.cameraAppFileName({ name: '1700000000000', size: 10, lastModified: 5, type: 'image/png' }, [{ name: '1700000000000', size: 11 }]), '1700000000000-5-10.png');
+});
+
+// ── capture limits ───────────────────────────────────────────────────────────────────────────
+const MiB = 1024 * 1024;
+test('CAPTURE_LIMITS come from lib/validation (200 photos, 1 GB, 20 MB each)', () => {
+  assert.equal(m.CAPTURE_LIMITS.maxImages, m.MAX_IMAGES);
+  assert.equal(m.CAPTURE_LIMITS.maxTotalBytes, m.MAX_TOTAL_BYTES);
+  assert.equal(m.CAPTURE_LIMITS.maxImageBytes, m.MAX_IMAGE_BYTES);
+  assert.deepEqual([m.MAX_IMAGES, m.MAX_TOTAL_BYTES, m.MAX_IMAGE_BYTES], [200, 1024 * MiB, 20 * MiB]);
+});
+
+test('shotBudget stops the shutter before a shot could pass the photo limit', () => {
+  assert.equal(m.shotBudget({ count: 0, bytes: 0 }, []).canShoot, true);
+  assert.equal(m.shotBudget({ count: 199, bytes: 0 }, []).canShoot, true);
+  const full = m.shotBudget({ count: 190, bytes: 0 }, Array(10).fill(1000));
+  assert.equal(full.canShoot, false);
+  assert.equal(full.limit, 'count');
+  assert.match(full.message, /200 photos/);
+  assert.equal(m.shotBudget({ count: 200, bytes: 0 }, []).limit, 'count');
+});
+
+test('shotBudget counts the selection, the real shot sizes and a worst-case next shot against 1 GB', () => {
+  // The review case: 100 × 10 MiB selected leaves room for 1024 − 1000 = 24 MiB; a 20 MiB shot can still fit once.
+  const selected = { count: 100, bytes: 100 * 10 * MiB };
+  assert.equal(m.shotBudget(selected, []).canShoot, true);
+  const after = m.shotBudget(selected, [10 * MiB]); // 14 MiB left < 20 MiB worst case
+  assert.equal(after.canShoot, false);
+  assert.equal(after.limit, 'bytes');
+  assert.match(after.message, /1 GB limit \(14 MB left; one photo can take up to 20 MB\)/);
+  // Small real shots keep the shutter going until the worst case no longer fits.
+  assert.equal(m.shotBudget({ count: 0, bytes: 1004 * MiB }, []).canShoot, true);
+  assert.equal(m.shotBudget({ count: 0, bytes: 1004 * MiB }, [1]).canShoot, false);
+  // Custom limits work the same way.
+  assert.deepEqual(m.shotBudget({ count: 0, bytes: 0 }, [3, 3], { maxImages: 10, maxTotalBytes: 10, maxImageBytes: 4 }).limit, null);
+  assert.deepEqual(m.shotBudget({ count: 0, bytes: 0 }, [3, 4], { maxImages: 10, maxTotalBytes: 10, maxImageBytes: 4 }).limit, 'bytes');
+});
+
+test('shotsThatFit never hands Studio more than it accepts, by its own rules', () => {
+  const shot = (size, id) => ({ size, id });
+  const ids = list => list.map(s => s.id);
+  // The review case without the shutter guard: of ten 10 MiB shots only two fit, and only those go.
+  const ten = Array.from({ length: 10 }, (_, i) => shot(10 * MiB, i));
+  assert.deepEqual(ids(m.shotsThatFit({ count: 100, bytes: 1000 * MiB }, ten)), [0, 1]);
+  // The photo limit, then the stop at the first overflow (Studio breaks there too).
+  assert.deepEqual(ids(m.shotsThatFit({ count: 198, bytes: 0 }, [shot(1, 'a'), shot(1, 'b'), shot(1, 'c')])), ['a', 'b']);
+  assert.deepEqual(ids(m.shotsThatFit({ count: 0, bytes: 1020 * MiB }, [shot(5 * MiB, 'big'), shot(1, 'small')])), []);
+  // Empty or oversized shots are skipped, as Studio skips them.
+  assert.deepEqual(ids(m.shotsThatFit({ count: 0, bytes: 0 }, [shot(0, 'empty'), shot(21 * MiB, 'huge'), shot(5, 'ok')])), ['ok']);
+  // Everything a budgeted session takes fits.
+  const sizes = [];
+  while (m.shotBudget({ count: 150, bytes: 900 * MiB }, sizes).canShoot) sizes.push(20 * MiB);
+  assert.equal(sizes.length, 6);
+  assert.equal(m.shotsThatFit({ count: 150, bytes: 900 * MiB }, sizes.map((size, id) => shot(size, id))).length, sizes.length);
 });
 
 // ── frame size and takePhoto check ───────────────────────────────────────────────────────────

@@ -12,13 +12,15 @@
  */
 import { useCallback, useRef, useState, useSyncExternalStore } from "react";
 import { Aperture, Camera } from "lucide-react";
-import { capturedFileName, problemMessages, showCameraEntry } from "../lib/camera/camera";
+import { cameraAppFileName, problemMessages, showCameraEntry, type NamedFile } from "../lib/camera/camera";
 import CameraCapture from "./CameraCapture";
 import { liveCameraAvailability } from "./useCamera";
 
 type Props = {
-  /** Photos already selected: numbering of the new files continues from here. */
-  existingCount: number;
+  /** The photos in Studio's selection: names to keep unique, and the guided mode's budget. */
+  selection: readonly File[];
+  /** Studio is busy or adding photos. The buttons stay focusable (aria-disabled), so focus that
+   * returns to them after the guided mode is not lost while the new photos are checked. */
   disabled: boolean;
   /** Studio's add path. One add runs at a time, so calls are queued here. */
   onAdd(files: File[]): Promise<void> | void;
@@ -36,33 +38,47 @@ const touchSnapshot = () => showCameraEntry({
   maxTouchPoints: navigator.maxTouchPoints ?? 0,
 });
 const serverSnapshot = () => false;
+const keyOf = (file: NamedFile) => `${file.name}:${file.size}`;
 
-export default function CameraEntry({ existingCount, disabled, onAdd }: Props) {
+export default function CameraEntry({ selection, disabled, onAdd }: Props) {
   const touch = useSyncExternalStore(subscribe, touchSnapshot, serverSnapshot);
   const [open, setOpen] = useState(false);
   const [notice, setNotice] = useState("");
+  /** Photos handed to the queue that Studio has not taken in yet. */
+  const [pending, setPending] = useState<File[]>([]);
+  /** Guided-mode photos: they exist only in this tab, which the note under the buttons says. */
+  const [guided] = useState(() => new WeakSet<File>());
   const input = useRef<HTMLInputElement>(null);
   const guidedButton = useRef<HTMLButtonElement>(null);
   const queue = useRef<Promise<void>>(Promise.resolve());
+
+  // The selection as Studio will hold it once the queue drains (Studio drops name + size repeats).
+  const known = [...new Map([...selection, ...pending].map(file => [keyOf(file), file])).values()];
+  const budget = { count: known.length, bytes: known.reduce((sum, file) => sum + file.size, 0) };
+  const holdsGuided = known.some(file => guided.has(file));
 
   // Studio takes one add at a time and reads its selection from a ref updated after render, so each
   // add waits for the previous one and a tick.
   const enqueue = useCallback((files: File[]) => {
     if (!files.length) return;
+    setPending(current => [...current, ...files]);
     queue.current = queue.current
       .then(() => onAdd(files))
       .catch(() => {})
-      .then(() => new Promise<void>(resolve => setTimeout(resolve, 0)));
+      .then(() => new Promise<void>(resolve => setTimeout(resolve, 0)))
+      .then(() => setPending(current => current.filter(file => !files.includes(file))));
   }, [onAdd]);
 
   function openCameraApp() { input.current?.click(); }
   function openGuided() {
+    if (disabled) return;
     const availability = liveCameraAvailability();
     if (availability !== "ok") { setNotice(problemMessages[availability]); openCameraApp(); return; }
     setNotice("");
     setOpen(true);
   }
   function returnFocus() { requestAnimationFrame(() => guidedButton.current?.focus()); }
+  function addGuided(shots: File[]) { shots.forEach(shot => guided.add(shot)); enqueue(shots); }
 
   if (!touch) return null;
   return <div className="camera-entry">
@@ -70,14 +86,21 @@ export default function CameraEntry({ existingCount, disabled, onAdd }: Props) {
       onChange={e => {
         const picked = Array.from(e.target.files ?? []);
         e.target.value = "";
-        const now = new Date();
-        enqueue(picked.map((file, i) => new File([file], capturedFileName(file, file.lastModified ? new Date(file.lastModified) : now, existingCount + i + 1), { type: file.type, lastModified: file.lastModified })));
+        // Original names stay (the resume matcher pairs files by name + size); only a name another
+        // photo already uses (iOS: every photo is image.jpg) gets a deterministic suffix.
+        const taken: NamedFile[] = [...known];
+        enqueue(picked.map(file => {
+          const name = cameraAppFileName(file, taken);
+          taken.push({ name, size: file.size });
+          return name === file.name ? file : new File([file], name, { type: file.type, lastModified: file.lastModified });
+        }));
       }} />
-    <button ref={guidedButton} type="button" className="camera-entry-button main" disabled={disabled} onClick={openGuided}><Aperture size={18} /><span className="camera-entry-label"><strong>Take photos</strong><small>guided camera</small></span></button>
-    <button type="button" className="camera-entry-button" disabled={disabled} onClick={openCameraApp}><Camera size={17} /> Camera app</button>
+    <button ref={guidedButton} type="button" className="camera-entry-button main" aria-disabled={disabled || undefined} onClick={openGuided}><Aperture size={18} /><span className="camera-entry-label"><strong>Take photos</strong><small>guided camera</small></span></button>
+    <button type="button" className="camera-entry-button" aria-disabled={disabled || undefined} onClick={() => { if (!disabled) openCameraApp(); }}><Camera size={17} /> Camera app</button>
     {notice && <p className="camera-entry-notice" role="status">{notice}</p>}
-    {open && <CameraCapture existingCount={existingCount}
-      onClose={shots => { setOpen(false); enqueue(shots); returnFocus(); }}
-      onUseCameraApp={shots => { openCameraApp(); setOpen(false); enqueue(shots); }} />}
+    {holdsGuided && <p className="camera-entry-note">Guided-camera photos are kept only in this tab and can’t be recovered after a reload. Upload before you close it.</p>}
+    {open && <CameraCapture selection={budget}
+      onClose={shots => { setOpen(false); addGuided(shots); returnFocus(); }}
+      onUseCameraApp={shots => { openCameraApp(); setOpen(false); addGuided(shots); }} />}
   </div>;
 }

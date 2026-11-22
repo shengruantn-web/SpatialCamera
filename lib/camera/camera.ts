@@ -3,7 +3,7 @@
  * is unit-tested in Node (tests/camera.test.mjs); components/useCamera.ts and CameraCapture.tsx
  * hold the browser side.
  */
-import { MAX_IMAGE_BYTES, MAX_IMAGES, MIN_IMAGES } from "../validation";
+import { MAX_IMAGE_BYTES, MAX_IMAGES, MAX_TOTAL_BYTES, MIN_IMAGES } from "../validation";
 import { RECOMMENDED_MIN_PHOTOS } from "../capture-prep/metrics";
 
 // ── Shot-count guidance ──────────────────────────────────────────────────────────────────────
@@ -72,16 +72,82 @@ export function cameraFileName(sessionStart: Date, position: number, extension =
 }
 
 const KNOWN_EXTENSIONS: Record<string, string> = { "image/jpeg": "jpg", "image/png": "png", "image/heic": "heic", "image/heif": "heif" };
+export type NamedFile = { name: string; size: number };
 /**
- * A unique name for a photo from the `capture` file input. iOS Safari names every camera photo
- * `image.jpg` and Android uses a millisecond number, so a set taken one photo at a time would be a
- * list of identical names in the warnings and the resume prompt. The original extension (or the
- * MIME type's) is kept, so HEIC detection and conversion (§8.1) still apply.
+ * The name a photo from the `capture` file input (the camera app) joins the selection under. The
+ * original name is kept whenever it can be: the resume-after-reload matcher (§8.1) pairs reselected
+ * files with the manifest by exact name and size, so `IMG_20261123_101530.jpg` must stay that. Only
+ * a name already used in the selection by a *different* photo (iOS calls every camera photo
+ * `image.jpg`) is made unique, as `<stem>-<lastModified>-<size>.<ext>` (with `-2`, `-3`, … if even
+ * that is taken). The result depends only on the file and the selection, so picking the same file
+ * again gives the same name, and Studio's name + size check drops the repeat. A photo with the same
+ * name *and* size as one in the selection keeps its name for the same reason.
  */
-export function capturedFileName(original: { name: string; type: string }, when: Date, position: number): string {
-  const match = /\.([a-z0-9]{2,5})$/i.exec(original.name);
-  const extension = match ? match[1].toLowerCase() : KNOWN_EXTENSIONS[original.type.toLowerCase()] ?? "jpg";
-  return cameraFileName(when, position, extension);
+export function cameraAppFileName(file: NamedFile & { type: string; lastModified: number }, existing: readonly NamedFile[]): string {
+  const match = /\.([a-z0-9]{2,5})$/i.exec(file.name);
+  const extension = match ? match[1] : KNOWN_EXTENSIONS[file.type.toLowerCase()] ?? "jpg";
+  const name = file.name || `image.${extension}`;
+  const clash = (candidate: string) => existing.some(other => other.name === candidate && other.size !== file.size);
+  if (!clash(name)) return name;
+  const stem = match ? name.slice(0, -match[0].length) : name;
+  const base = `${stem}-${Math.max(0, Math.floor(file.lastModified || 0))}-${file.size}`;
+  for (let n = 1; ; n++) {
+    const candidate = `${base}${n === 1 ? "" : `-${n}`}.${extension}`;
+    if (!clash(candidate)) return candidate;
+  }
+}
+
+// ── Capture limits (what Studio accepts) ─────────────────────────────────────────────────────
+/** The per-capture limits Studio and the server enforce, from lib/validation.ts. */
+export const CAPTURE_LIMITS = { maxImages: MAX_IMAGES, maxTotalBytes: MAX_TOTAL_BYTES, maxImageBytes: MAX_IMAGE_BYTES };
+export type CaptureLimits = typeof CAPTURE_LIMITS;
+/** The photos already in the selection (or queued for it) when the guided mode opens. */
+export type Selection = { count: number; bytes: number };
+export type ShotBudget = { canShoot: true; limit: null; message: null } | { canShoot: false; limit: "count" | "bytes"; message: string };
+
+const wholeMegabytes = (bytes: number) => Math.max(0, Math.floor(bytes / (1024 * 1024)));
+const sizeLabel = (bytes: number) => (bytes >= 1024 ** 3 && bytes % 1024 ** 3 === 0 ? `${bytes / 1024 ** 3} GB` : `${wholeMegabytes(bytes)} MB`);
+
+/**
+ * Whether the guided mode may take another photo. Guided shots exist only in memory, so a shot
+ * Studio would refuse at Done is a photo lost: the shutter stops as soon as the next shot *could*
+ * break a limit, counting the selection, the real sizes of the shots taken so far and the largest
+ * photo the camera can produce (`maxImageBytes`; useCamera drops larger takePhoto results and
+ * re-encodes video frames under it). The same bound caps what the dialog holds in memory.
+ */
+export function shotBudget(selection: Selection, shotSizes: readonly number[], limits: CaptureLimits = CAPTURE_LIMITS): ShotBudget {
+  const count = selection.count + shotSizes.length;
+  const bytes = selection.bytes + shotSizes.reduce((sum, size) => sum + size, 0);
+  if (count >= limits.maxImages) {
+    return { canShoot: false, limit: "count", message: `That’s the limit of ${limits.maxImages} photos for one capture. Tap Done to add them.` };
+  }
+  if (bytes + limits.maxImageBytes > limits.maxTotalBytes) {
+    return {
+      canShoot: false,
+      limit: "bytes",
+      message: `This capture is near its ${sizeLabel(limits.maxTotalBytes)} limit (${wholeMegabytes(limits.maxTotalBytes - bytes)} MB left; one photo can take up to ${sizeLabel(limits.maxImageBytes)}). Tap Done to add your photos.`,
+    };
+  }
+  return { canShoot: true, limit: null, message: null };
+}
+
+/**
+ * The shots Studio's add path accepts on top of the selection, by its rules: it stops at the first
+ * photo that would pass the photo or byte limit and skips an empty or oversized one. With the
+ * shutter held by `shotBudget` that is every shot; Done never hands Studio more than this.
+ */
+export function shotsThatFit<T extends { size: number }>(selection: Selection, shots: readonly T[], limits: CaptureLimits = CAPTURE_LIMITS): T[] {
+  const kept: T[] = [];
+  let count = selection.count;
+  let bytes = selection.bytes;
+  for (const shot of shots) {
+    if (count >= limits.maxImages || bytes + shot.size > limits.maxTotalBytes) break;
+    if (shot.size <= 0 || shot.size > limits.maxImageBytes) continue;
+    kept.push(shot);
+    count += 1;
+    bytes += shot.size;
+  }
+  return kept;
 }
 
 // ── Frame size and encoding ──────────────────────────────────────────────────────────────────

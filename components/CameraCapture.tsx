@@ -6,27 +6,31 @@
  * (focus stays inside, Escape and the Android back gesture close it), a shutter, a shot counter
  * against the 12–200 range with a goal of 40, and an overlap hint with a faded "ghost" of the last
  * shot. Closing, by any route, keeps the photos taken: they go to Studio's normal add path
- * (validation, prep checks, upload), exactly like picked files.
+ * (validation, prep checks, upload), exactly like picked files. The shots live only in memory, so
+ * the shutter stops before a shot Studio could refuse (photo count or total bytes, `shotBudget`),
+ * and Done hands over only what Studio accepts (`shotsThatFit`).
  */
 import { useEffect, useRef, useState } from "react";
 import { Check, Ghost, LoaderCircle, RefreshCw, Smartphone, Undo2, X } from "lucide-react";
 import {
-  SHOT_GOAL, cameraFileName, canRetry, overlapHint, problemMessages, shotAnnouncement, shotGuidance,
+  SHOT_GOAL, cameraFileName, canRetry, overlapHint, problemMessages, shotAnnouncement, shotBudget, shotGuidance, shotsThatFit,
+  type Selection,
 } from "../lib/camera/camera";
 import { MIN_IMAGES } from "../lib/validation";
 import { useCamera, useMotionCue } from "./useCamera";
 
 type Taken = { file: File; preview: string | null };
 type Props = {
-  /** Photos already in the selection; the counter and the file numbers continue from here. */
-  existingCount: number;
+  /** Photos already in (or queued for) the selection: the counter, the file numbers and the
+   * photo and byte budget continue from here. */
+  selection: Selection;
   /** The mode is closing (done, close button, Escape, back gesture). */
   onClose(shots: File[]): void;
   /** "Use camera app" from an error: the parent opens the `capture` file input in this same tap. */
   onUseCameraApp(shots: File[]): void;
 };
 
-export default function CameraCapture({ existingCount, onClose, onUseCameraApp }: Props) {
+export default function CameraCapture({ selection, onClose, onUseCameraApp }: Props) {
   const dialogRef = useRef<HTMLDialogElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const shutterRef = useRef<HTMLButtonElement>(null);
@@ -42,12 +46,15 @@ export default function CameraCapture({ existingCount, onClose, onUseCameraApp }
   const [shotError, setShotError] = useState("");
   const finished = useRef(false);
 
-  const total = existingCount + shots.length;
+  const total = selection.count + shots.length;
   const guidance = shotGuidance(total);
+  const budget = shotBudget(selection, shots.map(shot => shot.file.size));
   const motion = useMotionCue(state.status === "live" || state.status === "capturing", shots.length);
   const last = shots.at(-1);
   const busy = state.status === "capturing";
-  const shutterBlocked = state.status !== "live" || !guidance.canShoot;
+  const shutterBlocked = state.status !== "live" || !budget.canShoot;
+  /** What Done hands Studio: every shot, as the budget holds the shutter; never more than it accepts. */
+  const keep = () => shotsThatFit(selection, shotsRef.current.map(shot => shot.file));
 
   // Open as a modal (top layer, inert page behind) and start the camera; the camera stops in
   // useCamera's cleanup when this unmounts. Not closed in the cleanup: StrictMode re-runs effects.
@@ -73,14 +80,14 @@ export default function CameraCapture({ existingCount, onClose, onUseCameraApp }
     if (finished.current) return;
     finished.current = true;
     close();
-    onClose(shotsRef.current.map(shot => shot.file));
+    onClose(keep());
   }
   function switchToCameraApp() {
     if (finished.current) return;
     finished.current = true;
     close();
     dialogRef.current?.close();
-    onUseCameraApp(shotsRef.current.map(shot => shot.file)); // synchronously, inside this tap
+    onUseCameraApp(keep()); // synchronously, inside this tap
   }
 
   async function shoot() {
@@ -89,12 +96,19 @@ export default function CameraCapture({ existingCount, onClose, onUseCameraApp }
     const shot = await camera.capture();
     if (finished.current) return; // closed while the photo was being taken
     if (!shot) { setShotError("That photo could not be taken. Try again."); setAnnouncement("That photo could not be taken. Try again."); return; }
-    const position = existingCount + shotsRef.current.length + 1;
-    // Always a JPEG: useCamera uses takePhoto only when it returns one, else a JPEG video frame.
+    const position = selection.count + shotsRef.current.length + 1;
+    // Always a JPEG of at most MAX_IMAGE_BYTES: useCamera uses takePhoto only when it returns one,
+    // else a JPEG video frame encoded under the limit.
     const file = new File([shot.photo], cameraFileName(sessionStart, position), { type: "image/jpeg", lastModified: Date.now() });
+    if (shotsThatFit(selection, [...shotsRef.current.map(s => s.file), file]).length <= shotsRef.current.length) {
+      // Cannot happen while the budget holds the shutter; never keep a photo Done would drop.
+      setShotError("That photo would pass the capture limit, so it was not kept.");
+      return;
+    }
     shotsRef.current = [...shotsRef.current, { file, preview: shot.preview }];
     setShots(shotsRef.current);
-    setAnnouncement(shotAnnouncement(position));
+    const next = shotBudget(selection, shotsRef.current.map(s => s.file.size));
+    setAnnouncement(next.canShoot ? shotAnnouncement(position) : `Photo ${position} taken. ${next.message}`);
     setFlash(n => n + 1);
     try { navigator.vibrate?.(15); } catch { /* not on iOS; harmless elsewhere */ }
   }
@@ -102,7 +116,7 @@ export default function CameraCapture({ existingCount, onClose, onUseCameraApp }
     if (!shotsRef.current.length) return;
     shotsRef.current = shotsRef.current.slice(0, -1);
     setShots(shotsRef.current);
-    const remaining = existingCount + shotsRef.current.length;
+    const remaining = selection.count + shotsRef.current.length;
     setAnnouncement(`Last photo deleted. ${remaining} ${remaining === 1 ? "photo" : "photos"}.`);
   }
 
@@ -138,15 +152,16 @@ export default function CameraCapture({ existingCount, onClose, onUseCameraApp }
       </div>
 
       <div className="camera-hints" id="camera-guidance">
-        <p className="camera-message">{guidance.message}</p>
-        <p className={motion ? "camera-warning" : ""}>{motion ?? overlapHint(shots.length, ghostOn)}</p>
+        <p className={budget.canShoot ? "camera-message" : "camera-message camera-warning"}>{budget.message ?? guidance.message}</p>
+        {budget.canShoot && <p className={motion ? "camera-warning" : ""}>{motion ?? overlapHint(shots.length, ghostOn)}</p>}
         {shotError && <p className="camera-warning" role="alert">{shotError}</p>}
+        {shots.length > 0 && <p className="camera-note">These photos are kept only in this tab. Upload them before you close or reload it.</p>}
       </div>
 
       <div className="camera-controls">
         <button type="button" className="camera-round" aria-label="Delete the last photo" title="Delete the last photo" disabled={!shots.length || busy} onClick={undo}><Undo2 size={19} /></button>
         <button ref={shutterRef} type="button" className="camera-shutter" aria-disabled={shutterBlocked || undefined} aria-busy={busy || undefined}
-          aria-label={guidance.canShoot ? `Take photo, ${guidance.total} taken` : `Photo limit reached, ${guidance.total} taken`} onClick={() => void shoot()}>
+          aria-label={budget.canShoot ? `Take photo, ${guidance.total} taken` : `Capture limit reached, ${guidance.total} taken`} onClick={() => void shoot()}>
           <span>{busy && <LoaderCircle size={22} className="spin" />}</span>
         </button>
         <button type="button" className="camera-done" onClick={finish} aria-label={shots.length ? `Done, add ${shots.length} ${shots.length === 1 ? "photo" : "photos"}` : "Done"}>
