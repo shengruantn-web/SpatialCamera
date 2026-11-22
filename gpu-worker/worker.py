@@ -231,7 +231,7 @@ class Worker:
         self.iterations = iterations
         self.backend = backend
         # Explicit relative binaries are relative to launch, not the job's cwd.
-        self.brush = str(Path(brush).resolve()) if os.path.dirname(brush) else brush
+        self.brush = os.path.abspath(brush) if os.path.dirname(brush) else brush  # keep symlinks: argv[0] stays as given
         self.max_resolution = max_resolution
         self.max_splats = max_splats
         self.keep_awake_warned = False
@@ -588,8 +588,18 @@ if __name__ == "__main__":
     if args.backend == "brush":
         # Importing pycolmap installs signal handlers. Only the alignment
         # subprocess may import it; the worker must retain EXIT_SIGNALS.
+        # find_spec proves the package exists; a throwaway interpreter proves
+        # it imports (wrong-architecture wheels, missing dylibs) without
+        # touching this process's signal handlers.
         if importlib.util.find_spec("pycolmap") is None:
             parser.error("Missing pycolmap. Run npm run setup:mac first.")
+        try:
+            probe = subprocess.run([sys.executable, "-c", "import pycolmap"], capture_output=True, text=True, timeout=120)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            parser.error(f"Could not check pycolmap ({exc}). Run npm run setup:mac first.")
+        if probe.returncode != 0:
+            detail = (probe.stderr.strip().splitlines() or ["no error output"])[-1]
+            parser.error(f"pycolmap is installed but fails to import: {detail}. Run npm run setup:mac first.")
     binaries = (args.brush,) if args.backend == "brush" else ("ns-process-data", "ns-train", "ns-export", "colmap", "ffmpeg", "nvidia-smi")
     for binary in binaries:
         if not shutil.which(binary):

@@ -543,17 +543,21 @@ class WorkerFollowupTests(unittest.TestCase):
                 imported.append(name)
                 return mock.Mock()
             return original_import(name, *args, **kwargs)
-        for available in (True, False):
-            with self.subTest(available=available), \
+        cases = ((True, 0), (False, 0), (True, 1))  # (package found, probe exit code)
+        for available, probe_code in cases:
+            imported.clear()
+            probe = mock.Mock(return_value=subprocess.CompletedProcess([], probe_code, "", "ImportError: dlopen failed"))
+            with self.subTest(available=available, probe_code=probe_code), \
                     mock.patch.object(builtins, "__import__", side_effect=tracked_import), \
                     mock.patch.object(worker.importlib.util, "find_spec", return_value=object() if available else None) as find, \
+                    mock.patch.object(worker.subprocess, "run", probe), \
                     mock.patch.object(sys, "argv", [worker.__file__, "--backend", "brush", "--once", "--recovery-dir", str(self.root)]), \
                     mock.patch.dict(os.environ, {"WORKER_TOKEN": "t" * 32, "SPATIAL_GATEWAY_HEADERS": "{}"}), \
                     mock.patch.object(worker.signal, "signal"), \
                     mock.patch.object(worker.shutil, "which", return_value="/fake/brush"), \
                     mock.patch.object(worker.urllib.request, "urlopen", return_value=io.BytesIO(b'{"job": null}')), \
                     contextlib.redirect_stderr(io.StringIO()):
-                if available:
+                if available and probe_code == 0:
                     runpy.run_path(worker.__file__, run_name="__main__")
                 else:
                     with self.assertRaises(SystemExit) as raised:
@@ -561,6 +565,10 @@ class WorkerFollowupTests(unittest.TestCase):
                     self.assertEqual(raised.exception.code, 2)
                 self.assertEqual(imported, [])
                 find.assert_called_once_with("pycolmap")
+                if available:  # the import is probed in a separate interpreter, never in-process
+                    self.assertEqual(probe.call_args.args[0], [sys.executable, "-c", "import pycolmap"])
+                else:
+                    probe.assert_not_called()
 
     def test_alignment_ratio_is_sent_in_training_request_for_both_backends(self):
         for backend in ("brush", "nerfstudio"):
@@ -595,7 +603,7 @@ class WorkerFollowupTests(unittest.TestCase):
                                     backend="brush", brush=".local/bin/brush_app")
         _, run = self.process()
         training, = [call for call in run.call_args_list if call.args[2] == "training"]
-        self.assertEqual(training.args[0][0], str(Path(".local/bin/brush_app").resolve()))
+        self.assertEqual(training.args[0][0], os.path.abspath(".local/bin/brush_app"))
 
     def test_run_passes_cwd_to_subprocess(self):
         process = mock.Mock(returncode=0)
