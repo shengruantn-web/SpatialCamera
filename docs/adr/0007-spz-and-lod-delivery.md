@@ -17,8 +17,8 @@ The worker validates the PLY (spec T5) and converts it to SPZ, optionally also b
 Implemented as decided, apart from LOD:
 
 - The worker validates the PLY (S1, T5), converts it to SPZ (`gpu-worker/spz.py`, v3 by default) and uploads `result.spz` before `result.ply`. Conversion is best effort: if it fails, or the server predates SPZ, the PLY alone is delivered. The PLY is always kept as the archive and download.
-- The API stores the SPZ beside the attempt's PLY and publishes both in the PLY's conditional UPDATE (spec §7.3, §7.6). `GET /api/captures/:id/scene?v=<ready_at>` serves the SPZ, falling back to the PLY for older results, with immutable caching. The 90 MB cap applies to the PLY; the SPZ has its own 48 MB cap.
-- The viewer loads the scene with Spark's `onProgress` (real bytes, ADR-0005) and reuses one WebGL renderer across scenes.
+- The API validates the whole SPZ (full inflation to the exact size its header implies), stores it under a per-request key in the attempt's folder, and publishes it with the PLY in the PLY's conditional UPDATE; once `ready`, neither changes. Leftover attempt objects are garbage-collected (spec §7.3, §7.6, §7.7). `GET /api/captures/:id/scene?v=<ready_at>` serves the SPZ, falling back to the PLY for older results, with immutable caching. The 90 MB cap applies to the PLY; the SPZ has its own 48 MB cap.
+- The viewer fetches the scene itself (abortable) and streams it into Spark's `SplatMesh({ stream })`, counting real bytes for progress (ADR-0005). It falls back to the PLY, with a notice, if the SPZ will not decode, survives WebGL context loss with a reload, and reuses one WebGL renderer across scenes.
 - Measured on the S4 Brush scene: 35.5 MB PLY → 5.0 MB SPZ (7.1×), converted in 2.4 s ([run log](../plan/runs/2026-11-22-s5-spz-size.md)).
 
 One deliberate deviation: the SPZ keeps the PLY's coordinate frame instead of converting RDF → RUB as the SPZ spec and reference tools do, so PLY and SPZ results render identically under the viewer's single orientation. Frame handling belongs to defect D7.
