@@ -20,6 +20,7 @@ const newMiniflare = bindings => new Miniflare({ modules: true, script, compatib
 before(async () => {
   const result = await build({ stdin: { contents: `import { handleApi } from "./worker/api.ts";
     import { handleSharePublic, isSharePath, newShareToken } from "./worker/share.ts";
+    import { refuseFraming } from "./worker/framing.ts";
     const renderPage = async request => new Response('<!doctype html><title>rendered</title>' + new URL(request.url).pathname,
       { headers: { 'Content-Type': 'text/html; charset=utf-8', 'X-Frame-Options': 'SAMEORIGIN', 'Cache-Control': 'public, max-age=600' } });
     export default { fetch(request, env, ctx) {
@@ -27,8 +28,21 @@ before(async () => {
       if (url.pathname === '/__test/is-share-path') return Response.json(JSON.parse(url.searchParams.get('paths')).map(isSharePath));
       if (url.pathname === '/__test/tokens') return Response.json(Array.from({ length: 50 }, newShareToken));
       if (url.pathname.startsWith('/api/')) return handleApi(request, env, ctx);
-      if (isSharePath(url.pathname)) return handleSharePublic(request, env, renderPage);
-      return new Response('app', { status: 200 });
+      if (isSharePath(url.pathname)) {
+        // workerd always fills in CF-Connecting-IP (127.0.0.1 locally); this test-only header removes it,
+        // to stand in for a request that arrives without one.
+        if (request.headers.has('x-test-drop-client-ip')) {
+          request = new Request(request);
+          request.headers.delete('cf-connecting-ip');
+        }
+        return handleSharePublic(request, env, renderPage);
+      }
+      // Stands in for the app router, wrapped like worker/index.ts wraps it: ?type, ?csp and ?xfo set the
+      // response the "router" produced.
+      const headers = { 'Content-Type': url.searchParams.get('type') ?? 'text/html; charset=utf-8' };
+      if (url.searchParams.has('csp')) headers['Content-Security-Policy'] = url.searchParams.get('csp');
+      if (url.searchParams.has('xfo')) headers['X-Frame-Options'] = url.searchParams.get('xfo');
+      return refuseFraming(new Response('app', { status: 200, headers }));
     } };`, resolveDir: process.cwd() }, bundle: true, write: false, format: 'esm', platform: 'browser' });
   script = result.outputFiles[0].text;
   mf = newMiniflare({ SHARE_RATE_LIMIT: '100000' });
@@ -127,9 +141,19 @@ test('only a ready capture can be shared, and active links are capped', async ()
   const id = await readyCapture();
   const created = [];
   for (let i = 0; i < 20; i++) created.push(await createShare(id));
-  assert.equal((await api(`captures/${id}/shares`, { method: 'POST', body: {} })).status, 409);
+  const capped = await api(`captures/${id}/shares`, { method: 'POST', body: {} });
+  assert.equal(capped.status, 409);
+  assert.match((await capped.json()).error, /at most 20 active links/);
   await api(`captures/${id}/shares/${created[0].share.id}/revoke`, { method: 'POST' });
   assert.equal((await api(`captures/${id}/shares`, { method: 'POST', body: {} })).status, 201);
+});
+
+test('concurrent creates cannot exceed the active-link cap (the cap is in the INSERT)', async () => {
+  const id = await readyCapture();
+  const statuses = await Promise.all(Array.from({ length: 25 }, () => api(`captures/${id}/shares`, { method: 'POST', body: {} }).then(r => r.status)));
+  assert.equal(statuses.filter(s => s === 201).length, 20);
+  assert.equal(statuses.filter(s => s === 409).length, 5);
+  assert.equal((await db.prepare('SELECT COUNT(*) AS n FROM shares WHERE capture_id=? AND revoked_at IS NULL').bind(id).first()).n, 20);
 });
 
 test('another owner cannot list, create, change or revoke links', async () => {
@@ -240,6 +264,12 @@ test('revoked, unknown, malformed and non-ready links are 404 on every route, im
   assert.match(page.headers.get('content-type'), /text\/html/);
   assert.equal(page.headers.get('cache-control'), 'no-store');
   assert.doesNotMatch(await page.text(), /rendered/);
+  // Only the embed's 404 may be framed (it shows inside the host page); the page's refuses framing.
+  assert.match(page.headers.get('content-security-policy'), /frame-ancestors 'none'/);
+  assert.equal(page.headers.get('x-frame-options'), 'DENY');
+  const embed404 = await pub(`/s/${token}/embed`);
+  assert.match(embed404.headers.get('content-security-policy'), /frame-ancestors \*/);
+  assert.equal(embed404.headers.get('x-frame-options'), null);
 
   const unknown = Buffer.alloc(16, 7).toString('base64url');
   for (const path of [...routes(unknown), '/s/not-a-token', '/s/', '/s', `/s/${token}x`]) assert.equal((await pub(path)).status, 404, path);
@@ -265,6 +295,12 @@ test('views count GET page and embed loads only', async () => {
   assert.equal(await viewsOf(share.id), 3);
   assert.equal((await pub(`/s/${token}`, { method: 'HEAD' })).status, 200);
   assert.equal((await pub(`/s/${token}`, { headers: { 'sec-purpose': 'prefetch' } })).status, 200);
+  assert.equal((await pub(`/s/${token}`, { headers: { purpose: 'prefetch' } })).status, 200);
+  assert.equal((await pub(`/s/${token}`, { headers: { 'next-router-prefetch': '1' } })).status, 200);
+  // Link previews and crawlers are served but not counted.
+  for (const ua of ['Slackbot-LinkExpanding 1.0 (+https://api.slack.com/robots)', 'facebookexternalhit/1.1', 'Mozilla/5.0 (compatible; Googlebot/2.1)', 'WhatsApp/2.23']) {
+    assert.equal((await pub(`/s/${token}/embed`, { headers: { 'user-agent': ua } })).status, 200, ua);
+  }
   await pub(`/s/${token}/info`);
   await pub(`/s/${token}/scene`);
   assert.equal(await viewsOf(share.id), 3);
@@ -304,5 +340,56 @@ test('the public rate limiter trips per client, before any lookup', async () => 
     assert.equal(tripped.headers.get('cache-control'), 'no-store');
     // Another client has its own budget.
     assert.equal((await hit('198.51.100.9')).status, 404);
+    // Requests without CF-Connecting-IP (never the case behind Cloudflare's edge) are not pooled into one
+    // bucket that a single client could exhaust for everyone: they are not limited at all.
+    for (let i = 0; i < 6; i++) assert.equal((await limited.dispatchFetch('http://localhost/s/unknown-token/info', { headers: { 'x-test-drop-client-ip': '1' } })).status, 404);
   } finally { await limited.dispose(); }
+});
+
+test('a failing database answers 503 with no-store: HTML on page routes, JSON on data routes', async () => {
+  // No migrations: every share query fails with "no such table".
+  const broken = newMiniflare({ SHARE_RATE_LIMIT: '100000' });
+  try {
+    const token = Buffer.alloc(16, 3).toString('base64url');
+    for (const [path, kind, framing] of [[`/s/${token}`, 'html', "frame-ancestors 'none'"], [`/s/${token}/embed`, 'html', 'frame-ancestors *'], [`/s/${token}/info`, 'json'], [`/s/${token}/scene`, 'json']]) {
+      const response = await broken.dispatchFetch(`http://localhost${path}`);
+      assert.equal(response.status, 503, path);
+      assert.equal(response.headers.get('cache-control'), 'no-store', path);
+      assert.ok(response.headers.get('retry-after'), path);
+      const body = await response.text();
+      assert.doesNotMatch(body, /no such table|SQLITE|at .*\.ts/i, `${path} leaks the error`);
+      if (kind === 'html') {
+        assert.match(response.headers.get('content-type'), /text\/html/, path);
+        assert.match(response.headers.get('content-security-policy'), new RegExp(framing.replace('*', '\\*')), path);
+      } else assert.equal(JSON.parse(body).error, 'Sharing is not available right now.');
+    }
+  } finally { await broken.dispose(); }
+});
+
+test('a failed If-Match on the scene is 412, not 304', async () => {
+  const { token } = await createShare(await readyCapture());
+  const etag = (await pub(`/s/${token}/scene`)).headers.get('etag');
+  assert.equal((await pub(`/s/${token}/scene`, { headers: { 'if-match': '"something-else"' } })).status, 412);
+  assert.equal((await pub(`/s/${token}/scene`, { headers: { 'if-match': etag } })).status, 200);
+  assert.equal((await pub(`/s/${token}/scene`, { headers: { 'if-none-match': etag } })).status, 304);
+});
+
+test('owner (app router) HTML refuses framing without clobbering an existing policy', async () => {
+  const get = async query => (await pub(`/studio${query}`)).headers;
+  let h = await get('');
+  assert.equal(h.get('content-security-policy'), "frame-ancestors 'none'");
+  assert.equal(h.get('x-frame-options'), 'DENY');
+  h = await get(`?csp=${encodeURIComponent("default-src 'self';")}`);
+  assert.equal(h.get('content-security-policy'), "default-src 'self'; frame-ancestors 'none'");
+  // An explicit frame-ancestors and X-Frame-Options are left as they are.
+  h = await get(`?csp=${encodeURIComponent("frame-ancestors 'self'")}&xfo=SAMEORIGIN`);
+  assert.equal(h.get('content-security-policy'), "frame-ancestors 'self'");
+  assert.equal(h.get('x-frame-options'), 'SAMEORIGIN');
+  // Not a document: untouched.
+  h = await get(`?type=${encodeURIComponent('application/json')}`);
+  assert.equal(h.get('content-security-policy'), null);
+  assert.equal(h.get('x-frame-options'), null);
+  // The embed stays frameable by any site (it never reaches the app-router wrapper).
+  const { token } = await createShare(await readyCapture());
+  assert.equal((await pub(`/s/${token}/embed`)).headers.get('content-security-policy'), 'frame-ancestors *');
 });

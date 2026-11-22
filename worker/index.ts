@@ -3,6 +3,7 @@ import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } fr
 import handler from "vinext/server/app-router-entry";
 import { handleApi, handleScheduled } from "./api";
 import { handleSharePublic, isSharePath } from "./share"; // S8
+import { refuseFraming } from "./framing"; // S8 review
 
 interface Env {
   ASSETS: Fetcher;
@@ -51,7 +52,8 @@ const worker = {
       }, allowedWidths);
     }
 
-    return handler.fetch(request, env, ctx);
+    // S8 review: owner pages (every app-router HTML response; /s/* never gets here) refuse framing.
+    return refuseFraming(await handler.fetch(request, env, ctx));
   },
 
   // Cron Trigger (see `triggers.crons` in vite.config.ts): expires stale worker leases so the

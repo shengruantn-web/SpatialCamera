@@ -65,15 +65,21 @@ export async function handleOwnerShares(request: Request, env: ApiEnv, capture: 
   if (rest.length === 0 && request.method === "POST") {
     const body = await smallJson(request);
     if (!body || (body.allow_download !== undefined && typeof body.allow_download !== "boolean")) return json({ error: "Invalid share settings." }, 400);
-    if (capture.status !== "ready") return json({ error: "Only a finished scene can be shared." }, 409);
-    const active = await db.prepare("SELECT COUNT(*) AS n FROM shares WHERE capture_id=? AND revoked_at IS NULL").bind(id).first<{ n: number }>();
-    if ((active?.n ?? 0) >= MAX_ACTIVE_SHARES) return json({ error: `A capture can have at most ${MAX_ACTIVE_SHARES} active links. Revoke one first.` }, 409);
+    const notReady = () => json({ error: "Only a finished scene can be shared." }, 409);
+    if (capture.status !== "ready") return notReady();
     const token = newShareToken();
     const row: ShareRow = { id: crypto.randomUUID(), created_at: now, revoked_at: null, views: 0, allow_download: body.allow_download ? 1 : 0 };
-    // Conditional on the capture still being ready, so a link is never created for one being deleted.
-    const inserted = await db.prepare("INSERT INTO shares (id,capture_id,token_hash,created_at,allow_download) SELECT ?,?,?,?,? WHERE EXISTS (SELECT 1 FROM captures WHERE id=? AND status='ready')")
-      .bind(row.id, id, await hashShareToken(token), now, row.allow_download, id).run();
-    if (!inserted.meta.changes) return json({ error: "Only a finished scene can be shared." }, 409);
+    // Both conditions live in the one INSERT, so concurrent creates can neither exceed the cap nor add a
+    // link to a capture that stopped being ready (resubmitted, being deleted) after it was read.
+    const inserted = await db.prepare(`INSERT INTO shares (id,capture_id,token_hash,created_at,allow_download) SELECT ?,?,?,?,?
+      WHERE EXISTS (SELECT 1 FROM captures WHERE id=? AND status='ready')
+        AND (SELECT COUNT(*) FROM shares WHERE capture_id=? AND revoked_at IS NULL) < ?`)
+      .bind(row.id, id, await hashShareToken(token), now, row.allow_download, id, id, MAX_ACTIVE_SHARES).run();
+    if (!inserted.meta.changes) {
+      const ready = await db.prepare("SELECT 1 AS ok FROM captures WHERE id=? AND status='ready'").bind(id).first();
+      if (!ready) return notReady();
+      return json({ error: `A capture can have at most ${MAX_ACTIVE_SHARES} active links. Revoke one first.` }, 409);
+    }
     // The only response that ever contains the token.
     return json({ share: toShare(row), token, path: `/s/${token}` }, 201);
   }
@@ -111,12 +117,21 @@ export async function handleOwnerShares(request: Request, env: ApiEnv, capture: 
 // It stops a single client hammering one isolate (scraping, accidental refresh loops) and keeps D1 and R2
 // load per isolate bounded. Token guessing is not what it protects against: a 128-bit token cannot be
 // guessed. Replace it with a Workers Rate Limiting binding or a WAF rule when one is available.
+//
+// A request without `CF-Connecting-IP` is not rate-limited (logged once per isolate). Cloudflare's edge
+// sets that header on every request it proxies, so it is missing only off the edge (local dev, tests,
+// an internal service call). Pooling all such requests in one shared bucket would let a single client
+// exhaust it and lock out everyone else in that bucket, which is worse than not limiting a path that
+// public traffic does not take. If the hosting gateway sits in front and does not forward the real
+// client IP, every request carries the gateway's IP instead and shares one budget: the gateway must
+// forward a trustworthy client IP (ADR-0010, Risks).
 // ---------------------------------------------------------------------------------------------------
 
 export const DEFAULT_SHARE_RATE_LIMIT = 120;
 const RATE_WINDOW_MS = 60_000;
 const MAX_TRACKED_CLIENTS = 10_000;
 const windows = new Map<string, { start: number; count: number }>();
+let warnedNoClientIp = false;
 
 /** Counts one request; returns 0 when allowed, otherwise the seconds until the client's window resets. */
 export function takeRateLimit(client: string, limit: number, now = Date.now()) {
@@ -166,11 +181,30 @@ const PAGE_FRAMING = {
   embed: { "Content-Security-Policy": "frame-ancestors *" },
 } as const;
 
-function notFound(page: boolean) {
-  const headers = { ...BASE_HEADERS, "Cache-Control": "no-store" };
-  if (!page) return json({ error: "This link is not available." }, 404, { ...headers, "Content-Security-Policy": DATA_CSP });
-  return new Response("<!doctype html><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><title>Link not available</title><body style=\"font-family:system-ui,sans-serif;padding:2rem;max-width:36rem\"><h1>This link is not available</h1><p>It may have been revoked, or the scene is no longer shared.</p></body>",
-    { status: 404, headers: { ...headers, "Content-Type": "text/html; charset=utf-8", "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors *" } });
+type PageKind = "page" | "embed" | null;
+/**
+ * A minimal HTML error page for page routes. Only the embed's may be framed (so a revoked embed says so
+ * inside the host page instead of showing a browser error); every other page refuses framing.
+ */
+function htmlError(kind: "page" | "embed", status: number, title: string, text: string) {
+  const framing = kind === "embed" ? "frame-ancestors *" : "frame-ancestors 'none'";
+  const headers: Record<string, string> = {
+    ...BASE_HEADERS, "Cache-Control": "no-store", "Content-Type": "text/html; charset=utf-8",
+    "Content-Security-Policy": `default-src 'none'; style-src 'unsafe-inline'; ${framing}`,
+  };
+  if (kind !== "embed") headers["X-Frame-Options"] = "DENY";
+  return new Response(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>${title}</title><body style="font-family:system-ui,sans-serif;padding:2rem;max-width:36rem"><h1>${title}</h1><p>${text}</p></body>`, { status, headers });
+}
+/** `false` for data routes (JSON); otherwise the page kind (`null`: an unknown path under /s/). */
+function notFound(page: PageKind | false) {
+  if (page === false) return json({ error: "This link is not available." }, 404, { ...BASE_HEADERS, "Content-Security-Policy": DATA_CSP });
+  return htmlError(page ?? "page", 404, "This link is not available", "It may have been revoked, or the scene is no longer shared.");
+}
+function unavailable(page: PageKind | false) {
+  if (page === false) return json({ error: "Sharing is not available right now." }, 503, { ...BASE_HEADERS, "Retry-After": "30", "Content-Security-Policy": DATA_CSP });
+  const response = htmlError(page ?? "page", 503, "Sharing is not available right now", "Please try again in a moment.");
+  response.headers.set("Retry-After", "30");
+  return response;
 }
 
 /**
@@ -183,8 +217,22 @@ async function objectResponse(env: ShareEnv, request: Request, key: string, mime
   const object = await env.BUCKET.get(key, conditional ? { onlyIf: request.headers } : {});
   if (!object) return notFound(false);
   const common = { ...BASE_HEADERS, "Content-Security-Policy": DATA_CSP, ETag: object.httpEtag, ...headers };
-  if (!("body" in object)) return new Response(null, { status: 304, headers: common });
+  // R2 returns the object without a body when a precondition fails: If-Match / If-Unmodified-Since → 412,
+  // If-None-Match / If-Modified-Since → 304.
+  if (!("body" in object)) return new Response(null, { status: preconditionFailed(request, object) ? 412 : 304, headers: common });
   return new Response(request.method === "HEAD" ? null : object.body, { headers: { "Content-Type": mime, "Content-Length": String(object.size), ...common } });
+}
+
+/** RFC 9110 §13.2.2: If-Match is evaluated first; without it, If-Unmodified-Since. */
+function preconditionFailed(request: Request, object: R2Object) {
+  const ifMatch = request.headers.get("if-match");
+  if (ifMatch) {
+    if (ifMatch.trim() === "*") return false;
+    // If-Match uses the strong comparison: a weak validator never matches.
+    return !ifMatch.split(",").map(tag => tag.trim()).some(tag => !tag.startsWith("W/") && tag === object.httpEtag);
+  }
+  const since = Date.parse(request.headers.get("if-unmodified-since") ?? "");
+  return Number.isFinite(since) && object.uploaded.getTime() > since + 999;
 }
 
 /**
@@ -198,9 +246,12 @@ export function isSharePath(pathname: string) {
   return /^\/+s(\/|$)/i.test(decoded) || /^\/+s(\/|$)/i.test(pathname);
 }
 
-const isPrefetch = (request: Request) => {
-  const purpose = request.headers.get("sec-purpose") ?? request.headers.get("purpose") ?? "";
-  return /prefetch|prerender/i.test(purpose);
+/** Link previews and crawlers fetch a page without anyone viewing it. Best effort: UAs can be anything. */
+const BOT_UA = /bot|crawler|spider|preview|facebookexternalhit|slackbot|discordbot|twitterbot|whatsapp|telegrambot/i;
+/** Loads that are not a person opening the link: prefetch/prerender, router prefetches and known bots. */
+const isUncountedLoad = (request: Request) => {
+  const purpose = `${request.headers.get("sec-purpose") ?? ""} ${request.headers.get("purpose") ?? ""}`;
+  return /prefetch|prerender/i.test(purpose) || request.headers.has("next-router-prefetch") || BOT_UA.test(request.headers.get("user-agent") ?? "");
 };
 
 /**
@@ -208,30 +259,45 @@ const isPrefetch = (request: Request) => {
  * called after the token was checked, so the page itself never sees a link that is not live.
  */
 export async function handleSharePublic(request: Request, env: ShareEnv, renderPage: (request: Request) => Promise<Response>): Promise<Response> {
-  const url = new URL(request.url);
-  const match = PUBLIC_ROUTE.exec(url.pathname);
-  const route = match ? (match[2] ?? "page") as "page" | "embed" | "info" | "scene" | "download" : null;
-  const isPage = route === "page" || route === "embed" || route === null;
+  const match = PUBLIC_ROUTE.exec(new URL(request.url).pathname);
+  const route = match ? (match[2] ?? "page") as Route : null;
+  const pageKind: PageKind | false = route === "page" || route === "embed" ? route : route === null ? null : false;
+  try {
+    return await servePublic(request, env, renderPage, match, route, pageKind);
+  } catch (error) {
+    // D1 or R2 unavailable (or the page render threw): a clean 503 with no-store, never a stack trace.
+    console.error("share links: public request failed", error);
+    return unavailable(pageKind);
+  }
+}
+
+type Route = "page" | "embed" | "info" | "scene" | "download";
+async function servePublic(request: Request, env: ShareEnv, renderPage: (request: Request) => Promise<Response>, match: RegExpExecArray | null, route: Route | null, pageKind: PageKind | false): Promise<Response> {
   if (request.method !== "GET" && request.method !== "HEAD") {
     return json({ error: "Method not allowed." }, 405, { ...BASE_HEADERS, Allow: "GET, HEAD", "Content-Security-Policy": DATA_CSP });
   }
   const limit = Math.floor(Number(env.SHARE_RATE_LIMIT)) > 0 ? Math.floor(Number(env.SHARE_RATE_LIMIT)) : DEFAULT_SHARE_RATE_LIMIT;
-  const retryAfter = takeRateLimit(request.headers.get("cf-connecting-ip") ?? "unknown", limit);
+  const client = request.headers.get("cf-connecting-ip")?.trim();
+  if (!client && !warnedNoClientIp) {
+    warnedNoClientIp = true;
+    console.warn("share links: request without CF-Connecting-IP; public share routes are not rate-limited for such requests");
+  }
+  const retryAfter = client ? takeRateLimit(client, limit) : 0;
   if (retryAfter) {
     return json({ error: "Too many requests. Try again shortly." }, 429, { ...BASE_HEADERS, "Retry-After": String(retryAfter), "Content-Security-Policy": DATA_CSP });
   }
   const token = match?.[1] ?? "";
-  if (!route || !TOKEN_PATTERN.test(token)) return notFound(isPage);
-  if (!env.DB || !env.BUCKET) return json({ error: "Sharing is not available right now." }, 503, { ...BASE_HEADERS, "Content-Security-Policy": DATA_CSP });
+  if (!route || !TOKEN_PATTERN.test(token)) return notFound(pageKind);
+  if (!env.DB || !env.BUCKET) return unavailable(pageKind);
   const hash = await hashShareToken(token);
 
   if (route === "page" || route === "embed") {
-    // One statement checks the link and counts the view. HEAD and prefetches are checked, not counted.
-    const counted = request.method === "GET" && !isPrefetch(request);
+    // One statement checks the link and counts the view. HEAD, prefetches and bots are checked, not counted.
+    const counted = request.method === "GET" && !isUncountedLoad(request);
     const live = counted
       ? await env.DB.prepare("UPDATE shares SET views=views+1 WHERE token_hash=? AND revoked_at IS NULL AND EXISTS (SELECT 1 FROM captures WHERE id=shares.capture_id AND status='ready') RETURNING id").bind(hash).first()
       : await env.DB.prepare(SHARED_SELECT).bind(hash).first();
-    if (!live) return notFound(true);
+    if (!live) return notFound(route);
     const rendered = await renderPage(request);
     const response = new Response(rendered.body, rendered);
     for (const [name, value] of Object.entries({ ...BASE_HEADERS, ...PAGE_FRAMING[route], "Cache-Control": "no-store" })) response.headers.set(name, value);

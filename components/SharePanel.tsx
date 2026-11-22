@@ -87,7 +87,7 @@ export default function SharePanel({ captureId, name }: { captureId: string; nam
     </button>
     <p className="sr-only" role="status" aria-live="polite">{announce}</p>
     {open && <div id={`${ids}-body`} className="share-body">
-      <p className="share-help">Anyone with a link can view this scene, read-only. Your photos are never shared. Revoke a link to turn it off.</p>
+      <p className="share-help">Anyone with a link can view this scene, read-only. Your photos are never shared. Revoke a link to turn it off. If you reprocess this capture, its links pause while it processes and then show the new result.</p>
       <div className="share-create">
         <label className="share-check"><input type="checkbox" checked={allowDownload} onChange={e => setAllowDownload(e.target.checked)} /> Allow PLY download</label>
         <button type="button" className="primary small" disabled={busy !== null} onClick={() => void create()}>

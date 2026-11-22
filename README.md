@@ -45,8 +45,15 @@ Open **Share** under a finished capture to create a read-only link (ADR-0010, sp
 - The link is shown **once**. Only a hash of it is stored, so copy it when it is created; if it is lost, create another and revoke the old one.
 - Viewers get the compact SPZ (or the PLY if the capture has no SPZ). The full PLY download is off unless you tick "Allow PLY download" for that link. Photos are never shared.
 - Each link shows its page views. Revoking a link stops it on the next request, cached scene bytes included. A scene someone already has open stays on their screen until they reload.
-- Up to 20 active links per capture. Public routes are rate-limited per IP (best effort, per isolate; `SHARE_RATE_LIMIT`, default 120 per minute).
-- The share page and embed need the hosting gateway to let anonymous requests reach `/s/*`.
+- Reprocessing a capture pauses its links (404) until it is `ready` again; then they show the new result. Revoke them first if you do not want that.
+- Up to 20 active links per capture. Public routes are rate-limited per IP (best effort, per isolate; `SHARE_RATE_LIMIT`, default 120 per minute). A request without `CF-Connecting-IP` is not limited (logged once per isolate), so one header-less client cannot lock out the others.
+
+Deploy notes for sharing:
+
+- The hosting gateway must let anonymous requests reach `/s/*` **only**. `/api/*` and the owner pages stay behind sign-in.
+- The gateway must strip or overwrite `oai-authenticated-user-email` on every request, anonymous `/s/*` requests included, so no visitor can send their own.
+- The gateway must forward the real client IP as `CF-Connecting-IP`. If it sends its own address, all visitors share one rate-limit budget.
+- The built-in limiter is per isolate. For production, add a Workers Rate Limiting binding or a WAF rate-limiting rule on `/s/*`.
 
 ## Local development
 
