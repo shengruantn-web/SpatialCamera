@@ -111,3 +111,19 @@ export function nextEncodeAttempt(last: EncodeAttempt & { bytes: number }, limit
   if (scale < MIN_DOWNSCALE) return { kind: "give-up" };
   return { kind: "retry", next: { quality: last.quality, scale } };
 }
+
+/**
+ * Review item 6: which HEICs of one add would go over the photo limit and so are not converted.
+ * `sources[i]` is the source key of a HEIC (null for other files). Only HEICs that will actually be
+ * added use a slot: not other files (Studio applies the limit to them), not a repeat of a source
+ * earlier in the add, and not a source whose converted copy is already selected (`selected`).
+ */
+export function heicOverLimit(sources: readonly (string | null)[], slots: number, selected: ReadonlySet<string>): boolean[] {
+  const verdict = new Map<string, boolean>([...selected].map(source => [source, false]));
+  let used = 0;
+  return sources.map(source => {
+    if (source === null) return false;
+    if (!verdict.has(source)) verdict.set(source, used++ >= slots);
+    return verdict.get(source)!;
+  });
+}

@@ -8,6 +8,7 @@ import { type Capture, stages, statusLabels } from "../lib/types";
 import { MAX_IMAGE_BYTES, MAX_IMAGES, MAX_TOTAL_BYTES, MIN_IMAGES } from "../lib/validation";
 import PrepWarnings from "./PrepWarnings"; // S6 capture prep
 import { useCapturePrep } from "./useCapturePrep"; // S6 capture prep
+import { useDropGuard } from "./useDropGuard"; // S6 capture prep
 
 const sample: SceneSource = { url: "https://sparkjs.dev/assets/splats/butterfly.spz", name: "The butterfly", sample: true };
 type Selected = { file: File; url: string };
@@ -36,6 +37,7 @@ export default function Studio() {
   const [resume, setResume] = useState<{ id: string; images: ManifestImage[] } | null>(null);
   const [source, setSource] = useState<SceneSource>(sample);
   const prep = useCapturePrep(files); // S6 capture prep: HEIC conversion + warn-only checks
+  useDropGuard(busy || prep.converting, () => { setDragging(false); if (prep.converting) setError("Wait for the photos being added to finish."); }); // S6: no navigating away on a drop while the dropzone is disabled
   const fileInput = useRef<HTMLInputElement>(null);
   const splatInput = useRef<HTMLInputElement>(null);
   const guideRef = useRef<HTMLDialogElement>(null);
@@ -81,11 +83,13 @@ export default function Studio() {
         if (live.length >= MAX_IMAGES || live.reduce((sum, x) => sum + x.file.size, 0) + file.size > MAX_TOTAL_BYTES) { errors.push("Limit: 200 photos and 1 GB per capture."); break; }
         if (!["image/jpeg", "image/png"].includes(file.type)) { errors.push("Only JPG, PNG and HEIC photos are supported."); continue; }
         if (file.size > MAX_IMAGE_BYTES || file.size === 0) { errors.push("Each photo must be between 1 byte and 20 MB."); continue; }
-        try { const bitmap = await createImageBitmap(file); bitmap.close(); }
-        catch { errors.push(`Could not read ${file.name}. Choose a valid image.`); continue; }
-        if (ticket.signal.aborted) { accepted.forEach(item => URL.revokeObjectURL(item.url)); return; }
+        let readable = true;
+        try { const bitmap = await createImageBitmap(file); bitmap.close(); } catch { readable = false; }
+        if (ticket.signal.aborted) break; // S6 review item 2: Clear won while this photo was read
+        if (!readable) { errors.push(`Could not read ${file.name}. Choose a valid image.`); continue; }
         accepted.push({ file, url: URL.createObjectURL(file) });
       }
+      if (ticket.signal.aborted) { accepted.forEach(item => URL.revokeObjectURL(item.url)); return; }
       // Dedupe again against the state React actually holds (covers anything added since the last read).
       setFiles(current => { const have = new Set(current.map(x => keyOf(x.file))); return [...current, ...accepted.filter(x => !have.has(keyOf(x.file)))]; });
       setError([...new Set(errors)].join(" "));

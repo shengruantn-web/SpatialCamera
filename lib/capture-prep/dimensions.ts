@@ -101,3 +101,6 @@ export function displaySize(b: Uint8Array): ImageSize | null {
 }
 
 export const megapixels = ({ width, height }: ImageSize) => Math.round(width * height / 1e5) / 10;
+
+/** True when decoding this many pixels is within MAX_DECODE_PIXELS (also checked after a native decode). */
+export const withinDecodeLimit = ({ width, height }: ImageSize, limit = MAX_DECODE_PIXELS) => width * height <= limit;

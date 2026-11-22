@@ -10,7 +10,7 @@ import { build } from 'esbuild';
 let m;
 before(async () => {
   const result = await build({
-    stdin: { contents: `export * from "./lib/capture-prep/metrics.ts"; export * from "./lib/capture-prep/heic.ts"; export * from "./lib/capture-prep/heif-decode.ts"; export * from "./lib/capture-prep/dimensions.ts"; export { WorkerPool } from "./lib/capture-prep/pool.ts"; export { MAX_IMAGE_BYTES } from "./lib/validation.ts";`, resolveDir: process.cwd(), loader: 'ts' },
+    stdin: { contents: `export * from "./lib/capture-prep/metrics.ts"; export * from "./lib/capture-prep/heic.ts"; export * from "./lib/capture-prep/heif-decode.ts"; export * from "./lib/capture-prep/dimensions.ts"; export { WorkerPool } from "./lib/capture-prep/pool.ts"; export * from "./lib/capture-prep/confirm.ts"; export * from "./lib/capture-prep/any-signal.ts"; export { MAX_IMAGE_BYTES } from "./lib/validation.ts";`, resolveDir: process.cwd(), loader: 'ts' },
     bundle: true, write: false, format: 'esm', platform: 'neutral',
   });
   m = await import(`data:text/javascript;base64,${Buffer.from(result.outputFiles[0].text).toString('base64')}`);
@@ -465,4 +465,70 @@ test('WorkerPool: tells a worker that never loaded from one that crashed, and dr
   assert.equal((await p.run(file(4))).type, 'done');
   assert.equal(workers.length, 2);
   p.terminate(); unloaded.terminate(); crashing.p.terminate();
+});
+
+// ── review round 3 ──────────────────────────────────────────────────────────────────────────
+test('heicOverLimit: only HEICs that will actually be added use slots', () => {
+  // JPEGs (null) never use a HEIC slot; with 2 slots, the third distinct HEIC is over.
+  assert.deepEqual(m.heicOverLimit([null, null, 'a', null, 'b', 'c'], 2, new Set()), [false, false, false, false, false, true]);
+  // A HEIC whose JPEG is already selected, and a repeat within the add, use no slot.
+  assert.deepEqual(m.heicOverLimit(['a', 'b', 'a', 'c'], 1, new Set(['a'])), [false, false, false, true]);
+  assert.deepEqual(m.heicOverLimit(['a', 'b', 'b'], 1, new Set()), [false, true, true], 'a repeat shares its first verdict and uses no slot');
+  assert.deepEqual(m.heicOverLimit(['a', 'b'], 0, new Set()), [true, true]);
+  assert.deepEqual(m.heicOverLimit(['a'], -3, new Set(['a'])), [false], 'already selected stays a no-op even when full');
+});
+
+test('withinDecodeLimit: 48 MP passes, just over 50 MP does not (also applied after a native decode)', () => {
+  assert.equal(m.withinDecodeLimit({ width: 8064, height: 6048 }), true);
+  assert.equal(m.withinDecodeLimit({ width: 10000, height: 5000 }), true);
+  assert.equal(m.withinDecodeLimit({ width: 10000, height: 5001 }), false);
+});
+
+test('anySignal fires on any input and removes its listeners from the inputs when done', () => {
+  const counts = new Map();
+  /** An AbortController whose signal counts its listeners. */
+  const tracked = () => {
+    const controller = new AbortController(), signal = controller.signal;
+    const add = signal.addEventListener.bind(signal), remove = signal.removeEventListener.bind(signal);
+    const handlers = new Set();
+    counts.set(signal, () => handlers.size);
+    signal.addEventListener = (type, fn, opts) => { handlers.add(fn); add(type, fn, opts); };
+    signal.removeEventListener = (type, fn, opts) => { handlers.delete(fn); remove(type, fn, opts); };
+    return controller;
+  };
+  const listening = (...controllers) => controllers.reduce((n, c) => n + counts.get(c.signal)(), 0);
+  const a = tracked(), b = tracked();
+  const first = m.anySignal([a.signal, b.signal]);
+  assert.equal(first.signal.aborted, false);
+  assert.equal(listening(a, b), 2);
+  first.dispose();
+  assert.equal(listening(a, b), 0, 'dispose() detaches from long-lived inputs');
+  b.abort();
+  assert.equal(first.signal.aborted, false, 'a disposed signal no longer follows its inputs');
+  const c = tracked(), d = tracked();
+  const second = m.anySignal([c.signal, d.signal]);
+  c.abort();
+  assert.equal(second.signal.aborted, true);
+  assert.equal(listening(c, d), 0, 'firing detaches from the other inputs too');
+  assert.equal(m.anySignal([b.signal]).signal.aborted, true, 'an already aborted input aborts at once');
+});
+
+test('standingConfirmation: drops removed photos, closes when empty, disabled or rechecking', () => {
+  const [p1, p2, p3] = [{ n: 1 }, { n: 2 }, { n: 3 }];
+  const pending = { opener: 'blurry', what: 'low detail or blurry', files: [p1, p2] };
+  const settled = { disabled: false, checking: false };
+  assert.equal(m.standingConfirmation(pending, [p1, p2, p3], settled), pending, 'unchanged while all are selected');
+  assert.deepEqual(m.standingConfirmation(pending, [p2, p3], settled).files, [p2], 'a thumbnail removal shrinks the list');
+  assert.equal(m.standingConfirmation(pending, [p3], settled), null, 'none left: closes');
+  assert.equal(m.standingConfirmation(pending, [p1, p2], { disabled: true, checking: false }), null, 'upload started');
+  assert.equal(m.standingConfirmation(pending, [p1, p2, p3], { disabled: false, checking: true }), null, 'photos added: findings change');
+  assert.equal(m.standingConfirmation(null, [p1], settled), null);
+});
+
+test('focusAfterClose: cancel returns to the opener; otherwise the heading, unless focus is elsewhere', () => {
+  assert.equal(m.focusAfterClose('cancel', { openerFocusable: true, focusLost: true }), 'opener');
+  assert.equal(m.focusAfterClose('cancel', { openerFocusable: false, focusLost: true }), 'heading');
+  assert.equal(m.focusAfterClose('remove', { openerFocusable: true, focusLost: true }), 'heading');
+  assert.equal(m.focusAfterClose('invalidated', { openerFocusable: true, focusLost: true }), 'heading', 'never left on <body>');
+  assert.equal(m.focusAfterClose('invalidated', { openerFocusable: true, focusLost: false }), null, 'an upload button keeps its focus');
 });

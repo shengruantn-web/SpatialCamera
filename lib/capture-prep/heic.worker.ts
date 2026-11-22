@@ -5,7 +5,7 @@
  */
 import type { LibHeif } from "libheif-js/libheif-wasm/libheif.js";
 import { JPEG_QUALITY, nextEncodeAttempt, type EncodeAttempt } from "./heic";
-import { HEADER_BYTES, heicSize, MAX_DECODE_PIXELS, megapixels, type ImageSize } from "./dimensions";
+import { HEADER_BYTES, heicSize, MAX_DECODE_PIXELS, megapixels, withinDecodeLimit, type ImageSize } from "./dimensions";
 import { decodeHeif, HeifDecodeError, HeifTooLargeError } from "./heif-decode";
 import type { ConversionMessage, ConversionStage, JobRequest, WorkerScope } from "./protocol";
 
@@ -32,9 +32,18 @@ async function decode(file: File, stage: (s: ConversionStage) => void): Promise<
   stage("decoding");
   // Refuse oversized photos from the header, before any decoder allocates their pixels.
   const declared = heicSize(new Uint8Array(await file.slice(0, HEADER_BYTES).arrayBuffer()));
-  if (declared && declared.width * declared.height > MAX_DECODE_PIXELS) throw tooLarge(declared);
+  if (declared && !withinDecodeLimit(declared)) throw tooLarge(declared);
   // Safari (and any browser with a HEIC codec) decodes natively, applying the file's rotation.
-  try { return await createImageBitmap(file); } catch { /* no native HEIC support: use libheif */ }
+  let native: ImageBitmap | null = null;
+  try { native = await createImageBitmap(file); } catch { /* no native HEIC support: use libheif */ }
+  if (native) {
+    // Review item 7: the header check misses a `meta` box past HEADER_BYTES, so check the result
+    // too and refuse before the encoder allocates canvases of that size.
+    const size = { width: native.width, height: native.height };
+    if (withinDecodeLimit(size)) return native;
+    native.close();
+    throw tooLarge(size);
+  }
   let lib: LibHeif;
   try {
     if (!libheif) stage("loading-decoder");

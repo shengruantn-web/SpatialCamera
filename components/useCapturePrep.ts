@@ -11,10 +11,13 @@
  *  - `reset()` (Clear / new capture) aborts the add in flight, every queued or running worker job
  *    and pending result flushes; results that arrive later are ignored (epoch + mounted guard).
  *  - Photos that leave the selection have their analysis job cancelled and their cached
- *    conversion dropped.
+ *    conversion dropped. The cache is keyed by the source HEIC (name:size:mtime) and kept while
+ *    that source's JPEG (under whatever final name) is selected or its add is still running, so
+ *    re-adding a folder skips photos already converted.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { classifyByNameAndType, convertedNames, jpegName, sniffHeic } from "../lib/capture-prep/heic";
+import { anySignal } from "../lib/capture-prep/any-signal";
+import { classifyByNameAndType, convertedNames, heicOverLimit, jpegName, sniffHeic } from "../lib/capture-prep/heic";
 import { buildPrepReport, type PrepReport } from "../lib/capture-prep/metrics";
 import { analysisPool, heicPool, prepSupported } from "../lib/capture-prep/pool";
 import type { ConversionStage } from "../lib/capture-prep/protocol";
@@ -59,15 +62,6 @@ async function isHeic(file: File): Promise<boolean> {
   try { return sniffHeic(new Uint8Array(await file.slice(0, 64).arrayBuffer())); } catch { return false; }
 }
 
-/** An AbortSignal that fires when any input does (AbortSignal.any is too new for Safari 16.4). */
-function anySignal(signals: AbortSignal[]): AbortSignal {
-  const controller = new AbortController();
-  for (const signal of signals) {
-    if (signal.aborted) { controller.abort(); break; }
-    signal.addEventListener("abort", () => controller.abort(), { once: true });
-  }
-  return controller.signal;
-}
 
 const cacheKeyOf = (file: File) => `${file.name}:${file.size}:${file.lastModified}`;
 
@@ -85,6 +79,10 @@ export function useCapturePrep(files: readonly { file: File }[]): CapturePrep {
   const add = useRef<{ controller: AbortController; conversions: AbortController } | null>(null);
   /** Converted output per source HEIC (keyed by name/size/mtime), so re-adding it skips the work. */
   const converted = useRef(new Map<string, File>());
+  /** Source key of every converted output, renamed copies included (review item 5). */
+  const sourceOf = useRef(new WeakMap<File, string>());
+  /** Source keys of the add in flight: their outputs are not selected yet, so the trim spares them. */
+  const inFlight = useRef(new Set<string>());
   /** Analysis jobs in flight, by photo; aborted when the photo leaves the selection. */
   const jobs = useRef(new Map<File, AbortController>());
   const buffer = useRef(new Map<File, Measurement>());
@@ -109,7 +107,7 @@ export function useCapturePrep(files: readonly { file: File }[]): CapturePrep {
       end: () => {
         if (ended) return;
         ended = true;
-        if (add.current === current) add.current = null;
+        if (add.current === current) { add.current = null; inFlight.current.clear(); }
         if (mounted.current) setAdds(n => n - 1);
       },
     };
@@ -122,11 +120,15 @@ export function useCapturePrep(files: readonly { file: File }[]): CapturePrep {
     if (!alive()) return [];
     if (!flags.some(Boolean)) return incoming;
     const canConvert = prepSupported();
+    const sources = incoming.map((file, i) => flags[i] ? cacheKeyOf(file) : null);
+    const selectedSources = new Set(live.current.flatMap(item => sourceOf.current.get(item.file) ?? []));
+    const overLimit = heicOverLimit(sources, slots, selectedSources);
+    for (const source of sources) if (source) inFlight.current.add(source);
     const batch: ConversionRecord[] = [];
     const keys = flags.map((heic, i) => {
       if (!heic) return 0;
       const key = nextKey.current++;
-      const message = !canConvert ? UNSUPPORTED_HEIC : i >= slots ? OVER_LIMIT : undefined;
+      const message = !canConvert ? UNSUPPORTED_HEIC : overLimit[i] ? OVER_LIMIT : undefined;
       batch.push({ key, name: incoming[i].name, status: message ? "failed" : "queued", message });
       return key;
     });
@@ -137,33 +139,40 @@ export function useCapturePrep(files: readonly { file: File }[]): CapturePrep {
     setConversions(list => [...list.filter(r => r.status !== "done" && r.status !== "failed" && r.status !== "cancelled"), ...batch]);
     if (!canConvert) return incoming.filter((_, i) => !flags[i]);
     const stop = anySignal([signal, add.current?.conversions.signal].filter((s): s is AbortSignal => !!s));
-    const results = await Promise.all(incoming.map(async (file, i): Promise<File | null> => {
-      if (!flags[i]) return file;
-      if (i >= slots) return null;
-      const key = keys[i];
-      const cacheKey = cacheKeyOf(file);
-      const cached = converted.current.get(cacheKey);
-      if (cached) { update(key, { status: "done", bytes: cached.size }); return cached; }
-      const result = await heicPool().run(file, {
-        signal: stop,
-        onMessage: message => { if (message.type === "stage") update(key, { status: message.stage }); },
-      });
-      if (result.type === "error") {
-        update(key, result.reason === "cancelled" ? { status: "cancelled", message: "Not converted: cancelled." } : { status: "failed", message: result.message });
-        return null;
-      }
-      if (result.type !== "done") return null;
-      const jpeg = new File([result.blob], jpegName(file.name), { type: "image/jpeg", lastModified: file.lastModified });
-      if (epoch.current === started) converted.current.set(cacheKey, jpeg);
-      update(key, { status: "done", bytes: jpeg.size, quality: result.quality, scale: result.scale });
-      return jpeg;
-    }));
+    let results: (File | null)[];
+    try {
+      results = await Promise.all(incoming.map(async (file, i): Promise<File | null> => {
+        const source = sources[i];
+        if (!source) return file;
+        if (overLimit[i]) return null;
+        const key = keys[i];
+        const cached = converted.current.get(source);
+        if (cached) { update(key, { status: "done", bytes: cached.size }); return cached; }
+        const result = await heicPool().run(file, {
+          signal: stop.signal,
+          onMessage: message => { if (message.type === "stage") update(key, { status: message.stage }); },
+        });
+        if (result.type === "error") {
+          update(key, result.reason === "cancelled" ? { status: "cancelled", message: "Not converted: cancelled." } : { status: "failed", message: result.message });
+          return null;
+        }
+        if (result.type !== "done") return null;
+        const jpeg = new File([result.blob], jpegName(file.name), { type: "image/jpeg", lastModified: file.lastModified });
+        update(key, { status: "done", bytes: jpeg.size, quality: result.quality, scale: result.scale });
+        return jpeg;
+      }));
+    } finally { stop.dispose(); }
     if (!alive()) return [];
     // Review L4: a converted name must not clash with a different photo already selected or
     // elsewhere in this batch (two uploads under one name confuse the resume matcher).
-    const kept = results.flatMap((file, i) => file ? [{ file, converted: flags[i] }] : []);
-    const names = convertedNames(live.current.map(item => item.file), kept.map(({ file, converted }) => ({ name: file.name, size: file.size, converted })));
-    return kept.map(({ file }, i) => names[i] === file.name ? file : new File([file], names[i], { type: file.type, lastModified: file.lastModified }));
+    const kept = results.flatMap((file, i) => file ? [{ file, source: sources[i] }] : []);
+    const names = convertedNames(live.current.map(item => item.file), kept.map(({ file, source }) => ({ name: file.name, size: file.size, converted: !!source })));
+    return kept.map(({ file, source }, i) => {
+      const final = names[i] === file.name ? file : new File([file], names[i], { type: file.type, lastModified: file.lastModified });
+      // Review item 5: cache the file under the name it is added with, keyed by its source.
+      if (source) { converted.current.set(source, final); sourceOf.current.set(final, source); }
+      return final;
+    });
   }, []);
 
   const cancelConversions = useCallback(() => add.current?.conversions.abort(), []);
@@ -178,6 +187,7 @@ export function useCapturePrep(files: readonly { file: File }[]): CapturePrep {
     clearTimeout(flushTimer.current);
     flushTimer.current = undefined;
     converted.current.clear();
+    inFlight.current.clear();
     setConversions([]);
     setMeasurements(new Map());
   }, []);
@@ -190,7 +200,8 @@ export function useCapturePrep(files: readonly { file: File }[]): CapturePrep {
     const present = new Set(files.map(item => item.file));
     // Photos that left the selection: stop their checks and forget their converted copies (M3).
     for (const [file, controller] of jobs.current) if (!present.has(file)) { controller.abort(); jobs.current.delete(file); }
-    for (const [key, jpeg] of converted.current) if (!present.has(jpeg)) converted.current.delete(key);
+    const liveSources = new Set(files.flatMap(item => sourceOf.current.get(item.file) ?? []));
+    for (const source of converted.current.keys()) if (!liveSources.has(source) && !inFlight.current.has(source)) converted.current.delete(source);
     if (!supported) return;
     const flush = () => {
       flushTimer.current = undefined;

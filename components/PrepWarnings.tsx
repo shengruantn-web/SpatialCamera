@@ -3,10 +3,13 @@
  * HEIC conversion progress and warn-only photo checks (PRD R1.3, R1.6). Every warning is written
  * out in words (icons are decorative), and a polite live region announces when conversion and
  * checks start and finish — not every progress tick — including why photos were not added.
- * Bulk removal always asks first, listing what goes, then moves focus to the checks heading.
+ * Bulk removal always asks first, listing what goes. The confirmation takes focus when it opens
+ * (Escape cancels); cancelling returns focus to the button that opened it, removing moves it to the
+ * checks heading. It closes by itself when its photos are gone, checks rerun, or removal is disabled.
  */
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { CircleCheck, Copy, Focus, Info, TriangleAlert } from "lucide-react";
+import { focusAfterClose, standingConfirmation, type CloseReason, type Confirmation } from "../lib/capture-prep/confirm";
 import { RECOMMENDED_MIN_PHOTOS } from "../lib/capture-prep/metrics";
 import type { CapturePrep, ConversionRecord } from "./useCapturePrep";
 
@@ -45,13 +48,18 @@ function statusText(record: ConversionRecord): string {
   }
 }
 
-type Pending = { what: string; files: File[] };
+type Opener = "blurry" | "copies";
 
 export default function PrepWarnings({ prep, files, minImages, onRemove, disabled }: Props) {
   const { conversions, converting, checked, checking, report, supported } = prep;
-  const [pending, setPending] = useState<Pending | null>(null);
+  const [pending, setPending] = useState<Confirmation<File> | null>(null);
   const [removed, setRemoved] = useState("");
   const heading = useRef<HTMLHeadingElement>(null);
+  const group = useRef<HTMLDivElement>(null);
+  const openers = useRef<Partial<Record<Opener, HTMLButtonElement | null>>>({});
+  /** Why the confirmation is closing; anything not set by its buttons counts as "invalidated". */
+  const closing = useRef<{ reason: CloseReason; opener?: Opener }>({ reason: "invalidated" });
+  const wasOpen = useRef(false);
   const finished = conversions.filter(settled).length;
   const failed = conversions.filter(r => r.status === "failed");
   const cancelled = conversions.filter(r => r.status === "cancelled");
@@ -66,17 +74,42 @@ export default function PrepWarnings({ prep, files, minImages, onRemove, disable
   const done = files.length > 0 && !checking;
   const usable = done ? report.usable : files.length;
   const showCount = files.length >= minImages && usable < RECOMMENDED_MIN_PHOTOS && (done || files.length < RECOMMENDED_MIN_PHOTOS);
-  // A confirmation only stands while removal is possible and its photos are still selected.
-  const confirm = pending && !disabled && done ? pending : null;
+  // Review item 4: a confirmation only stands while removal is possible, checks are settled and
+  // some of its photos are still selected; otherwise it is dropped for good, not just hidden.
+  const confirm = standingConfirmation(pending, files.map(item => item.file), { disabled: !!disabled, checking: !done });
+  if (pending && !confirm) setPending(null);
+  const open = confirm !== null;
 
-  function ask(what: string, list: File[]) { setRemoved(""); setPending({ what, files: list }); }
+  // Review item 1: the confirmation takes focus when it opens; when it closes, focus goes back to
+  // the opener (cancel) or to the checks heading, never to <body>.
+  useEffect(() => {
+    if (open) group.current?.focus();
+    else if (wasOpen.current) {
+      const { reason, opener: key } = closing.current;
+      const opener = key ? openers.current[key] : null;
+      const active = document.activeElement;
+      const target = focusAfterClose(reason, { openerFocusable: !!opener?.isConnected && !opener.disabled, focusLost: !active || active === document.body });
+      if (target === "opener") opener?.focus();
+      else if (target === "heading") heading.current?.focus();
+    }
+    closing.current = { reason: "invalidated" };
+    wasOpen.current = open;
+  }, [open]);
+
+  function ask(opener: Opener, what: string, list: File[]) { setRemoved(""); setPending({ opener, what, files: list }); }
+  function cancel() { closing.current = { reason: "cancel", opener: confirm?.opener as Opener | undefined }; setPending(null); }
   function remove() {
     if (!confirm) return;
-    onRemove(confirm.files);
+    closing.current = { reason: "remove" };
+    onRemove([...confirm.files]);
     setPending(null);
     setRemoved(`Removed ${plural(confirm.files.length, "photo")} (${confirm.what}).`);
-    // The buttons that were focused are gone; continue from the checks heading.
-    requestAnimationFrame(() => heading.current?.focus());
+  }
+  function onConfirmKey(event: KeyboardEvent) {
+    if (event.key !== "Escape") return;
+    event.preventDefault();
+    event.stopPropagation();
+    cancel();
   }
 
   const reasons = failed.slice(0, REASONS_ANNOUNCED).map(r => `${r.name}: ${r.message}`).join(" ");
@@ -117,20 +150,20 @@ export default function PrepWarnings({ prep, files, minImages, onRemove, disable
           <progress value={checked} max={files.length} aria-label="Photo check progress" />
         </> : findings.length === 0 ? <p className="prep-ok"><CircleCheck size={13} aria-hidden="true" /> Checked {plural(files.length, "photo")}: no blur or near-duplicates found.</p> : null}
       {removed && !confirm && <p className="prep-ok"><CircleCheck size={13} aria-hidden="true" /> {removed}</p>}
-      {confirm ? <div className="prep-confirm" role="group" aria-labelledby="prep-confirm-text">
-        <p id="prep-confirm-text"><strong>Remove {plural(confirm.files.length, "photo")} ({confirm.what}) from this capture?</strong> {nameList(confirm.files.map(f => f.name))}. They stay on your device; you can add them again.</p>
+      {confirm ? <div className="prep-confirm" role="group" aria-labelledby="prep-confirm-question" aria-describedby="prep-confirm-detail" tabIndex={-1} ref={group} onKeyDown={onConfirmKey}>
+        <p><strong id="prep-confirm-question">Remove {plural(confirm.files.length, "photo")} ({confirm.what}) from this capture?</strong> <span id="prep-confirm-detail">{nameList(confirm.files.map(f => f.name))}. They stay on your device; you can add them again.</span></p>
         <div className="prep-actions">
           <button type="button" className="prep-button" onClick={remove}>Remove {plural(confirm.files.length, "photo")}</button>
-          <button type="button" className="prep-link" onClick={() => setPending(null)}>Keep them</button>
+          <button type="button" className="prep-link" onClick={cancel}>Keep them</button>
         </div>
       </div> : <ul className="prep-list">
         {done && blurry.length > 0 && <li><Focus size={13} aria-hidden="true" /><span>
           <strong>Warning: {plural(blurry.length, "photo")} {blurry.length === 1 ? "looks" : "look"} low detail or blurry.</strong> Such photos often fail to align: {nameList(blurry.map(f => f.name))}.
-          <button type="button" className="prep-link" disabled={disabled} onClick={() => ask("low detail or blurry", blurry)}>Review and remove {plural(blurry.length, "photo")}…</button>
+          <button type="button" className="prep-link" disabled={disabled} ref={el => { openers.current.blurry = el; }} onClick={() => ask("blurry", "low detail or blurry", blurry)}>Review and remove {plural(blurry.length, "photo")}…</button>
         </span></li>}
         {done && report.duplicateGroups.length > 0 && <li><Copy size={13} aria-hidden="true" /><span>
           <strong>Warning: {duplicatePhotos} photos are near-duplicates</strong> ({plural(report.duplicateGroups.length, "group")}). Near-identical shots add processing time but no new viewpoint: {report.duplicateGroups.slice(0, NAMES_SHOWN).map(g => g.map(i => files[i]?.file.name).join(" ≈ ")).join("; ")}{report.duplicateGroups.length > NAMES_SHOWN ? "; …" : ""}.
-          {extraCopies.length > 0 && <button type="button" className="prep-link" disabled={disabled} onClick={() => ask("extra copies; the sharpest of each group stays", extraCopies)}>Review and remove {plural(extraCopies.length, "extra copy", "extra copies")}…</button>}
+          {extraCopies.length > 0 && <button type="button" className="prep-link" disabled={disabled} ref={el => { openers.current.copies = el; }} onClick={() => ask("copies", "extra copies; the sharpest of each group stays", extraCopies)}>Review and remove {plural(extraCopies.length, "extra copy", "extra copies")}…</button>}
         </span></li>}
         {showCount && <li><Info size={13} aria-hidden="true" /><span>
           <strong>Warning: {done && usable < files.length ? `only ${usable} of ${files.length} photos look usable` : `${plural(files.length, "photo")} selected`}.</strong> With fewer than {RECOMMENDED_MIN_PHOTOS} usable photos, camera alignment may fail. Add more overlapping photos from new positions if you can.
