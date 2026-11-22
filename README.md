@@ -6,6 +6,7 @@ A web-first photo-to-Gaussian-splat prototype. Capture photos are stored on the 
 
 - JPG/PNG validation, previews, duplicate selection filtering, and upload progress. Photos upload four at a time, and a failed photo is retried on network errors and 5xx before the upload stops.
 - HEIC/HEIF photos (the iPhone default) are converted to JPEG in the browser before upload. See "Capture preparation" below.
+- Phone camera capture (S9): on touch devices, **Take photos** opens a full-screen guided camera (shot counter against the 12 minimum and a 40+ goal, a faded ghost of the last photo for overlap, undo), and **Camera app** opens the system camera; every photo joins the same selection. See "Camera capture" below.
 - Warn-only checks before upload: blurry or low-detail photos, near-duplicates, and fewer than 30 usable photos.
 - Persistent capture manifests in D1, image/result storage in R2, and owner-scoped APIs.
 - Resumable uploads: reselect the original files from an incomplete capture.
@@ -38,6 +39,16 @@ Photos are prepared in the browser, in Web Workers, as soon as they are added. T
   - The low-detail or blurry photos, or the extra copies, can be removed in bulk after a confirmation that lists them.
 - Thresholds and how they were calibrated are in [docs/specs/capture-pipeline.md §8](docs/specs/capture-pipeline.md).
 - The code is in `lib/capture-prep/`, `components/useCapturePrep.ts` and `components/PrepWarnings.tsx`.
+
+## Camera capture
+
+On a phone or tablet, two buttons appear under the dropzone (spec [§8.3](docs/specs/capture-pipeline.md)).
+
+- **Take photos** opens a full-screen viewfinder. Shoot, take a small step, and shoot again when about two-thirds of the faded last photo still lines up. The counter shows the 12 minimum and the 40+ goal. Done, the close button, Escape or the back gesture all keep the photos taken.
+- **Camera app** opens the phone's own camera. iOS returns one photo per trip; each trip adds to the selection. Use it for full-quality iPhone photos with EXIF: the guided mode saves video frames on iOS.
+- The live camera needs HTTPS (or `localhost`). On a plain `http://` LAN address the page says so and opens the camera app instead; if camera access is blocked, the viewfinder explains how to allow it and offers **Use camera app**. To try the guided mode on a phone during development, serve the dev server over HTTPS (for example through a tunnel).
+- Guided shots are named `camera-YYYYMMDD-HHMMSS-NNN.jpg`. Camera-app photos keep their own names, so an interrupted upload can still match them; only a name already used by a different photo (same name, but a different size or time, such as iOS's `image.jpg`) becomes `image-<lastModified>-<size>.jpg`. A renamed photo can't be resumed after a reload; on iOS camera-app photos aren't saved to the library anyway. Both go through the same checks and upload as picked files.
+- The shutter stops before a shot would pass the 200-photo or 1 GB limit, so Done never adds fewer photos than were taken. Guided shots live only in the open tab: upload them before you close or reload it, because they cannot be reselected to resume. The code is in `lib/camera/`, `components/CameraEntry.tsx`, `components/CameraCapture.tsx` and `components/useCamera.ts`.
 
 ## Video captures
 
