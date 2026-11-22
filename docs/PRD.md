@@ -31,10 +31,10 @@ Status key: ✅ done · 🟡 partial · ❌ missing (as of 2026-11-16)
 |---|---|---|
 | R1.1 | Show capture guidance (move around, overlap, even light) | ✅ |
 | R1.2 | Accept 12–200 JPG/PNG photos, ≤20 MB each, ≤1 GB total | ✅ |
-| R1.3 | Accept HEIC (iPhone default) and convert automatically | ❌ |
+| R1.3 | Accept HEIC (iPhone default) and convert automatically | ✅ in-browser JPEG conversion (S6, spec §8.1); EXIF not carried over |
 | R1.4 | Capture directly from a phone camera | ❌ |
 | R1.5 | Accept video and select sharp, overlapping frames | ❌ |
-| R1.6 | Warn about blurry or non-overlapping photos before upload | ❌ |
+| R1.6 | Warn about blurry or non-overlapping photos before upload | 🟡 blur, near-duplicates and too-few-usable warnings (S6, spec §8.2); overlap between distinct photos not checked |
 
 ### J2 Upload
 | ID | Requirement | Status |

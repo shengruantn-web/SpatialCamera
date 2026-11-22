@@ -5,6 +5,8 @@ A web-first photo-to-Gaussian-splat prototype. Capture photos are stored on the 
 ## What works
 
 - JPG/PNG validation, previews, duplicate selection filtering, and per-file upload progress.
+- HEIC/HEIF photos (the iPhone default) are converted to JPEG in the browser before upload. See "Capture preparation" below.
+- Warn-only checks before upload: blurry or low-detail photos, near-duplicates, and fewer than 30 usable photos.
 - Persistent capture manifests in D1, image/result storage in R2, and owner-scoped APIs.
 - Resumable uploads: reselect the original files from an incomplete capture.
 - A durable job queue with atomic claims, worker leases, real stage reporting, and stale-job recovery.
@@ -13,6 +15,24 @@ A web-first photo-to-Gaussian-splat prototype. Capture photos are stored on the 
 - A separately attributed Spark sample scene. The sample is not a reconstruction of uploaded photos.
 
 Reconstruction needs an external CUDA GPU worker. Without one, uploads stay queued. There is no fake progress, generated replacement scene, or automatic paid GPU provisioning.
+
+## Capture preparation
+
+Photos are prepared in the browser, in Web Workers, as soon as they are added. The server still accepts only JPG/PNG.
+
+- **HEIC/HEIF** files are recognised by extension, MIME type or file signature, then converted to JPEG at quality 0.92 with the correct orientation.
+  - Safari decodes them natively.
+  - Other browsers download a WASM decoder the first time: [libheif-js](https://github.com/catdad-experiments/libheif-js), about 2 MB, licensed LGPL-3.0, and loaded as a separate lazily imported chunk.
+  - A photo that would exceed 20 MB is re-encoded at lower quality, then a smaller size.
+  - Each file shows its status. A file that fails shows the reason and what to do; the other files continue.
+  - EXIF metadata is not copied into the converted JPEG.
+- **Checks** only warn; they never block an upload.
+  - Blur uses the variance of the Laplacian on a 512 px grayscale copy.
+  - Near-duplicates use a 64-bit difference hash with a Hamming distance ≤ 6.
+  - Count guidance appears when fewer than 30 usable photos remain.
+  - One click removes the blurry photos or the extra copies.
+- Thresholds and how they were calibrated are in [docs/specs/capture-pipeline.md §8](docs/specs/capture-pipeline.md).
+- The code is in `lib/capture-prep/`, `components/useCapturePrep.ts` and `components/PrepWarnings.tsx`.
 
 ## Local development
 

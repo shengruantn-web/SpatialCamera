@@ -6,6 +6,8 @@ import { ArrowUpRight, ArrowRight, Plus, Scan, Images, X, Check, ChevronRight, C
 import SplatViewer, { type SceneSource } from "./SplatViewer";
 import { type Capture, stages, statusLabels } from "../lib/types";
 import { MAX_IMAGE_BYTES, MAX_IMAGES, MAX_TOTAL_BYTES, MIN_IMAGES } from "../lib/validation";
+import PrepWarnings from "./PrepWarnings"; // S6 capture prep
+import { useCapturePrep } from "./useCapturePrep"; // S6 capture prep
 
 const sample: SceneSource = { url: "https://sparkjs.dev/assets/splats/butterfly.spz", name: "The butterfly", sample: true };
 type Selected = { file: File; url: string };
@@ -33,6 +35,7 @@ export default function Studio() {
   const [activeId, setActiveId] = useState<string | null>(null);
   const [resume, setResume] = useState<{ id: string; images: ManifestImage[] } | null>(null);
   const [source, setSource] = useState<SceneSource>(sample);
+  const prep = useCapturePrep(files); // S6 capture prep: HEIC conversion + warn-only checks
   const fileInput = useRef<HTMLInputElement>(null);
   const splatInput = useRef<HTMLInputElement>(null);
   const guideRef = useRef<HTMLDialogElement>(null);
@@ -62,12 +65,15 @@ export default function Studio() {
 
   async function addFiles(incoming: FileList | File[]) {
     if (busy) return;
+    // ── S6 capture prep: HEIC/HEIF → JPEG in a worker before validation (the server takes JPG/PNG only).
+    incoming = await prep.convertHeic(Array.from(incoming));
+    // ── end S6
     const accepted: Selected[] = []; const errors: string[] = []; let bytes = totalBytes;
     const existing = new Set(files.map(x => `${x.file.name}:${x.file.size}`));
     for (const file of Array.from(incoming)) {
       const key = `${file.name}:${file.size}`;
       if (existing.has(key)) continue;
-      if (!["image/jpeg", "image/png"].includes(file.type)) { errors.push("Only JPG and PNG photos are supported. Convert HEIC first."); continue; }
+      if (!["image/jpeg", "image/png"].includes(file.type)) { errors.push("Only JPG, PNG and HEIC photos are supported."); continue; }
       if (file.size > MAX_IMAGE_BYTES || file.size === 0) { errors.push("Each photo must be between 1 byte and 20 MB."); continue; }
       if (files.length + accepted.length >= MAX_IMAGES || bytes + file.size > MAX_TOTAL_BYTES) { errors.push("Limit: 200 photos and 1 GB per capture."); break; }
       try { const bitmap = await createImageBitmap(file); bitmap.close(); }
@@ -140,12 +146,14 @@ export default function Studio() {
           </div> : <>
             <p className="panel-description">One place, from different angles.<br />We’ll put the pieces together.</p>
             {resume && <div className="notice">Reselect the original photos. Uploaded files will be skipped.</div>}
-            <input ref={fileInput} type="file" accept="image/jpeg,image/png" multiple className="sr-only" aria-label="Choose capture photos" disabled={busy} onChange={e => { if (e.target.files) void addFiles(e.target.files); e.target.value = ""; }} />
-            <button disabled={busy} className={`dropzone ${dragging ? "dragging" : ""} ${files.length ? "compact" : ""}`} onClick={() => fileInput.current?.click()} onDragOver={e => { e.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={e => { e.preventDefault(); setDragging(false); void addFiles(e.dataTransfer.files); }}><span className="photo-stack"><Images size={29} strokeWidth={1.3} /></span><strong>{files.length ? "Add more photos" : "Drop your photos here"}</strong><span>or <u>browse files</u></span><small>JPG or PNG · 12–200 photos · Up to 20 MB each</small></button>
+            <input ref={fileInput} type="file" accept="image/jpeg,image/png,image/heic,image/heif,.heic,.heif" multiple className="sr-only" aria-label="Choose capture photos" disabled={busy} onChange={e => { if (e.target.files) void addFiles(e.target.files); e.target.value = ""; }} />
+            <button disabled={busy} className={`dropzone ${dragging ? "dragging" : ""} ${files.length ? "compact" : ""}`} onClick={() => fileInput.current?.click()} onDragOver={e => { e.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={e => { e.preventDefault(); setDragging(false); void addFiles(e.dataTransfer.files); }}><span className="photo-stack"><Images size={29} strokeWidth={1.3} /></span><strong>{files.length ? "Add more photos" : "Drop your photos here"}</strong><span>or <u>browse files</u></span><small>JPG, PNG or HEIC · 12–200 photos · Up to 20 MB each</small></button>
             {files.length > 0 && <div className="selected-files"><div className="file-summary"><span>{files.length} photos <span>· {formatBytes(totalBytes)}</span></span><button disabled={busy} onClick={() => { files.forEach(item => URL.revokeObjectURL(item.url)); setFiles([]); }}>Clear</button></div><div className="thumbnails">{files.slice(0, 8).map((item, i) => <div key={item.url}><img src={item.url} alt={item.file.name} /><button aria-label={`Remove ${item.file.name}`} disabled={busy || !!resume} onClick={() => { URL.revokeObjectURL(item.url); setFiles(files.filter((_, index) => index !== i)); }}><X size={11} /></button>{i === 7 && files.length > 8 && <span className="extra-count">+{files.length - 8}</span>}</div>)}</div>{files.length < MIN_IMAGES && <small className="validation-hint">Add {MIN_IMAGES - files.length} more photos to get started.</small>}</div>}
+            {/* S6 capture prep: conversion progress + warn-only checks */}
+            <PrepWarnings prep={prep} files={files} minImages={MIN_IMAGES} disabled={busy || !!resume} onRemove={remove => { const gone = new Set(remove); files.forEach(item => { if (gone.has(item.file)) URL.revokeObjectURL(item.url); }); setFiles(current => current.filter(item => !gone.has(item.file))); }} />
             <label className="field-label" htmlFor="capture-name">Name your capture <span>Something to remember it by</span></label><input id="capture-name" className="name-input" placeholder="e.g. A quiet corner of home" maxLength={80} value={name} disabled={busy || !!resume} onChange={e => setName(e.target.value)} />
             {error && <div className="notice error" role="alert"><AlertCircle size={16} />{error}</div>}
-            <button className="primary" disabled={busy || files.length < MIN_IMAGES || !name.trim() || !!serverError} onClick={upload}>{busy ? <><LoaderCircle size={16} className="spin" /> Uploading photos · {progress}%</> : <><Box size={17} />{resume ? "Resume & create splat" : "Create 3D splat"}<ArrowRight size={17} /></>}</button>
+            <button className="primary" disabled={busy || prep.converting || files.length < MIN_IMAGES || !name.trim() || !!serverError} onClick={upload}>{busy ? <><LoaderCircle size={16} className="spin" /> Uploading photos · {progress}%</> : <><Box size={17} />{resume ? "Resume & create splat" : "Create 3D splat"}<ArrowRight size={17} /></>}</button>
             {busy && <progress value={progress} max={100} aria-label="Upload progress" />}<p className="privacy-note"><LockKeyhole size={12} /> Your captures stay private.</p>
           </>}
           <div className="processor-note"><span className={`status-dot ${processor ? "online" : ""}`} /><div>{processor ? "Processor connected" : "Processor not connected"}<small>{processor ? "Captures are processed on the server." : "You can save photos now and process them later."}</small></div></div>

@@ -148,3 +148,47 @@ The same sweep also clears `lease` on up to 100 `failed` rows that still hold on
 The API runs no DDL. The schema lives in `db/schema.ts`; `npm run db:generate` emits SQL into `drizzle/`, which the build packages into `dist/.openai/drizzle` for the host to apply. Locally, `node db/migrate.mjs` (run automatically as `predev`, or as `npm run db:migrate:local`) applies pending migrations to the `vinext dev` database (`.wrangler/state/v3`), recording them in `d1_migrations` (the table `wrangler d1 migrations apply` uses). Before applying a pending migration it checks whether the tables, columns and indexes it creates already exist (`sqlite_master`, `PRAGMA table_info`). If all of them do, as in a pre-migration database whose tables came from the old runtime DDL, or one where the SQL was run with `wrangler d1 execute --file`, it records the migration as applied without running it. If only some exist, it stops with a message that lists what is present and what is missing. Migration `0001_api_integrity_hot_path` adds `uploaded_count`, `result_key`, the stage timestamps, `alignment_ratio`, `images.object_key` and the four indexes.
 
 Migrations are schema-only, as the host requires: no `UPDATE` backfills or seed data, and an added column's default is a constant. The code is correct on un-backfilled legacy rows instead: a NULL `result_key` on a `ready` row reads `{id}/result.ply` (§7.1); `uploaded_count` is recounted on every image upload (§7.2) and reported as `image_count` once past `uploading`; and the sweep clears leftover leases (§7.4). `uploaded_count` is maintained on upload, so list and detail reads need no per-row COUNT.
+
+## 8. Client-side preparation (S6, R1.3, R1.6)
+
+Everything here runs in the browser before upload. The server contract is unchanged: it accepts JPG/PNG only (§7.2).
+
+### 8.1 HEIC/HEIF → JPEG
+
+1. **Detection** (`lib/capture-prep/heic.ts`): by extension (`.heic`, `.heif`, `.hif`) or MIME type (`image/heic`, `image/heif` and the `-sequence` forms). iPhone files often arrive with an empty `type`; when neither the name nor the type decides, the first 64 bytes are sniffed for an ISO-BMFF `ftyp` box with a HEVC brand (`heic`, `heix`, `heim`, `heis`, `hevc`, `hevx`, …). The generic `mif1`/`msf1` brands count only when a HEVC brand is also listed, so AVIF is not treated as HEIC.
+2. **Decode** (`heic.worker.ts`, a module worker; pool of `min(2, cores − 1)`): native `createImageBitmap(file)` first (Safari decodes HEIC itself). If that fails, the worker lazily `import()`s **libheif-js 1.23.5** (libheif compiled to WASM, **LGPL-3.0**). It ships as a separate ~2 MB chunk that is fetched only when the first HEIC needs it, from a dynamic import inside the worker, so neither the main bundle nor Studio contains it and the library can be replaced independently, as the LGPL requires. libheif applies the `irot`/`imir`/`clap` transforms, so the decoded pixels are already upright, and the JPEG carries no orientation tag.
+3. **Encode**: `OffscreenCanvas.convertToBlob({ type: "image/jpeg", quality: 0.92 })` on a white background. If the result exceeds `MAX_IMAGE_BYTES` (20 MB), `nextEncodeAttempt` steps through quality 0.85 → 0.75 → 0.65, then downscales by `min(0.9, √(limit / bytes) × 0.95)` per step. Below 25 % of the original size it gives up with a message.
+4. **UI**: one status per file (`queued → loading decoder → decoding → encoding → done/failed`), a progress bar, and a note while the decoder downloads. A failure lists the file with a specific action, for example "This HEIC file could not be read; it may be damaged or use an unsupported variant. Export it as JPEG instead (iPhone: Settings › Camera › Formats › Most Compatible …)". A failed file is left out; the others continue. A worker crash, usually out of memory, fails only that photo. Converted files are cached by name, size and mtime, so re-adding them does not re-decode.
+
+Not preserved: EXIF (camera model, focal length, GPS) is not copied into the converted JPEG. COLMAP falls back to its default focal-length prior, as it does for any photo without EXIF.
+
+### 8.2 Warn-only checks
+
+`lib/capture-prep/analysis.worker.ts` (pool of `min(4, cores − 1)`, idle workers terminated after 20 s) measures each selected photo: `createImageBitmap` → `OffscreenCanvas` downscale to ≤512 px (`imageSmoothingQuality: "high"`) → Rec. 601 grayscale → the pure functions in `lib/capture-prep/metrics.ts`. Results are batched into React state every 120 ms. Nothing is blocked: the user can remove the flagged photos with one button, or upload anyway.
+
+| Check | Metric | Rule | Constant |
+|---|---|---|---|
+| Blurry or low detail | Variance of the 4-neighbour Laplacian on the ≤512 px grayscale copy | `< 50`, or `< 0.3 ×` the selection median when ≥ 8 photos are measured | `BLUR_VARIANCE_MIN`, `BLUR_RELATIVE_FRACTION`, `BLUR_RELATIVE_MIN_PHOTOS` |
+| Near-duplicates | 64-bit dHash (9×8 area-average, horizontal gradient) | Hamming ≤ 6, grouped transitively (union-find). The sharpest photo of each group is kept; the others count as extra copies | `NEAR_DUPLICATE_MAX_DISTANCE` |
+| Too few | Photos minus blurry minus extra copies | `< 30` usable (shown once the 12-photo minimum is met) | `RECOMMENDED_MIN_PHOTOS` |
+
+**Calibration** (headless Chromium, the same browser path):
+
+- Blur score on COLMAP "south-building", 64 photos at 3072×2304:
+  - Sharp: 688–2602 (median 1390).
+  - With a full-resolution Gaussian blur of σ = 1: 608–1671. σ = 2: 355–988. σ = 4: 97–274. σ = 8: 13–34.
+  - Relative to the set median: sharp 0.50–1.87×, σ = 2 0.26–0.71×, σ = 4 0.07–0.20×.
+  - Sharp but featureless photos (macOS desert wallpapers) score 24–63, so the absolute floor sits just above the σ = 8 band. The warning therefore reads "blurry or low in detail".
+  - With these rules the 64 sharp photos produce no warnings. In a 176-photo mix of sharp, blurred, re-encoded and shifted copies, exactly the 32 copies with σ ≥ 4 were flagged. The σ ≤ 2 copies were not: at 512 px a 2 px blur is under a pixel, so it does little harm to alignment either.
+- dHash Hamming distance:
+  - Half-size re-encode at JPEG quality 60: 0–2 bits.
+  - 1 % shift or zoom (hand-shake burst): 0–6. 3 %: 3–12.
+  - Consecutive frames of the real walk-around: 12–43 (median 25). The closest of all 2016 distinct pairs is 11.
+- Cost:
+  - Median ~42 ms per 12 MP photo per worker.
+  - 176 photos checked in ~2.6 s with 4 workers, and no main-thread task over 100 ms during the checks.
+- The unit tests (`tests/capture-prep.test.mjs`) repeat the separation on a deterministic synthetic scene: sharp 1834, σ = 1 at 512 px 59, σ = 2 7.6.
+
+Not checked: overlap between non-duplicate photos (whether every photo shares features with a neighbour). That needs feature matching, so R1.6 stays partial.
+
+Accessibility: warnings are text that starts "Warning:"; the icons are decorative (`aria-hidden`). A visually hidden `role="status" aria-live="polite"` region announces conversion and check summaries once each.

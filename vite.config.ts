@@ -34,6 +34,8 @@ const localBindingConfig = {
 };
 
 export default defineConfig({
+  // Module workers: the HEIC worker lazy-loads libheif with a dynamic import, which needs ES format.
+  worker: { format: "es" },
   plugins: [
     vinext(),
     sites(),
