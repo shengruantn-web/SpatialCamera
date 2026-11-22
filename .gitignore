@@ -43,3 +43,4 @@ playwright-report/
 next-env.d.ts
 /dist/
 /.wrangler/
+/.local/

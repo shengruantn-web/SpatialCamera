@@ -12,7 +12,9 @@
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
     "db:generate": "drizzle-kit generate",
     "typecheck": "tsc --noEmit",
-    "test": "node --test tests/*.test.mjs"
+    "test": "node --test tests/*.test.mjs",
+    "setup:mac": "python3 gpu-worker/setup_mac.py",
+    "worker:mac": ".local/venv/bin/python gpu-worker/worker.py --backend brush --env-file .dev.vars"
   },
   "dependencies": {
     "@sparkjsdev/spark": "^2.3.0",

@@ -1,10 +1,11 @@
-"""Pull-based Gaussian-splat worker. Run in a CUDA-enabled Nerfstudio environment."""
+"""Pull-based Gaussian-splat worker: CUDA/Nerfstudio or Apple Silicon/Brush."""
 import argparse
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -13,10 +14,15 @@ import urllib.request
 
 
 class Worker:
-    def __init__(self, base_url, token, iterations):
+    def __init__(self, base_url, token, iterations, backend="nerfstudio", brush="brush_app",
+                 max_resolution=1200, max_splats=300000):
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.iterations = iterations
+        self.backend = backend
+        self.brush = brush
+        self.max_resolution = max_resolution
+        self.max_splats = max_splats
         # Optional headers supplied by the chosen hosting gateway; never log them.
         self.gateway_headers = json.loads(os.environ.get("SPATIAL_GATEWAY_HEADERS", "{}"))
 
@@ -73,6 +79,7 @@ class Worker:
         def run(command, log_path):
             with log_path.open("wb") as log:
                 process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
+                print(f"{stage.capitalize()}: {log_path.name}", flush=True)
                 deadline = time.monotonic() + 7200
                 try:
                     while process.poll() is None:
@@ -107,20 +114,32 @@ class Worker:
                     data = self.request(f"{job_id}/images/{image['id']}", lease=lease, raw=True)
                     (photos / f"frame_{index:05d}{extension}").write_bytes(data)
                 dataset, outputs, exported = root / "dataset", root / "outputs", root / "export"
-                run(["ns-process-data", "images", "--data", str(photos), "--output-dir", str(dataset)], root / "alignment.log")
-                transforms = json.loads((dataset / "transforms.json").read_text())
-                registered = len(transforms.get("frames", []))
-                if registered < max(8, int(len(job["images"]) * 0.6)):
-                    raise RuntimeError("Too few photos could be aligned. Add overlapping views and avoid blur, mirrors, and moving subjects.")
-                status("training")
-                run(["ns-train", "splatfacto", "--data", str(dataset), "--output-dir", str(outputs),
-                     "--max-num-iterations", str(self.iterations), "--vis", "tensorboard",
-                     "--viewer.quit-on-train-completion", "True"], root / "training.log")
-                configs = list(outputs.rglob("config.yml"))
-                if len(configs) != 1:
-                    raise RuntimeError("The trainer did not produce one complete checkpoint.")
-                status("exporting")
-                run(["ns-export", "gaussian-splat", "--load-config", str(configs[0]), "--output-dir", str(exported)], root / "export.log")
+                if self.backend == "brush":
+                    run([sys.executable, str(Path(__file__).with_name("mac_pipeline.py")),
+                         str(photos), str(dataset), "--max-resolution", str(self.max_resolution)], root / "alignment.log")
+                    status("training")
+                    exported.mkdir()
+                    run([self.brush, str(dataset / "undistorted"),
+                         "--total-steps", str(self.iterations), "--max-resolution", str(self.max_resolution),
+                         "--max-splats", str(self.max_splats), "--sh-degree", "2",
+                         "--export-every", str(self.iterations), "--export-path", str(exported),
+                         "--export-name", "result.ply"], root / "training.log")
+                    status("exporting")
+                else:
+                    run(["ns-process-data", "images", "--data", str(photos), "--output-dir", str(dataset)], root / "alignment.log")
+                    transforms = json.loads((dataset / "transforms.json").read_text())
+                    registered = len(transforms.get("frames", []))
+                    if registered < max(8, int(len(job["images"]) * 0.6)):
+                        raise RuntimeError("Too few photos could be aligned. Add overlapping views and avoid blur, mirrors, and moving subjects.")
+                    status("training")
+                    run(["ns-train", "splatfacto", "--data", str(dataset), "--output-dir", str(outputs),
+                         "--max-num-iterations", str(self.iterations), "--vis", "tensorboard",
+                         "--viewer.quit-on-train-completion", "True"], root / "training.log")
+                    configs = list(outputs.rglob("config.yml"))
+                    if len(configs) != 1:
+                        raise RuntimeError("The trainer did not produce one complete checkpoint.")
+                    status("exporting")
+                    run(["ns-export", "gaussian-splat", "--load-config", str(configs[0]), "--output-dir", str(exported)], root / "export.log")
                 results = list(exported.glob("*.ply"))
                 if len(results) != 1:
                     raise RuntimeError("No Gaussian-splat PLY was produced.")
@@ -143,18 +162,28 @@ class Worker:
         finally:
             stop.set()
 
-    def serve(self):
+    def serve(self, once=False):
+        print(f"Worker started ({self.backend}). Waiting for queued captures.", flush=True)
         while True:
             try:
                 result = self.request("claim", "POST", {})
                 if result.get("job"):
+                    print(f"Claimed capture {result['job']['id']}", flush=True)
                     self.process(result["job"])
+                    if once:
+                        return
                 else:
+                    if once:
+                        print("No queued captures.", flush=True)
+                        return
                     time.sleep(10)
             except KeyboardInterrupt:
                 return
             except Exception as exc:
-                print(f"Cannot reach job queue ({type(exc).__name__}); retrying in 15 seconds.", flush=True)
+                detail = f"HTTP {exc.code}" if isinstance(exc, urllib.error.HTTPError) else type(exc).__name__
+                print(f"Cannot reach job queue ({detail}). Check the URL, WORKER_TOKEN and gateway access.", flush=True)
+                if once:
+                    raise
                 time.sleep(15)
 
 
@@ -162,13 +191,33 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", default=os.environ.get("SPATIAL_URL", "http://localhost:3000"))
     parser.add_argument("--iterations", type=int, default=7000)
+    parser.add_argument("--backend", choices=("nerfstudio", "brush"), default="nerfstudio")
+    parser.add_argument("--brush", default=str(Path(__file__).resolve().parent.parent / ".local/bin/brush_app"))
+    parser.add_argument("--max-resolution", type=int, default=1200)
+    parser.add_argument("--max-splats", type=int, default=300000)
+    parser.add_argument("--env-file", type=Path, help="Read WORKER_TOKEN from a local dotenv file without executing it")
+    parser.add_argument("--once", action="store_true", help="Process at most one queued capture and exit")
     args = parser.parse_args()
     token = os.environ.get("WORKER_TOKEN", "")
+    if not token and args.env_file:
+        for line in args.env_file.read_text().splitlines():
+            key, sep, value = line.strip().partition("=")
+            if sep and key.strip() == "WORKER_TOKEN":
+                token = value.strip().strip("\"'")
     if len(token) < 32:
         parser.error("WORKER_TOKEN must contain at least 32 characters and match the web server.")
     if args.iterations < 1000 or args.iterations > 30000:
         parser.error("Choose 1000–30000 iterations.")
-    for binary in ("ns-process-data", "ns-train", "ns-export", "colmap", "ffmpeg", "nvidia-smi"):
+    if not 256 <= args.max_resolution <= 4096 or not 1000 <= args.max_splats <= 1000000:
+        parser.error("Use resolution 256–4096 and 1,000–1,000,000 splats.")
+    if args.backend == "brush":
+        try:
+            import pycolmap
+        except ImportError:
+            parser.error("Missing pycolmap. Run npm run setup:mac first.")
+    binaries = (args.brush,) if args.backend == "brush" else ("ns-process-data", "ns-train", "ns-export", "colmap", "ffmpeg", "nvidia-smi")
+    for binary in binaries:
         if not shutil.which(binary):
-            parser.error(f"Missing {binary}. Use a CUDA-enabled Nerfstudio environment.")
-    Worker(args.url, token, args.iterations).serve()
+            parser.error(f"Missing {binary}. Run npm run setup:mac for Brush, or use a CUDA-enabled Nerfstudio environment.")
+    Worker(args.url, token, args.iterations, args.backend, args.brush,
+           args.max_resolution, args.max_splats).serve(args.once)
