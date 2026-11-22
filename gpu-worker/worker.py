@@ -1,6 +1,7 @@
 """Pull-based Gaussian-splat worker: CUDA/Nerfstudio or Apple Silicon/Brush."""
 import argparse
 import http.client
+import importlib.util
 import json
 import math
 import os
@@ -15,6 +16,21 @@ import threading
 import time
 import urllib.error
 import urllib.request
+
+
+MAX_SPZ_BYTES = 48 * 1024 * 1024  # Matches the API's cap; SPZ is typically ~1/7 of the PLY.
+
+
+def load_spz():
+    """The sibling spz.py converter, loaded by path so it works however this file is imported.
+    It needs numpy (both worker hosts have it); any import failure means PLY-only delivery."""
+    module = sys.modules.get("spatial_camera_spz")
+    if module is None:
+        spec = importlib.util.spec_from_file_location("spatial_camera_spz", Path(__file__).with_name("spz.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        sys.modules["spatial_camera_spz"] = module
+    return module
 
 
 def validate_ply(path):
@@ -245,9 +261,38 @@ class Worker:
             except json.JSONDecodeError as exc:
                 raise RuntimeError("The worker endpoint returned a non-JSON response. Check hosting gateway authentication.") from exc
 
-    def upload_result(self, job_id, lease, path, lease_lost):
+    def convert_spz(self, job_id, ply_path, spz_path):
+        """Best-effort SPZ conversion of the validated PLY. Returns the SPZ path, or None to deliver the PLY alone."""
+        try:
+            stats = load_spz().convert(ply_path, spz_path)
+        except Exception as exc:  # Never fail a finished capture over the faster format.
+            # Any partial file lives in the working directory, which is removed after the job.
+            print(f"Capture {job_id}: SPZ conversion skipped ({type(exc).__name__}: {exc}); delivering the PLY only.", flush=True)
+            return None
+        if stats["spz_bytes"] > MAX_SPZ_BYTES:
+            print(f"Capture {job_id}: SPZ is over the {MAX_SPZ_BYTES // (1024 * 1024)} MB limit; delivering the PLY only.", flush=True)
+            return None
+        print(f"Capture {job_id}: SPZ {stats['ply_bytes']} -> {stats['spz_bytes']} bytes "
+              f"({stats['points']} splats, SH {stats['sh_degree']}) in {stats['seconds']:g}s.", flush=True)
+        return spz_path
+
+    def upload_spz(self, job_id, lease, path, lease_lost):
+        """Uploads the SPZ before the PLY publishes the capture. Only a lost lease is fatal."""
+        try:
+            # A shorter retry budget: the PLY alone is still a complete delivery.
+            self.upload_result(job_id, lease, path, lease_lost, endpoint="result.spz",
+                               retry_delays=self.retry_delays[:2])
+        except RuntimeError as exc:
+            if lease_lost.is_set():
+                raise
+            # Includes HTTP 404 from a server that predates SPZ, and 400/413 rejections.
+            print(f"Capture {job_id}: SPZ upload failed ({exc}); delivering the PLY only.", flush=True)
+
+    def upload_result(self, job_id, lease, path, lease_lost, *, endpoint="result", retry_delays=None):
+        label = "Result" if endpoint == "result" else "SPZ"
+        retry_delays = self.retry_delays if retry_delays is None else tuple(retry_delays)
         if lease_lost.is_set():
-            raise RuntimeError("The processing lease was lost before result upload.")
+            raise RuntimeError(f"The processing lease was lost before {label.lower()} upload.")
         attempt = 0
         unknown_outcome = False
         while True:
@@ -256,28 +301,28 @@ class Worker:
             # if the heartbeat lost the lease or the retry budget is exhausted.
             confirming = lease_lost.is_set()
             if confirming and not unknown_outcome:
-                raise RuntimeError("The processing lease was lost during result upload retries.")
+                raise RuntimeError(f"The processing lease was lost during {label.lower()} upload retries.")
             attempt += 1
             try:
                 # Reopen for each attempt so retries stream from byte zero.
                 with path.open("rb") as source:
-                    self.request(f"{job_id}/result", "PUT", source, lease, raw=True)
+                    self.request(f"{job_id}/{endpoint}", "PUT", source, lease, raw=True)
                 return
             except urllib.error.HTTPError as exc:
                 code = exc.code
                 exc.close()
                 if code in (401, 403, 409):
                     lease_lost.set()
-                    raise RuntimeError(f"Result upload aborted: HTTP {code}; authorization or processing lease lost.") from exc
+                    raise RuntimeError(f"{label} upload aborted: HTTP {code}; authorization or processing lease lost.") from exc
                 if code != 429 and not 500 <= code < 600:
-                    raise RuntimeError(f"Result upload failed: HTTP {code}.") from exc
+                    raise RuntimeError(f"{label} upload failed: HTTP {code}.") from exc
                 detail = f"HTTP {code}"
                 unknown_outcome = unknown_outcome or 500 <= code < 600
             except (OSError, urllib.error.URLError, http.client.HTTPException) as exc:
                 detail = type(exc).__name__
                 unknown_outcome = True
             if confirming:
-                raise RuntimeError(f"The processing lease was lost; confirming result upload failed ({detail}).")
+                raise RuntimeError(f"The processing lease was lost; confirming {label.lower()} upload failed ({detail}).")
             if not lease_lost.is_set():
                 # Servers may close an unauthorized PUT before reading its body,
                 # which urllib exposes as a network error instead of HTTP 409.
@@ -291,10 +336,10 @@ class Worker:
                     pass
             if lease_lost.is_set():
                 continue
-            if attempt > len(self.retry_delays):
-                raise RuntimeError(f"Result upload failed after {attempt} attempts ({detail}).")
-            delay = self.retry_delays[attempt - 1]
-            print(f"Result upload failed ({detail}); retrying in {delay:g}s.", flush=True)
+            if attempt > len(retry_delays):
+                raise RuntimeError(f"{label} upload failed after {attempt} attempts ({detail}).")
+            delay = retry_delays[attempt - 1]
+            print(f"{label} upload failed ({detail}); retrying in {delay:g}s.", flush=True)
             lease_lost.wait(delay)
 
     def prune_recovery(self):
@@ -423,6 +468,10 @@ class Worker:
                     raise RuntimeError("This splat exceeds the prototype's 90 MB delivery limit. Try a smaller scene.")
                 validate_ply(results[0])
                 validated_result = results[0]
+                # SPZ first: the PLY PUT publishes the capture and attaches this attempt's SPZ.
+                spz_path = self.convert_spz(job_id, results[0], root / "result.spz")
+                if spz_path is not None:
+                    self.upload_spz(job_id, lease, spz_path, lease_lost)
                 self.upload_result(job_id, lease, results[0], lease_lost)
                 uploaded = True
                 print(f"Completed capture {job_id}", flush=True)

@@ -1,4 +1,6 @@
-import { isGaussianPly, isImage, parseWorkerMetrics, validateManifest, MAX_IMAGE_BYTES } from "../lib/validation";
+import {
+  isGaussianPly, isGzip, isImage, parseSpzHeader, parseWorkerMetrics, validateManifest, MAX_IMAGE_BYTES, MAX_PLY_BYTES, MAX_SPZ_BYTES,
+} from "../lib/validation";
 
 export interface ApiEnv {
   DB: D1Database;
@@ -8,7 +10,7 @@ export interface ApiEnv {
 }
 type Job = {
   id: string; owner: string; status: string; lease: string | null; image_count: number; updated_at: number;
-  result_key: string | null;
+  result_key: string | null; spz_key: string | null; spz_bytes: number | null; ready_at: number | null;
 };
 type ImageRow = { id: string; name: string; bytes: number; mime: string; uploaded: number; object_key: string | null };
 const active = ["aligning", "training", "exporting"];
@@ -19,13 +21,16 @@ const RETRY_UPLOAD = "The upload was interrupted or could not be stored. Please 
 const STALE_ERROR = "The processor stopped responding. Retry this capture when it reconnects.";
 // Everything the owner may see. Never includes lease, result_key or R2 object keys.
 const publicFields = ["id", "name", "status", "created_at", "updated_at", "image_count", "uploaded_count", "error", "result_bytes",
-  "queued_at", "aligning_at", "training_at", "exporting_at", "ready_at", "failed_at", "alignment_ratio"] as const;
+  "spz_bytes", "queued_at", "aligning_at", "training_at", "exporting_at", "ready_at", "failed_at", "alignment_ratio"] as const;
 const publicColumns = publicFields.join(",");
 // Past `uploading` every manifest image is uploaded (I2) and frozen (I5), so `uploaded_count` is
 // `image_count`. Reading it that way keeps rows created before the counter existed correct without a
 // data backfill; while `uploading`, every image PUT recounts it (§7.2).
+// `spz_bytes` is recorded by the attempt's SPZ PUT while it is still exporting, but describes a scene only
+// once that attempt publishes, so it reads as null before `ready`.
 const toPublic = (row: Record<string, unknown>) => Object.fromEntries(publicFields.map(field =>
-  [field, (field === "uploaded_count" && row.status !== "uploading" ? row.image_count : row[field]) ?? null]));
+  [field, (field === "uploaded_count" && row.status !== "uploading" ? row.image_count
+    : field === "spz_bytes" && row.status !== "ready" ? null : row[field]) ?? null]));
 const json = (value: unknown, status = 200) => Response.json(value, { status, headers: { "Cache-Control": "no-store" } });
 class ApiError extends Error { constructor(message: string, public status = 400) { super(message); } }
 function fail(message: string, status = 400): never { throw new ApiError(message, status); }
@@ -39,7 +44,7 @@ const isStale = (row: { status?: unknown; updated_at?: unknown }, now: number) =
  */
 export async function sweepStaleLeases(db: D1Database, now = Date.now()) {
   const [expired] = await db.batch([
-    db.prepare("UPDATE captures SET status='failed',error=?,lease=NULL,failed_at=?,updated_at=? WHERE status IN ('aligning','training','exporting') AND updated_at < ?")
+    db.prepare("UPDATE captures SET status='failed',error=?,lease=NULL,spz_key=NULL,spz_bytes=NULL,failed_at=?,updated_at=? WHERE status IN ('aligning','training','exporting') AND updated_at < ?")
       .bind(STALE_ERROR, now, now, now - LEASE_TTL_MS),
     // I1 repair: before S2 a worker-reported `failed` kept its lease (`ready` always cleared it).
     // Clears those rows in bounded batches over the status index instead of a migration backfill.
@@ -49,19 +54,123 @@ export async function sweepStaleLeases(db: D1Database, now = Date.now()) {
 }
 /** Same as the sweep, for one capture already read and found stale (keeps reads write-free otherwise). */
 async function expireCapture(db: D1Database, id: string, now: number) {
-  await db.prepare("UPDATE captures SET status='failed',error=?,lease=NULL,failed_at=?,updated_at=? WHERE id=? AND status IN ('aligning','training','exporting') AND updated_at < ?")
+  await db.prepare("UPDATE captures SET status='failed',error=?,lease=NULL,spz_key=NULL,spz_bytes=NULL,failed_at=?,updated_at=? WHERE id=? AND status IN ('aligning','training','exporting') AND updated_at < ?")
     .bind(STALE_ERROR, now, now, id, now - LEASE_TTL_MS).run();
 }
-export async function handleScheduled(env: Pick<ApiEnv, "DB">) {
-  if (env.DB) await sweepStaleLeases(env.DB);
+export async function handleScheduled(env: Pick<ApiEnv, "DB" | "BUCKET">) {
+  if (!env.DB) return;
+  await sweepStaleLeases(env.DB);
+  if (env.BUCKET) await collectAttemptGarbage(env);
 }
+
 /** Leases are bearer secrets, so R2 keys carry a digest of the lease rather than the lease itself. */
-async function resultKeyFor(id: string, lease: string) {
+async function attemptDirFor(id: string, lease: string) {
   const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(lease)));
   const attempt = Array.from(digest.slice(0, 16), b => b.toString(16).padStart(2, "0")).join("");
-  return `${id}/attempts/${attempt}/result.ply`;
+  return `${id}/attempts/${attempt}`;
 }
+/**
+ * Every result PUT writes a key of its own (`{attempt}/result.{nonce}.ply|spz`) that nothing reads until a
+ * conditional UPDATE records it, so no request can change bytes that are already published (C2): a late
+ * or duplicate PUT can only create an unreferenced object, which it then deletes.
+ */
+const uploadKeyIn = (dir: string, extension: "ply" | "spz") => `${dir}/result.${crypto.randomUUID()}.${extension}`;
+const inDir = (key: string | null | undefined, dir: string): key is string => Boolean(key?.startsWith(`${dir}/`));
+/** Rows published before per-upload keys kept their SPZ beside a fixed `{attempt}/result.ply`. */
+const legacySpzKeyFor = (resultKey: string) => resultKey.replace(/\/result\.ply$/, "/result.spz");
 const legacyResultKey = (id: string) => `${id}/result.ply`;
+type Published = Pick<Job, "status" | "result_key" | "spz_key" | "spz_bytes">;
+/** The SPZ a ready capture serves, if any. */
+const publishedSpzKey = (row: Published) => row.status !== "ready" || row.spz_bytes == null ? null
+  : row.spz_key ?? (row.result_key && /\/result\.ply$/.test(row.result_key) ? legacySpzKeyFor(row.result_key) : null);
+const GC_LIST_LIMIT = 100;
+const GC_CAPTURES_PER_RUN = 10;
+const GC_PAGES_PER_CAPTURE = 5;
+/**
+ * D1 and R2 calls one collection may make. Workers Free allows 50 subrequests per invocation: the cron
+ * spends 1 on the lease sweep and at most 40 here; the inline collection after a publish, which already
+ * made about 8, at most 12. Whatever is left over is picked up by the next cron tick.
+ */
+export const GC_SUBREQUESTS_PER_RUN = 40;
+const GC_SUBREQUESTS_INLINE = 12;
+/** Collecting a capture needs its row read, one list, one delete and the final mark update, plus one in reserve to record a failure. */
+const GC_MIN_PER_CAPTURE = 5;
+/**
+ * `gc_pending` is 0 (clean) or 1 + the number of failed collections. A capture that fails is retried after
+ * the others (the cron orders by it) and given up after GC_MAX_FAILURES, keeping a truthy mark for the logs.
+ */
+export const GC_MAX_FAILURES = 5;
+type Budget = { left: number };
+const spend = (budget: Budget) => { budget.left--; };
+/** Lists keys under a prefix, a bounded number of pages, and deletes those not kept; true if more remain. */
+async function deleteUnder(bucket: R2Bucket, prefix: string, keep: (object: R2Object) => boolean = () => false, pages = 1, budget: Budget = { left: Infinity }, reserve = 0) {
+  let cursor: string | undefined;
+  for (let page = 0; page < pages; page++) {
+    if (budget.left < 2 + reserve) return true; // a list and a delete, keeping `reserve` for the caller
+    spend(budget);
+    const listing = await bucket.list({ prefix, limit: GC_LIST_LIMIT, ...(cursor ? { cursor } : {}) });
+    const doomed = listing.objects.filter(object => !keep(object)).map(object => object.key);
+    if (doomed.length) { spend(budget); await bucket.delete(doomed); }
+    if (!listing.truncated) return false;
+    cursor = listing.cursor;
+  }
+  return true;
+}
+/** Removes what an attempt that can no longer publish stored. Never called for the published attempt. */
+const deleteAttempt = (bucket: R2Bucket, dir: string, why: string) =>
+  deleteUnder(bucket, `${dir}/`).catch(error => console.error(`Could not delete ${why}`, dir, error));
+/**
+ * Attempt garbage collection (C3, spec §7.7). Every claim marks its capture `gc_pending`. Once the capture
+ * is terminal, everything under `{id}/attempts/` except the published PLY and SPZ is garbage: an attempt
+ * that died between its SPZ and its PLY, a superseded attempt, a duplicate PUT that lost. For a `failed`
+ * capture, objects stored after it failed are left alone in case they belong to a newer attempt (the owner
+ * may resubmit between this read and the listing); that attempt's own checks clean them up.
+ * Returns true when the capture is clean and its mark was cleared; false when it is not terminal, changed
+ * meanwhile, or has more to delete than this budget allowed (it stays marked for the next run).
+ */
+async function collectCapture(env: Pick<ApiEnv, "DB" | "BUCKET">, id: string, budget: Budget) {
+  if (budget.left < GC_MIN_PER_CAPTURE) return false;
+  spend(budget);
+  const row = await env.DB.prepare("SELECT status,result_key,spz_key,spz_bytes,updated_at FROM captures WHERE id=?").bind(id)
+    .first<Published & { updated_at: number }>();
+  if (!row || (row.status !== "ready" && row.status !== "failed")) return false;
+  const keep = new Set([row.status === "ready" ? row.result_key : null, publishedSpzKey(row)].filter(Boolean));
+  // Two in reserve: the mark update below, and recording a failure should the next call throw.
+  const more = await deleteUnder(env.BUCKET, `${id}/attempts/`,
+    object => keep.has(object.key) || (row.status === "failed" && object.uploaded.getTime() > row.updated_at), GC_PAGES_PER_CAPTURE, budget, 2);
+  if (more) return false;
+  spend(budget);
+  const cleared = await env.DB.prepare("UPDATE captures SET gc_pending=0 WHERE id=? AND status=? AND updated_at=?").bind(id, row.status, row.updated_at).run();
+  return cleared.meta.changes > 0;
+}
+/** Right after a publish: this capture only, within what is left of the request's subrequests. */
+const collectPublished = (env: Pick<ApiEnv, "DB" | "BUCKET">, id: string) => collectCapture(env, id, { left: GC_SUBREQUESTS_INLINE });
+/**
+ * Cron: terminal captures still marked, those that never failed first (oldest first), within a subrequest
+ * budget shared across captures. A capture whose collection throws has its mark incremented so it sinks
+ * behind the rest and cannot starve them; past GC_MAX_FAILURES it is no longer selected. Returns how many
+ * captures were cleaned.
+ */
+export async function collectAttemptGarbage(env: Pick<ApiEnv, "DB" | "BUCKET">, { limit = GC_CAPTURES_PER_RUN, budget = { left: GC_SUBREQUESTS_PER_RUN } }: { limit?: number; budget?: Budget } = {}) {
+  spend(budget);
+  const { results } = await env.DB.prepare("SELECT id,gc_pending FROM captures WHERE gc_pending BETWEEN 1 AND ? AND status IN ('ready','failed') ORDER BY gc_pending,updated_at LIMIT ?")
+    .bind(GC_MAX_FAILURES, limit).all<{ id: string; gc_pending: number }>();
+  let cleaned = 0;
+  for (const { id, gc_pending: marked } of results) {
+    if (budget.left < GC_MIN_PER_CAPTURE) break;
+    try { if (await collectCapture(env, id, budget)) cleaned++; }
+    catch (error) {
+      console.error("Attempt garbage collection failed", id, error);
+      try {
+        spend(budget);
+        // Stays truthy: only a successful collection (or a new claim, which resets it to 1) changes that.
+        await env.DB.prepare("UPDATE captures SET gc_pending=gc_pending+1 WHERE id=? AND gc_pending>0").bind(id).run();
+        if (marked >= GC_MAX_FAILURES) console.error(`Attempt garbage collection gave up after ${GC_MAX_FAILURES} failures; objects under ${id}/attempts/ need manual cleanup`);
+      } catch (markError) { console.error("Could not record the collection failure", id, markError); }
+    }
+  }
+  return cleaned;
+}
 const imageKey = (captureId: string, image: ImageRow) => image.object_key ?? `${captureId}/images/${image.id}`;
 
 async function boundedBody(request: Request, max: number) {
@@ -86,36 +195,138 @@ async function readJson(request: Request) {
   try { return JSON.parse(new TextDecoder().decode(await boundedBody(request, 128 * 1024))); }
   catch (error) { if (error instanceof ApiError) throw error; fail("Invalid JSON."); }
 }
-async function storeSplat(request: Request, bucket: R2Bucket, key: string) {
+/** Follows the whole upload after its first bytes were vetted; `false` from either call rejects it (400). */
+type SplatCheck = { write(chunk: Uint8Array<ArrayBuffer>): Promise<boolean>; end(): Promise<boolean>; abort(): void };
+type SplatFormat = {
+  label: string; max: number; contentType: string; invalid: string;
+  /** Vets the first bytes (at least 16 KB unless the file is shorter); null rejects before anything is stored. */
+  inspect(prefix: Uint8Array<ArrayBuffer>, length: number): Promise<SplatCheck | null> | SplatCheck | null;
+};
+const HEADER_ONLY: SplatCheck = { write: async () => true, end: async () => true, abort: () => {} };
+const PLY: SplatFormat = {
+  label: "PLY", max: MAX_PLY_BYTES, contentType: "application/octet-stream",
+  invalid: "Expected a Gaussian-splat PLY with scale, rotation, opacity and color properties.",
+  inspect: prefix => isGaussianPly(new TextDecoder().decode(prefix.subarray(0, 16384))) ? HEADER_ONLY : null,
+};
+/**
+ * Inflates the entire upload as it streams through (C1). A truncated, padded or corrupt gzip stream fails
+ * in DecompressionStream (workerd rejects incomplete data, a bad CRC and any byte after the member), and
+ * the decompressed size must be exactly what the header implies. Counting stops past that size, so the
+ * header's point count is also the zip-bomb cap: decompressed bytes are only counted, never held.
+ */
+function exactInflation(expected: number): SplatCheck {
+  const inflate = new DecompressionStream("gzip");
+  const writer = inflate.writable.getWriter();
+  const reader = inflate.readable.getReader();
+  let total = 0;
+  let ok = true;
+  const drained = (async () => {
+    while (true) {
+      const next = await reader.read();
+      if (next.done) return total === expected;
+      total += next.value.length;
+      if (total > expected) { await reader.cancel().catch(() => {}); return false; }
+    }
+  })().catch(() => false).then(result => { if (!result) ok = false; return result; });
+  return {
+    async write(chunk) {
+      if (ok) await writer.write(chunk).catch(() => { ok = false; });
+      return ok;
+    },
+    async end() {
+      if (ok) await writer.close().catch(() => { ok = false; });
+      else await writer.abort().catch(() => {});
+      return (await drained) && ok;
+    },
+    /** Releases the decompressor when the upload fails for another reason (a broken stream, R2). */
+    abort() {
+      ok = false;
+      writer.abort().catch(() => {});
+      reader.cancel().catch(() => {});
+    },
+  };
+}
+const SPZ: SplatFormat = {
+  label: "SPZ", max: MAX_SPZ_BYTES, contentType: "application/x-spz",
+  invalid: "Expected a complete gzip SPZ (version 2 or 3) whose data matches its header.",
+  async inspect(prefix, length) {
+    if (!isGzip(prefix)) return null;
+    // Inflate only the prefix, and only far enough to read the 16-byte header. A prefix cut mid-stream
+    // ends in an "unexpected end of file" error, but only after the header bytes have been read.
+    const inflate = new DecompressionStream("gzip");
+    const reader = inflate.readable.getReader();
+    const writer = inflate.writable.getWriter();
+    writer.write(prefix).then(() => writer.close()).catch(() => {});
+    const header = new Uint8Array(16);
+    let filled = 0;
+    try {
+      while (filled < 16) {
+        const next = await reader.read();
+        if (next.done) break;
+        const take = next.value.subarray(0, 16 - filled);
+        header.set(take, filled);
+        filled += take.length;
+      }
+    } catch { /* A corrupt stream, or a prefix cut before 16 output bytes; judged below. */ }
+    await reader.cancel().catch(() => {});
+    const parsed = filled === 16 ? parseSpzHeader(header, length) : null;
+    return parsed ? exactInflation(parsed.rawBytes) : null;
+  },
+};
+class InvalidSplat extends Error {}
+async function storeSplat(request: Request, bucket: R2Bucket, key: string, format: SplatFormat = PLY) {
   const length = Number(request.headers.get("content-length"));
-  if (!Number.isSafeInteger(length) || length <= 0 || length > 90 * 1024 * 1024) fail("Supply a PLY with Content-Length between 1 byte and 90 MB.", 413);
+  if (!Number.isSafeInteger(length) || length <= 0 || length > format.max) fail(`Supply a ${format.label} with Content-Length between 1 byte and ${format.max / 1024 / 1024} MB.`, 413);
   const reader = request.body?.getReader();
-  if (!reader) fail("A PLY is required.");
-  // Inspect only the header; stream the large result without duplicating it in Worker memory.
-  const prefix: Uint8Array[] = [];
-  let header = "";
+  if (!reader) fail(`A ${format.label} is required.`);
+  // Inspect the first bytes before storing anything; stream the rest without holding it in Worker memory.
+  const prefix: Uint8Array<ArrayBuffer>[] = [];
+  let read = 0;
   try {
-    while (!header.includes("end_header") && header.length < 16384) {
+    while (read < 16384) {
       const next = await reader.read();
       if (next.done) break;
       prefix.push(next.value);
-      header += new TextDecoder().decode(next.value.slice(0, 16384 - header.length));
+      read += next.value.length;
     }
   } catch { fail(RETRY_UPLOAD, 503); }
-  if (!isGaussianPly(header)) { await reader.cancel(); fail("Expected a Gaussian-splat PLY with scale, rotation, opacity and color properties."); }
+  const head = new Uint8Array(read);
+  prefix.reduce((offset, chunk) => { head.set(chunk, offset); return offset + chunk.length; }, 0);
+  const check = await format.inspect(head, length);
+  if (!check) { await reader.cancel(); fail(format.invalid); }
   const stream = new FixedLengthStream(length);
   const writer = stream.writable.getWriter();
   const pump = async () => {
+    let received = 0;
+    // Each chunk is checked before it is forwarded, and the stream is closed only after the whole check
+    // passes, so a rejected upload aborts the R2 put instead of completing it.
+    const forward = async (chunk: Uint8Array<ArrayBuffer>) => {
+      received += chunk.length;
+      if (received > length) throw new Error("Body longer than its Content-Length.");
+      if (!(await check.write(chunk))) throw new InvalidSplat();
+      await writer.write(chunk);
+    };
     try {
-      for (const chunk of prefix) await writer.write(chunk);
-      while (true) { const next = await reader.read(); if (next.done) break; await writer.write(next.value); }
+      for (const chunk of prefix) await forward(chunk);
+      while (true) { const next = await reader.read(); if (next.done) break; await forward(next.value); }
+      // A short body is a broken connection (retryable), not a bad file: judged before the content.
+      if (received !== length) throw new Error("Body shorter than its Content-Length.");
+      if (!(await check.end())) throw new InvalidSplat();
       await writer.close();
-    } catch (error) { await writer.abort(error).catch(() => {}); throw error; }
+    } catch (error) { check.abort(); await writer.abort(error).catch(() => {}); throw error; }
   };
-  try { await Promise.all([pump(), bucket.put(key, stream.readable, { httpMetadata: { contentType: "application/octet-stream" } })]); }
+  // If R2 gives up first, nothing reads the stream any more: abort it so the pump stops instead of hanging.
+  const put = bucket.put(key, stream.readable, { httpMetadata: { contentType: format.contentType } })
+    .catch(error => { writer.abort(error).catch(() => {}); throw error; });
+  const [pumped, stored] = await Promise.allSettled([pump(), put]);
+  if (pumped.status === "fulfilled" && stored.status === "fulfilled") return length;
+  await reader.cancel().catch(() => {});
+  if (pumped.status === "rejected" && pumped.reason instanceof InvalidSplat) {
+    await bucket.delete(key).catch(() => {});
+    fail(format.invalid);
+  }
   // A broken request stream, short body or R2 error is transient: 503 so the worker retries (400 is final).
-  catch { await reader.cancel().catch(() => {}); fail(RETRY_UPLOAD, 503); }
-  return length;
+  fail(RETRY_UPLOAD, 503);
 }
 async function verifyWorker(request: Request, env: ApiEnv) {
   if (!env.WORKER_TOKEN || env.WORKER_TOKEN.length < 32) fail("GPU worker authentication is not configured.", 503);
@@ -126,13 +337,15 @@ async function verifyWorker(request: Request, env: ApiEnv) {
   for (let i = 0; i < a.length; i++) difference |= a[i] ^ b[i];
   if (difference) fail("Unauthorized worker.", 401);
 }
-async function objectResponse(env: ApiEnv, key: string, mime: string, name?: string) {
+async function objectResponse(env: ApiEnv, key: string, mime: string, name?: string, headers: Record<string, string> = {}) {
   const object = await env.BUCKET.get(key);
   if (!object) fail("File not found.", 404);
+  // Bytes are served exactly as stored (an SPZ is gzip data, not a gzip Content-Encoding).
   return new Response(object.body, { headers: {
     "Content-Type": mime, "Content-Length": String(object.size), "Cache-Control": "private, no-store",
     "X-Content-Type-Options": "nosniff",
     ...(name ? { "Content-Disposition": `attachment; filename="${name}"` } : {}),
+    ...headers,
   } });
 }
 
@@ -160,23 +373,34 @@ export async function handleApi(request: Request, env: ApiEnv): Promise<Response
         // Expire dead attempts first so their captures can be resubmitted.
         await sweepStaleLeases(env.DB, now);
         const lease = crypto.randomUUID();
-        const job = await env.DB.prepare("UPDATE captures SET status='aligning',lease=?,aligning_at=?,updated_at=? WHERE id=(SELECT id FROM captures WHERE status='queued' ORDER BY created_at LIMIT 1) AND status='queued' RETURNING id,image_count").bind(lease, now, now).first();
+        const job = await env.DB.prepare("UPDATE captures SET status='aligning',lease=?,spz_key=NULL,spz_bytes=NULL,gc_pending=1,aligning_at=?,updated_at=? WHERE id=(SELECT id FROM captures WHERE status='queued' ORDER BY created_at LIMIT 1) AND status='queued' RETURNING id,image_count").bind(lease, now, now).first();
         if (!job) return json({ job: null });
         const images = await env.DB.prepare("SELECT id,name,mime FROM images WHERE capture_id=? AND uploaded=1 ORDER BY id").bind(job.id).all();
         return json({ job: { ...job, lease, images: images.results } });
       }
       const job = await env.DB.prepare("SELECT * FROM captures WHERE id=?").bind(path[2] ?? "").first<Job>();
       const lease = request.headers.get("x-job-lease") ?? "";
-      const isResultPut = path[3] === "result" && request.method === "PUT";
-      // Idempotent finalisation: the attempt that published the result may repeat its PUT (e.g. the
-      // response was lost) and gets 200 without rewriting. Recognised by its result key, so `ready`
-      // rows still hold no lease (I1).
-      if (isResultPut && job?.status === "ready" && lease && job.result_key === await resultKeyFor(job.id, lease)) {
+      // `result.spz` stores and records the attempt's SPZ without publishing; `result` stores the PLY and
+      // publishes the attempt in one conditional UPDATE. Workers that predate SPZ only ever send `result`.
+      const isResultPut = (path[3] === "result" || path[3] === "result.spz") && request.method === "PUT";
+      const attemptDir = isResultPut && job && lease ? await attemptDirFor(job.id, lease) : null;
+      // Idempotent finalisation: the attempt that published may repeat its PUTs (e.g. the response was
+      // lost) and gets 200 without writing anything. Recognised by its published key's attempt directory,
+      // so `ready` rows still hold no lease (I1).
+      if (attemptDir && job?.status === "ready" && inDir(job.result_key, attemptDir)) {
         await request.body?.cancel().catch(() => {});
         return json({ ok: true });
       }
-      if (!job || !active.includes(job.status) || !lease || job.lease !== lease) fail("Job lease expired or invalid.", 409);
-      if (isStale(job, now)) { await expireCapture(env.DB, job.id, now); fail("Job lease expired or invalid.", 409); }
+      if (!job || !active.includes(job.status) || !lease || job.lease !== lease || isStale(job, now)) {
+        if (job && isStale(job, now)) await expireCapture(env.DB, job.id, now);
+        // A superseded attempt can never publish, so whatever it stored is garbage; the published
+        // attempt returned above and is never reached here.
+        if (attemptDir && !inDir(job?.result_key, attemptDir)) {
+          await request.body?.cancel().catch(() => {});
+          await deleteAttempt(env.BUCKET, attemptDir, "superseded attempt");
+        }
+        fail("Job lease expired or invalid.", 409);
+      }
       if (path[3] === "images" && request.method === "GET") {
         const image = await env.DB.prepare("SELECT * FROM images WHERE id=? AND capture_id=? AND uploaded=1").bind(path[4] ?? "", job.id).first<ImageRow>();
         if (!image) fail("Photo not found.", 404);
@@ -198,31 +422,59 @@ export async function handleApi(request: Request, env: ApiEnv): Promise<Response
         // Stamp the stage's entry time only on a real transition, not on a same-stage heartbeat.
         // Column names come from the fixed whitelist above (active stages + failed).
         const stamp = next !== job.status ? `,${next}_at=?` : "";
-        const clearLease = next === "failed" ? ",lease=NULL" : "";
+        const clearLease = next === "failed" ? ",lease=NULL,spz_key=NULL,spz_bytes=NULL" : "";
         const result = await env.DB.prepare(`UPDATE captures SET status=?,error=?,updated_at=MAX(updated_at,?),alignment_ratio=COALESCE(?,alignment_ratio)${stamp}${clearLease} WHERE id=? AND lease=? AND status=? AND updated_at>=?`)
           .bind(next, error, at, alignmentRatio, ...(stamp ? [at] : []), job.id, job.lease, job.status, at - LEASE_TTL_MS).run();
         if (!result.meta.changes) fail("Job changed while updating.", 409);
         return json({ ok: true });
       }
-      if (isResultPut) {
+      if (attemptDir) {
         if (job.status !== "exporting") fail("The capture is not ready for export.", 409);
-        // Each attempt writes its own key; only the conditional UPDATE below publishes it (T2).
-        const key = await resultKeyFor(job.id, lease);
-        const bytes = await storeSplat(request, env.BUCKET, key);
+        const dir = attemptDir;
+        // This request's object was stored but not recorded. If this attempt already published (a
+        // duplicate PUT won), the published objects are other keys: drop only ours and acknowledge.
+        // Otherwise the attempt has lost its lease and nothing it stored can ever be published.
+        const unpublished = async (ownKey: string, at: number) => {
+          const current = await env.DB.prepare("SELECT status,result_key FROM captures WHERE id=?").bind(job.id).first<Pick<Job, "status" | "result_key">>();
+          if (current?.status === "ready" && inDir(current.result_key, dir)) {
+            await env.BUCKET.delete(ownKey).catch(error => console.error("Could not delete duplicate result", ownKey, error));
+            return json({ ok: true });
+          }
+          await deleteAttempt(env.BUCKET, dir, "unpublished attempt");
+          await expireCapture(env.DB, job.id, at);
+          fail("Job lease expired.", 409);
+        };
+        if (path[3] === "result.spz") {
+          const spzKey = uploadKeyIn(dir, "spz");
+          const bytes = await storeSplat(request, env.BUCKET, spzKey, SPZ);
+          // Recorded on the row, not published: the attempt's PLY PUT publishes it. The UPDATE holds only
+          // while this lease is live and still exporting, so a recorded SPZ can never replace a published
+          // one, and an SPZ that loses that race was never referenced (C2). Same batch, same snapshot:
+          // the SELECT names the SPZ this one replaces.
+          const done = Date.now();
+          const [previous, recorded] = await env.DB.batch([
+            env.DB.prepare("SELECT spz_key FROM captures WHERE id=?").bind(job.id),
+            env.DB.prepare("UPDATE captures SET spz_key=?,spz_bytes=? WHERE id=? AND lease=? AND status='exporting' AND updated_at>=?")
+              .bind(spzKey, bytes, job.id, lease, done - LEASE_TTL_MS),
+          ]);
+          if (!recorded.meta.changes) return await unpublished(spzKey, done);
+          const replaced = (previous.results[0] as { spz_key: string | null } | undefined)?.spz_key;
+          if (replaced && replaced !== spzKey) await env.BUCKET.delete(replaced).catch(error => console.error("Could not delete replaced SPZ", replaced, error));
+          return json({ ok: true });
+        }
+        const key = uploadKeyIn(dir, "ply");
+        const bytes = await storeSplat(request, env.BUCKET, key, PLY);
         // The lease must still be fresh when the upload completes, not just when it started: an
         // attempt that stopped heartbeating mid-upload has expired even if no sweep has run yet.
         // (The worker heartbeats throughout the upload, so a live long upload stays fresh.)
+        // The SPZ this attempt recorded (claim cleared any earlier one) publishes in the same statement,
+        // so a capture is never ready with one format of one attempt and the other of another.
         const done = Date.now();
         const result = await env.DB.prepare("UPDATE captures SET status='ready',result_key=?,result_bytes=?,ready_at=?,updated_at=MAX(updated_at,?),lease=NULL,error=NULL WHERE id=? AND lease=? AND status='exporting' AND updated_at>=?")
           .bind(key, bytes, done, done, job.id, lease, done - LEASE_TTL_MS).run();
-        if (!result.meta.changes) {
-          const current = await env.DB.prepare("SELECT status,result_key FROM captures WHERE id=?").bind(job.id).first<Pick<Job, "status" | "result_key">>();
-          // A concurrent duplicate PUT from this same attempt published first: same key, so keep it.
-          if (current?.status === "ready" && current.result_key === key) return json({ ok: true });
-          await env.BUCKET.delete(key).catch(error => console.error("Could not delete unpublished result", key, error));
-          await expireCapture(env.DB, job.id, done);
-          fail("Job lease expired.", 409);
-        }
+        if (!result.meta.changes) return await unpublished(key, done);
+        // Earlier attempts' leftovers go now; anything this misses stays marked for the cron (C3).
+        await collectPublished(env, job.id).catch(error => console.error("Attempt garbage collection failed", job.id, error));
         return json({ ok: true });
       }
       fail("Unknown worker endpoint.", 404);
@@ -303,9 +555,24 @@ export async function handleApi(request: Request, env: ApiEnv): Promise<Response
       }
       return json({ status: "queued" });
     }
+    // The PLY archive (the full-precision result) and download.
     if (path[3] === "result.ply" && request.method === "GET") {
       if (job.status !== "ready") fail("The scene is not ready yet.", 409);
       return objectResponse(env, job.result_key ?? legacyResultKey(id), "application/octet-stream", url.searchParams.has("download") ? "spatial-capture.ply" : undefined);
+    }
+    // What the viewer loads: the SPZ when the attempt published one, otherwise the PLY.
+    if (path[3] === "scene" && request.method === "GET") {
+      if (job.status !== "ready") fail("The scene is not ready yet.", 409);
+      const spzKey = publishedSpzKey(job);
+      const spz = spzKey != null;
+      const key = spzKey ?? job.result_key ?? legacyResultKey(id);
+      // `ready` is terminal and every published key was written by exactly one PUT and is never rewritten,
+      // so the bytes behind `?v=<ready_at>` never change: the browser may keep them. Other URLs are not cached.
+      const immutable = job.ready_at != null && url.searchParams.get("v") === String(job.ready_at);
+      return objectResponse(env, key, spz ? "application/x-spz" : "application/octet-stream", undefined, {
+        "Cache-Control": immutable ? "private, max-age=31536000, immutable" : "private, no-store",
+        "X-Splat-Format": spz ? "spz" : "ply",
+      });
     }
     fail("Not found.", 404);
   } catch (error) {

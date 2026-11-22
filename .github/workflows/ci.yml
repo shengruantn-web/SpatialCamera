@@ -21,6 +21,12 @@ jobs:
         with:
           node-version: 22
           cache: npm
+      # numpy runs the worker's SPZ encoder in tests/spz-roundtrip.test.mjs (decoded by Spark); without it
+      # that test skips, so CI installs it rather than silently dropping the cross-implementation check.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install numpy
       - run: npm ci
       - run: npm run typecheck
       - run: npm run lint
@@ -35,6 +41,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Install the SPZ encoder dependency
+        run: python -m pip install numpy
       - name: Byte-compile worker sources
         run: python -m py_compile gpu-worker/*.py
       - name: Run worker unit tests

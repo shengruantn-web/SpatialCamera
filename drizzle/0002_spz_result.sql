@@ -1,0 +1,1 @@
+ALTER TABLE `captures` ADD `spz_bytes` integer;

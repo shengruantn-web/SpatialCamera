@@ -1,2 +1,4 @@
 pycolmap==3.13.0
 Pillow==12.3.0
+# Imported directly by gpu-worker/spz.py (PLY to SPZ); also a pycolmap dependency.
+numpy==2.5.5
