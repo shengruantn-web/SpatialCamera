@@ -45,6 +45,20 @@ All routes require the `oai-authenticated-user-email` header (or `LOCAL_DEV` on 
 | POST | `/api/captures/:id/submit` | `uploading`/`failed` → `queued` |
 | GET | `/api/captures/:id/scene?v=<ready_at>` | What the viewer loads when `ready`: the SPZ if the attempt published one, otherwise the PLY. `X-Splat-Format: spz\|ply`. Cached `private, max-age=31536000, immutable` only when `v` equals the capture's `ready_at` (a resubmit changes it, so the URL changes); otherwise `private, no-store` (§7.6) |
 | GET | `/api/captures/:id/result.ply[?download]` | The PLY archive (full precision) when `ready`, read from `result_key`; `?download` adds `Content-Disposition: attachment` |
+| GET | `/api/captures/:id/shares` | S8: the capture's share links, newest first (at most 100): `{ id, created_at, revoked_at, views, allow_download }`. Never a token or its hash (§7.9) |
+| POST | `/api/captures/:id/shares` | S8: create a link `{ allow_download?: boolean }` → 201 `{ share, token, path }`. The only response that ever contains the token. 409 unless `ready`, or when the capture already has 20 active links |
+| PATCH | `/api/captures/:id/shares/:shareId` | S8: `{ allow_download: boolean }` → `{ share }`; 409 if the link is revoked |
+| POST | `/api/captures/:id/shares/:shareId/revoke` | S8: revoke → `{ share }`. Idempotent; the first `revoked_at` is kept |
+
+S8 public share routes (ADR-0010, §7.9). These carry no gateway identity: the token in the path is the only credential. A revoked, unknown or malformed token, or a capture that is not `ready`, gets the same 404 on every route. Only `GET` and `HEAD`; rate-limited per client IP.
+
+| Method | Route | Purpose |
+|---|---|---|
+| GET | `/s/:token` | Read-only viewer page. Counts a view. Cannot be framed |
+| GET | `/s/:token/embed` | The viewer alone, for an `<iframe>` on any site. Counts a view |
+| GET | `/s/:token/info` | `{ name, format, scene_bytes, download, download_bytes }` for those pages |
+| GET | `/s/:token/scene` | The SPZ, or the PLY only when the capture has no SPZ. `X-Splat-Format: spz\|ply`; `private, no-cache` + ETag |
+| GET | `/s/:token/download` | The PLY as an attachment, only when the owner allowed downloads on this link; otherwise 404 |
 
 ## 3. Worker API
 
@@ -199,6 +213,32 @@ Image uploads (§7.2) are not covered here: they replace their predecessor in th
 ### 7.8 Platform limits and the 0003 deploy
 
 - Full SPZ inflation on upload (§7.6) and attempt collection assume Workers Paid CPU and subrequest limits: inflating a multi-megabyte SPZ can exceed Workers Free's 10 ms of CPU, and the budgets above fit in 50 subrequests with little to spare. Drain the job queue before deploying migration 0003: a capture that was `exporting` with a legacy fixed `attempts/{attempt}/result.spz` when 0003 ships publishes its PLY only, and that `.spz` is orphaned, since its claim predates `gc_pending` and nothing marks the capture for collection.
+
+### 7.9 Share links and embeds (S8, ADR-0010, PRD R5.4)
+
+**Schema.** Migration `0004_share_links` adds `shares`: `id` (UUID, primary key), `capture_id` (FK → `captures.id`, `ON DELETE CASCADE`, so deleting a capture deletes its links), `token_hash` (text, unique index `shares_token_hash_idx`), `created_at`, `revoked_at` (nullable), `views` (integer, default 0) and `allow_download` (integer, default 0: the PLY download is opt-in per link). The index `shares_capture_created_idx (capture_id, created_at)` serves the owner's list. It is schema-only, like every migration (§7.5).
+
+**Tokens.** A token is 16 bytes from `crypto.getRandomValues`, base64url without padding (22 characters). Only its SHA-256 (lowercase hex) is stored. The token is returned once, by the create call, and the Share panel shows it once with a warning; it cannot be shown again, so a lost link is replaced by creating another. Each public request checks the shape (`^[A-Za-z0-9_-]{22}$`), hashes the token and looks it up through the unique index (no table scan; a test checks the query plan). A plain hash is enough: the input has 128 bits of entropy, so there is nothing for a slow hash or salt to protect. A capture can have at most 20 active links, and links can be created only for a `ready` capture (the INSERT itself requires `status='ready'`).
+
+**Owner routes** (§2) run inside `handleApi` after it has loaded the capture for the signed-in owner and rejected cross-origin mutations, so another owner's capture or link is a 404, the same as a capture that does not exist.
+
+**What is public.** The public routes join `shares` to `captures` and select only the name, status, the published result and SPZ keys and their sizes. They never read the owner, the photos, the lease, errors or ids other than the link's. `/info` returns the capture name, the format and the sizes. `/scene` returns the published SPZ (§7.6); a capture without one (pre-S5 or PLY-only) returns its PLY, because that is the only scene it has. `/download` returns the PLY only when `allow_download` is set. No other path under `/s/` exists: everything else, including image, `result.ply` and RSC variants, is 404. `worker/index.ts` sends every path whose first segment decodes to `s` in any case (`/s/`, `/S/`, `/%73/`, `//s/`) to the share handler, so the app router cannot render the share page without the token check.
+
+**Revocation and readiness are checked on every request**, scene bytes included. A revoked link, a capture that is no longer `ready` (resubmitted, failed, deleting) or a deleted capture (its links cascade away) answers 404 on the next request. The page and embed are rendered by the app router only after that check passes.
+
+**Caching.**
+- Page and embed: `no-store`. Every load reaches the worker, so it is checked and counted.
+- `/info`, 404s and 429s: `no-store`.
+- `/scene`: `private, no-cache` with the R2 object's ETag. The browser may keep the bytes but must revalidate before each use; revalidation runs the full token check and answers 304 with no body while the link is live, or 404 once it is revoked. Repeat views cost no download, and revocation still takes effect at once. Shared caches never store it.
+- `/download`: `private, no-store`.
+
+**Headers.** Every public response sends `Referrer-Policy: no-referrer` (the token is in the URL), `X-Robots-Tag: noindex, nofollow` and `X-Content-Type-Options: nosniff`; the pages also set `noindex` and `no-referrer` in their metadata. The page sends `Content-Security-Policy: frame-ancestors 'none'` and `X-Frame-Options: DENY`. The embed sends `frame-ancestors *` and no `X-Frame-Options`, so any site can frame it. Data responses send `default-src 'none'; frame-ancestors 'none'; sandbox`. The HTML 404 for a page route may be framed, so a revoked embed shows "This link is not available" inside the host page instead of a browser error.
+
+**Views** count page and embed loads only: a `GET` that is not a prefetch (`Sec-Purpose` or `Purpose` naming prefetch or prerender). The check and the count are one statement, `UPDATE shares SET views=views+1 WHERE token_hash=? AND revoked_at IS NULL AND EXISTS (…ready…) RETURNING id`. `HEAD`, prefetches, `/info`, `/scene`, `/download` and revalidations are not counted. A count is page loads, not unique visitors.
+
+**Rate limiting** is best effort. There is no rate-limiting binding in this deployment, so `takeRateLimit` keeps a fixed one-minute window per `CF-Connecting-IP` in module memory: 120 public requests per minute by default (`SHARE_RATE_LIMIT` overrides it), then 429 with `Retry-After`. At most 10,000 clients are tracked; past that the oldest windows are dropped. It is per isolate, so the effective global limit is that figure times the number of isolates a client reaches, and an evicted isolate forgets its counts. Clients behind one NAT share a budget. It bounds what one client can make one isolate do (scraping, refresh loops); it is not what protects the tokens, which cannot be guessed. Replace it with a Workers Rate Limiting binding or a WAF rule when available.
+
+**UI.** The Share panel (`components/SharePanel.tsx`) appears under a `ready` capture in the Studio. It is a disclosure button (`aria-expanded`); opening it fetches the list, so view counts are current. Create has an "Allow PLY download" option. The new link and an `<iframe>` snippet are shown once, each with a Copy button, and copy failures are announced. Each link shows its creation time, views and status, a per-link download toggle and Revoke, which asks for confirmation. Changes are announced through a polite live region. The public page and embed are `components/SharedScene.tsx` over the same `SplatViewer`, captioned "Shared scene · view only".
 
 ## 8. Client-side preparation (S6, R1.3, R1.6)
 

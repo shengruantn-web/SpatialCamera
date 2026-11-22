@@ -29,6 +29,13 @@
       "when": 1795369431248,
       "tag": "0003_attempt_keys_gc",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1795372314186,
+      "tag": "0004_share_links",
+      "breakpoints": true
     }
   ]
 }
