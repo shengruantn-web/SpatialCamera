@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import socket
 import subprocess
@@ -34,6 +35,28 @@ def ply_bytes(vertices=None):
         "property uchar red\nproperty float opacity\nend_header\n"
     ).encode("ascii")
     return header + b"".join(struct.pack("<fdfBf", *vertex) for vertex in vertices)
+
+
+try:
+    import numpy  # noqa: F401  # The SPZ converter needs it; both worker hosts have it.
+    HAS_NUMPY = True
+except ImportError:
+    HAS_NUMPY = False
+
+GAUSSIAN_PROPERTIES = ("x", "y", "z", "f_dc_0", "f_dc_1", "f_dc_2", "opacity",
+                       "scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3")
+
+
+def gaussian_ply_bytes(count=64):
+    header = (
+        "ply\nformat binary_little_endian 1.0\n"
+        f"element vertex {count}\n"
+        + "".join(f"property float {name}\n" for name in GAUSSIAN_PROPERTIES)
+        + "end_header\n"
+    ).encode("ascii")
+    rows = (struct.pack("<14f", i * 0.1, -i * 0.05, 1.5, 0.2, -0.1, 0.3, 1.0,
+                        -3.0, -2.5, -4.0, 1.0, 0.0, 0.0, 0.0) for i in range(count))
+    return header + b"".join(rows)
 
 
 class WorkerHandler(http.server.BaseHTTPRequestHandler):
@@ -390,6 +413,70 @@ class WorkerTests(unittest.TestCase):
         self.assertFalse(any(call.args[1:2] == ("PATCH",) and
                              call.args[2]["status"] == "failed"
                              for call in request.call_args_list))
+
+    @unittest.skipUnless(HAS_NUMPY, "SPZ conversion needs numpy")
+    def test_spz_uploaded_before_the_publishing_ply(self):
+        server = self.server()
+        job_root = self.process(gaussian_ply_bytes())
+        self.assertEqual([path for path, _, _ in server.uploads],
+                         ["/api/worker/capture/result.spz", "/api/worker/capture/result"])
+        spz_headers, spz = server.uploads[0][1], server.uploads[0][2]
+        self.assertEqual(spz[:3], b"\x1f\x8b\x08")
+        self.assertEqual(int(spz_headers["Content-Length"]), len(spz))
+        self.assertEqual(spz_headers["X-Job-Lease"], "lease")
+        self.assertEqual(server.uploads[1][2], gaussian_ply_bytes())
+        self.assertIn("SPZ ", self.output.getvalue())
+        self.assertIn("Completed capture capture", self.output.getvalue())
+        self.assertFalse(job_root.exists())
+
+    @unittest.skipUnless(HAS_NUMPY, "SPZ conversion needs numpy")
+    def test_spz_rejected_or_unknown_route_still_delivers_ply(self):
+        for code in (404, 400, 413):
+            with self.subTest(code=code):
+                self.reset_job()
+                server = self.server(codes=(code, 200))
+                self.process(gaussian_ply_bytes())
+                self.assertEqual([path for path, _, _ in server.uploads],
+                                 ["/api/worker/capture/result.spz", "/api/worker/capture/result"])
+                self.assertIn(f"SPZ upload failed (SPZ upload failed: HTTP {code}.); delivering the PLY only.", self.output.getvalue())
+                self.assertIn("Completed capture capture", self.output.getvalue())
+                self.assertNotIn("failed", [status[2].get("status") for status in server.statuses])
+
+    @unittest.skipUnless(HAS_NUMPY, "SPZ conversion needs numpy")
+    def test_spz_transient_failures_use_a_short_budget_then_ply(self):
+        server = self.server(codes=(503, 503, 503, 200))
+        self.process(gaussian_ply_bytes())
+        self.assertEqual([path for path, _, _ in server.uploads],
+                         ["/api/worker/capture/result.spz"] * 3 + ["/api/worker/capture/result"])
+        self.assertIn("SPZ upload failed after 3 attempts", self.output.getvalue())
+        self.assertIn("Completed capture capture", self.output.getvalue())
+
+    @unittest.skipUnless(HAS_NUMPY, "SPZ conversion needs numpy")
+    def test_spz_lease_loss_stops_before_the_ply_and_recovers_it(self):
+        server = self.server(codes=(409, 200))
+        self.process(gaussian_ply_bytes())
+        self.assertEqual([path for path, _, _ in server.uploads], ["/api/worker/capture/result.spz"])
+        recovered, = self.client.recovery_dir.glob("capture-*.ply")
+        self.assertEqual(recovered.read_bytes(), gaussian_ply_bytes())
+        self.assertEqual(server.statuses[-1][2]["status"], "failed")
+        self.assertIn("SPZ upload aborted: HTTP 409", server.statuses[-1][2]["error"])
+
+    def test_conversion_failure_or_missing_numpy_delivers_ply_only(self):
+        server = self.server()
+        with mock.patch.object(worker, "load_spz", side_effect=ImportError("No module named 'numpy'")):
+            self.process(gaussian_ply_bytes())
+        self.reset_job()
+        self.process()  # Valid PLY without Gaussian attributes: the converter refuses it.
+        self.assertEqual([path for path, _, _ in server.uploads], ["/api/worker/capture/result"] * 2)
+        self.assertIn("SPZ conversion skipped (ImportError", self.output.getvalue())
+        self.assertEqual(self.output.getvalue().count("delivering the PLY only"), 2)
+        self.assertEqual(self.output.getvalue().count("Completed capture capture"), 2)
+
+    def reset_job(self):
+        """Lets one test run process() more than once."""
+        job_root = self.root / "job"
+        if job_root.exists():
+            shutil.rmtree(job_root)
 
     def test_serve_exits_on_system_exit_and_keyboard_interrupt(self):
         for exception in (SystemExit(143), KeyboardInterrupt()):
