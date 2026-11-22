@@ -48,6 +48,18 @@ python3 gpu-worker/worker.py --iterations 7000
 
 The runner claims one job at a time, downloads photos, runs `ns-process-data images`, checks registration coverage, trains `ns-train splatfacto`, exports `ns-export gaussian-splat`, and uploads the PLY. It sends a heartbeat every 25 seconds. Stages time out after two hours. Jobs with no heartbeat for ten minutes become retryable failures. The heartbeat keeps running through the result upload, which is validated, streamed and retried with backoff. If the upload still fails, the PLY is kept in a recovery folder (`--recovery-dir`, newest 10) instead of being deleted. Each stage runs in its own process group, so stopping the worker (Ctrl-C, SIGTERM, SIGHUP) or a stage timeout also stops COLMAP/Brush child processes. Temporary inputs and checkpoints are removed when the job ends; original photos and successful PLYs remain in R2. Worker tests: `python3 -m unittest discover -s gpu-worker/tests`.
 
+### Apple Silicon (local)
+
+On an Apple Silicon Mac (Python 3.10+), the `brush` backend replaces Nerfstudio with CPU COLMAP (pycolmap) and the Metal-based Brush trainer. Nothing leaves the machine.
+
+```sh
+npm run setup:mac             # .local/venv (pycolmap, Pillow), pinned Brush v0.3.0, WORKER_TOKEN in .dev.vars
+npm run dev -- --port 3000    # terminal 1: migrates the local D1, then serves the app
+caffeinate -i npm run worker:mac  # terminal 2: claims captures from http://localhost:3000
+```
+
+Setup verifies the Brush download and an existing `.local/bin/brush_app` against pinned SHA-256 checksums, and reinstalls on mismatch. It keeps `.dev.vars` at mode 0600. Alignment (`gpu-worker/mac_pipeline.py`) applies EXIF orientation, skips files it cannot read, matches exhaustively up to 100 photos (sequentially above that, retrying exhaustively below 90% registration for sets of up to 300 photos), and rotates the model so up is +Z for the viewer. COLMAP uses every core; set `SPATIAL_COLMAP_THREADS` to limit it. On an idle M1 Pro (16 GB), 64 photos take about 6 minutes to align and 17 minutes to train 7000 steps; a busy machine can take several times longer (see `docs/plan/runs/`). Keep the Mac awake while it works (`caffeinate -i`, as above): if it sleeps for more than 10 minutes, heartbeats stop, the lease expires and the capture fails with "The processor stopped responding". Brush keeps an autotune cache in `target/` (gitignored) under the directory you run the worker from.
+
 Private hosting may require gateway authentication in addition to the worker token. Configure your host's supported service access; optional JSON `SPATIAL_GATEWAY_HEADERS` are added to worker requests. A worker token does **not** bypass Sites sign-in. Do not make the site public to work around this. A Linux GPU and a working authenticated connection are required to validate actual reconstruction end to end.
 
 ### Worker contract

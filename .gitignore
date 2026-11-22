@@ -31,6 +31,7 @@ yarn-error.log*
 .env*
 !.env.example
 .dev.vars
+.dev.vars.*
 *.tsbuildinfo
 __pycache__/
 test-results/
@@ -44,3 +45,5 @@ next-env.d.ts
 /dist/
 /.wrangler/
 /.local/
+# Brush (Burn) autotune cache, written to the worker's working directory
+/target/
