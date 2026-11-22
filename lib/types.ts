@@ -3,6 +3,8 @@ export type Capture = {
   id: string; name: string; status: CaptureStatus;
   created_at: number; updated_at: number; image_count: number; uploaded_count: number;
   error: string | null; result_bytes: number | null;
+  // Size of the SPZ the viewer loads; null when only the PLY was delivered (it then loads the PLY).
+  spz_bytes?: number | null;
   // Stage entry times (ms) for the current attempt, and the worker-reported alignment ratio (0..1).
   queued_at?: number | null; aligning_at?: number | null; training_at?: number | null; exporting_at?: number | null;
   ready_at?: number | null; failed_at?: number | null; alignment_ratio?: number | null;

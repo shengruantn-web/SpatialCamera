@@ -1,4 +1,6 @@
-import { isGaussianPly, isImage, parseWorkerMetrics, validateManifest, MAX_IMAGE_BYTES } from "../lib/validation";
+import {
+  isGaussianPly, isGzip, isImage, parseSpzHeader, parseWorkerMetrics, validateManifest, MAX_IMAGE_BYTES, MAX_PLY_BYTES, MAX_SPZ_BYTES,
+} from "../lib/validation";
 
 export interface ApiEnv {
   DB: D1Database;
@@ -8,7 +10,7 @@ export interface ApiEnv {
 }
 type Job = {
   id: string; owner: string; status: string; lease: string | null; image_count: number; updated_at: number;
-  result_key: string | null;
+  result_key: string | null; spz_bytes: number | null; ready_at: number | null;
 };
 type ImageRow = { id: string; name: string; bytes: number; mime: string; uploaded: number; object_key: string | null };
 const active = ["aligning", "training", "exporting"];
@@ -19,7 +21,7 @@ const RETRY_UPLOAD = "The upload was interrupted or could not be stored. Please 
 const STALE_ERROR = "The processor stopped responding. Retry this capture when it reconnects.";
 // Everything the owner may see. Never includes lease, result_key or R2 object keys.
 const publicFields = ["id", "name", "status", "created_at", "updated_at", "image_count", "uploaded_count", "error", "result_bytes",
-  "queued_at", "aligning_at", "training_at", "exporting_at", "ready_at", "failed_at", "alignment_ratio"] as const;
+  "spz_bytes", "queued_at", "aligning_at", "training_at", "exporting_at", "ready_at", "failed_at", "alignment_ratio"] as const;
 const publicColumns = publicFields.join(",");
 // Past `uploading` every manifest image is uploaded (I2) and frozen (I5), so `uploaded_count` is
 // `image_count`. Reading it that way keeps rows created before the counter existed correct without a
@@ -61,6 +63,8 @@ async function resultKeyFor(id: string, lease: string) {
   const attempt = Array.from(digest.slice(0, 16), b => b.toString(16).padStart(2, "0")).join("");
   return `${id}/attempts/${attempt}/result.ply`;
 }
+/** The attempt's SPZ lives beside its PLY; `result_key` (the PLY) identifies both. */
+const spzKeyFor = (resultKey: string) => resultKey.replace(/\/result\.ply$/, "/result.spz");
 const legacyResultKey = (id: string) => `${id}/result.ply`;
 const imageKey = (captureId: string, image: ImageRow) => image.object_key ?? `${captureId}/images/${image.id}`;
 
@@ -86,23 +90,61 @@ async function readJson(request: Request) {
   try { return JSON.parse(new TextDecoder().decode(await boundedBody(request, 128 * 1024))); }
   catch (error) { if (error instanceof ApiError) throw error; fail("Invalid JSON."); }
 }
-async function storeSplat(request: Request, bucket: R2Bucket, key: string) {
+type SplatFormat = {
+  label: string; max: number; contentType: string; invalid: string;
+  /** Vets the first bytes of the upload (at least 16 KB unless the file is shorter). */
+  accepts(prefix: Uint8Array<ArrayBuffer>, length: number): Promise<boolean> | boolean;
+};
+const PLY: SplatFormat = {
+  label: "PLY", max: MAX_PLY_BYTES, contentType: "application/octet-stream",
+  invalid: "Expected a Gaussian-splat PLY with scale, rotation, opacity and color properties.",
+  accepts: prefix => isGaussianPly(new TextDecoder().decode(prefix.subarray(0, 16384))),
+};
+const SPZ: SplatFormat = {
+  label: "SPZ", max: MAX_SPZ_BYTES, contentType: "application/x-spz",
+  invalid: "Expected a gzip SPZ (version 2 or 3) whose header matches its size.",
+  async accepts(prefix, length) {
+    if (!isGzip(prefix)) return false;
+    // Inflate only the prefix, and only far enough to read the 16-byte header. A prefix cut mid-stream
+    // ends in an "unexpected end of file" error, but only after the header bytes have been read.
+    const inflate = new DecompressionStream("gzip");
+    const reader = inflate.readable.getReader();
+    const writer = inflate.writable.getWriter();
+    writer.write(prefix).then(() => writer.close()).catch(() => {});
+    const header = new Uint8Array(16);
+    let filled = 0;
+    try {
+      while (filled < 16) {
+        const next = await reader.read();
+        if (next.done) break;
+        const take = next.value.subarray(0, 16 - filled);
+        header.set(take, filled);
+        filled += take.length;
+      }
+    } catch { /* A corrupt stream, or a prefix cut before 16 output bytes; judged below. */ }
+    await reader.cancel().catch(() => {});
+    return filled === 16 && parseSpzHeader(header, length) !== null;
+  },
+};
+async function storeSplat(request: Request, bucket: R2Bucket, key: string, format: SplatFormat = PLY) {
   const length = Number(request.headers.get("content-length"));
-  if (!Number.isSafeInteger(length) || length <= 0 || length > 90 * 1024 * 1024) fail("Supply a PLY with Content-Length between 1 byte and 90 MB.", 413);
+  if (!Number.isSafeInteger(length) || length <= 0 || length > format.max) fail(`Supply a ${format.label} with Content-Length between 1 byte and ${format.max / 1024 / 1024} MB.`, 413);
   const reader = request.body?.getReader();
-  if (!reader) fail("A PLY is required.");
-  // Inspect only the header; stream the large result without duplicating it in Worker memory.
+  if (!reader) fail(`A ${format.label} is required.`);
+  // Inspect only the first bytes; stream the large result without duplicating it in Worker memory.
   const prefix: Uint8Array[] = [];
-  let header = "";
+  let read = 0;
   try {
-    while (!header.includes("end_header") && header.length < 16384) {
+    while (read < 16384) {
       const next = await reader.read();
       if (next.done) break;
       prefix.push(next.value);
-      header += new TextDecoder().decode(next.value.slice(0, 16384 - header.length));
+      read += next.value.length;
     }
   } catch { fail(RETRY_UPLOAD, 503); }
-  if (!isGaussianPly(header)) { await reader.cancel(); fail("Expected a Gaussian-splat PLY with scale, rotation, opacity and color properties."); }
+  const head = new Uint8Array(read);
+  prefix.reduce((offset, chunk) => { head.set(chunk, offset); return offset + chunk.length; }, 0);
+  if (!(await format.accepts(head, length))) { await reader.cancel(); fail(format.invalid); }
   const stream = new FixedLengthStream(length);
   const writer = stream.writable.getWriter();
   const pump = async () => {
@@ -112,7 +154,7 @@ async function storeSplat(request: Request, bucket: R2Bucket, key: string) {
       await writer.close();
     } catch (error) { await writer.abort(error).catch(() => {}); throw error; }
   };
-  try { await Promise.all([pump(), bucket.put(key, stream.readable, { httpMetadata: { contentType: "application/octet-stream" } })]); }
+  try { await Promise.all([pump(), bucket.put(key, stream.readable, { httpMetadata: { contentType: format.contentType } })]); }
   // A broken request stream, short body or R2 error is transient: 503 so the worker retries (400 is final).
   catch { await reader.cancel().catch(() => {}); fail(RETRY_UPLOAD, 503); }
   return length;
@@ -126,13 +168,15 @@ async function verifyWorker(request: Request, env: ApiEnv) {
   for (let i = 0; i < a.length; i++) difference |= a[i] ^ b[i];
   if (difference) fail("Unauthorized worker.", 401);
 }
-async function objectResponse(env: ApiEnv, key: string, mime: string, name?: string) {
+async function objectResponse(env: ApiEnv, key: string, mime: string, name?: string, headers: Record<string, string> = {}) {
   const object = await env.BUCKET.get(key);
   if (!object) fail("File not found.", 404);
+  // Bytes are served exactly as stored (an SPZ is gzip data, not a gzip Content-Encoding).
   return new Response(object.body, { headers: {
     "Content-Type": mime, "Content-Length": String(object.size), "Cache-Control": "private, no-store",
     "X-Content-Type-Options": "nosniff",
     ...(name ? { "Content-Disposition": `attachment; filename="${name}"` } : {}),
+    ...headers,
   } });
 }
 
@@ -167,16 +211,27 @@ export async function handleApi(request: Request, env: ApiEnv): Promise<Response
       }
       const job = await env.DB.prepare("SELECT * FROM captures WHERE id=?").bind(path[2] ?? "").first<Job>();
       const lease = request.headers.get("x-job-lease") ?? "";
-      const isResultPut = path[3] === "result" && request.method === "PUT";
-      // Idempotent finalisation: the attempt that published the result may repeat its PUT (e.g. the
+      // `result.spz` stores the attempt's SPZ beside its PLY without publishing; `result` stores the PLY
+      // and publishes both in one conditional UPDATE. Workers that predate SPZ only ever send `result`.
+      const isResultPut = (path[3] === "result" || path[3] === "result.spz") && request.method === "PUT";
+      const attemptKey = isResultPut && job && lease ? await resultKeyFor(job.id, lease) : null;
+      // Idempotent finalisation: the attempt that published the result may repeat its PUTs (e.g. the
       // response was lost) and gets 200 without rewriting. Recognised by its result key, so `ready`
       // rows still hold no lease (I1).
-      if (isResultPut && job?.status === "ready" && lease && job.result_key === await resultKeyFor(job.id, lease)) {
+      if (attemptKey && job?.status === "ready" && job.result_key === attemptKey) {
         await request.body?.cancel().catch(() => {});
         return json({ ok: true });
       }
-      if (!job || !active.includes(job.status) || !lease || job.lease !== lease) fail("Job lease expired or invalid.", 409);
-      if (isStale(job, now)) { await expireCapture(env.DB, job.id, now); fail("Job lease expired or invalid.", 409); }
+      if (!job || !active.includes(job.status) || !lease || job.lease !== lease || isStale(job, now)) {
+        if (job && isStale(job, now)) await expireCapture(env.DB, job.id, now);
+        // A superseded attempt can never publish, so whatever it stored is garbage; the published
+        // key returned above and is never reached here.
+        if (attemptKey && job?.result_key !== attemptKey) {
+          await request.body?.cancel().catch(() => {});
+          await env.BUCKET.delete([attemptKey, spzKeyFor(attemptKey)]).catch(error => console.error("Could not delete superseded attempt", error));
+        }
+        fail("Job lease expired or invalid.", 409);
+      }
       if (path[3] === "images" && request.method === "GET") {
         const image = await env.DB.prepare("SELECT * FROM images WHERE id=? AND capture_id=? AND uploaded=1").bind(path[4] ?? "", job.id).first<ImageRow>();
         if (!image) fail("Photo not found.", 404);
@@ -204,26 +259,39 @@ export async function handleApi(request: Request, env: ApiEnv): Promise<Response
         if (!result.meta.changes) fail("Job changed while updating.", 409);
         return json({ ok: true });
       }
-      if (isResultPut) {
+      if (attemptKey) {
         if (job.status !== "exporting") fail("The capture is not ready for export.", 409);
-        // Each attempt writes its own key; only the conditional UPDATE below publishes it (T2).
-        const key = await resultKeyFor(job.id, lease);
-        const bytes = await storeSplat(request, env.BUCKET, key);
+        // Each attempt writes its own keys; only the conditional UPDATE below publishes them (T2).
+        const key = attemptKey;
+        const spzKey = spzKeyFor(key);
+        const unpublished = async (at: number) => {
+          const current = await env.DB.prepare("SELECT status,result_key FROM captures WHERE id=?").bind(job.id).first<Pick<Job, "status" | "result_key">>();
+          // A concurrent duplicate PUT from this same attempt published first: same key, so keep it.
+          if (current?.status === "ready" && current.result_key === key) return json({ ok: true });
+          await env.BUCKET.delete([key, spzKey]).catch(error => console.error("Could not delete unpublished result", key, error));
+          await expireCapture(env.DB, job.id, at);
+          fail("Job lease expired.", 409);
+        };
+        if (path[3] === "result.spz") {
+          await storeSplat(request, env.BUCKET, spzKey, SPZ);
+          // Stored, not published: the attempt's PLY PUT publishes both. An attempt whose lease lapsed
+          // during the upload removes what it stored now rather than leaving it for nobody.
+          const done = Date.now();
+          const live = await env.DB.prepare("SELECT 1 FROM captures WHERE id=? AND lease=? AND status='exporting' AND updated_at>=?")
+            .bind(job.id, lease, done - LEASE_TTL_MS).first();
+          return live ? json({ ok: true }) : await unpublished(done);
+        }
+        const bytes = await storeSplat(request, env.BUCKET, key, PLY);
+        // The SPZ, if this attempt stored one, is published with the PLY in the same statement, so a
+        // capture is never ready with one format of one attempt and the other of another.
+        const spz = await env.BUCKET.head(spzKey).catch(() => fail(RETRY_UPLOAD, 503));
         // The lease must still be fresh when the upload completes, not just when it started: an
         // attempt that stopped heartbeating mid-upload has expired even if no sweep has run yet.
         // (The worker heartbeats throughout the upload, so a live long upload stays fresh.)
         const done = Date.now();
-        const result = await env.DB.prepare("UPDATE captures SET status='ready',result_key=?,result_bytes=?,ready_at=?,updated_at=MAX(updated_at,?),lease=NULL,error=NULL WHERE id=? AND lease=? AND status='exporting' AND updated_at>=?")
-          .bind(key, bytes, done, done, job.id, lease, done - LEASE_TTL_MS).run();
-        if (!result.meta.changes) {
-          const current = await env.DB.prepare("SELECT status,result_key FROM captures WHERE id=?").bind(job.id).first<Pick<Job, "status" | "result_key">>();
-          // A concurrent duplicate PUT from this same attempt published first: same key, so keep it.
-          if (current?.status === "ready" && current.result_key === key) return json({ ok: true });
-          await env.BUCKET.delete(key).catch(error => console.error("Could not delete unpublished result", key, error));
-          await expireCapture(env.DB, job.id, done);
-          fail("Job lease expired.", 409);
-        }
-        return json({ ok: true });
+        const result = await env.DB.prepare("UPDATE captures SET status='ready',result_key=?,result_bytes=?,spz_bytes=?,ready_at=?,updated_at=MAX(updated_at,?),lease=NULL,error=NULL WHERE id=? AND lease=? AND status='exporting' AND updated_at>=?")
+          .bind(key, bytes, spz?.size ?? null, done, done, job.id, lease, done - LEASE_TTL_MS).run();
+        return result.meta.changes ? json({ ok: true }) : await unpublished(done);
       }
       fail("Unknown worker endpoint.", 404);
     }
@@ -303,9 +371,23 @@ export async function handleApi(request: Request, env: ApiEnv): Promise<Response
       }
       return json({ status: "queued" });
     }
+    // The PLY archive (the full-precision result) and download.
     if (path[3] === "result.ply" && request.method === "GET") {
       if (job.status !== "ready") fail("The scene is not ready yet.", 409);
       return objectResponse(env, job.result_key ?? legacyResultKey(id), "application/octet-stream", url.searchParams.has("download") ? "spatial-capture.ply" : undefined);
+    }
+    // What the viewer loads: the SPZ when the attempt published one, otherwise the PLY.
+    if (path[3] === "scene" && request.method === "GET") {
+      if (job.status !== "ready") fail("The scene is not ready yet.", 409);
+      const spz = job.spz_bytes != null && job.result_key != null;
+      const key = spz ? spzKeyFor(job.result_key!) : job.result_key ?? legacyResultKey(id);
+      // `ready` is terminal and its result keys are per attempt, so the bytes behind `?v=<ready_at>`
+      // never change: the browser may keep them. Any other URL is not cached.
+      const immutable = job.ready_at != null && url.searchParams.get("v") === String(job.ready_at);
+      return objectResponse(env, key, spz ? "application/x-spz" : "application/octet-stream", undefined, {
+        "Cache-Control": immutable ? "private, max-age=31536000, immutable" : "private, no-store",
+        "X-Splat-Format": spz ? "spz" : "ply",
+      });
     }
     fail("Not found.", 404);
   } catch (error) {

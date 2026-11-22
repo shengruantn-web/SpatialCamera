@@ -15,6 +15,9 @@ export const captures = sqliteTable("captures", {
   resultBytes: integer("result_bytes"),
   // R2 key of the published result (`{id}/attempts/{leaseHash}/result.ply`). NULL on legacy rows → `{id}/result.ply`.
   resultKey: text("result_key"),
+  // Size of the SPZ published with the result, stored beside it as `{attempt}/result.spz`. NULL when the
+  // attempt delivered only a PLY (older workers, failed conversion) and on legacy rows.
+  spzBytes: integer("spz_bytes"),
   // Per-stage entry times (ms since epoch) for the current attempt; reset on resubmit.
   queuedAt: integer("queued_at"),
   aligningAt: integer("aligning_at"),

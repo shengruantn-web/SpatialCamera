@@ -15,6 +15,13 @@
       "when": 1795355857445,
       "tag": "0001_api_integrity_hot_path",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1795360883186,
+      "tag": "0002_spz_result",
+      "breakpoints": true
     }
   ]
 }
