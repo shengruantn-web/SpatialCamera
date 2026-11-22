@@ -1,7 +1,7 @@
 # Spatial Camera — Product Requirements (DRAFT)
 
 **Status**: draft, reconstructed from `README.md`, the code at commit `5d136af`, and the 2026-11-16 progress review. Items marked **[OPEN]** need a product owner decision.
-**Last updated**: 2026-11-22
+**Last updated**: 2026-11-23
 
 ## 1. Problem
 
@@ -32,7 +32,7 @@ Status key: ✅ done · 🟡 partial · ❌ missing (as of 2026-11-16)
 | R1.1 | Show capture guidance (move around, overlap, even light) | ✅ |
 | R1.2 | Accept 12–200 JPG/PNG photos, ≤20 MB each, ≤1 GB total | ✅ |
 | R1.3 | Accept HEIC (iPhone default) and convert automatically | ✅ in-browser JPEG conversion (S6, spec §8.1); EXIF not carried over |
-| R1.4 | Capture directly from a phone camera | ❌ |
+| R1.4 | Capture directly from a phone camera | ✅ `capture` input plus a guided in-page camera with shot counter and overlap ghost (S9, spec §8.3); checked with iPhone/Pixel emulation, not on real devices |
 | R1.5 | Accept video and select sharp, overlapping frames | ❌ |
 | R1.6 | Warn about blurry or non-overlapping photos before upload | 🟡 blur, near-duplicates and too-few-usable warnings (S6, spec §8.2); overlap between distinct photos not checked |
 

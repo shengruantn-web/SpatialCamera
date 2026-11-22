@@ -11,6 +11,7 @@ import PrepWarnings from "./PrepWarnings"; // S6 capture prep
 import { useCapturePrep } from "./useCapturePrep"; // S6 capture prep
 import { useDropGuard } from "./useDropGuard"; // S6 capture prep
 import SharePanel from "./SharePanel"; // S8 share links
+import CameraEntry from "./CameraEntry"; // S9 phone camera
 
 const sample: SceneSource = { url: "https://sparkjs.dev/assets/splats/butterfly.spz", name: "The butterfly", sample: true };
 type Selected = { file: File; url: string };
@@ -313,6 +314,7 @@ export default function Studio() {
             {resume && <div className="notice">Reselect the original photos. Uploaded files will be skipped.</div>}
             <input ref={fileInput} type="file" accept="image/jpeg,image/png,image/heic,image/heif,.heic,.heif" multiple className="sr-only" aria-label="Choose capture photos" disabled={busy || prep.converting /* S6 */} onChange={e => { if (e.target.files) void addFiles(e.target.files); e.target.value = ""; }} />
             <button disabled={busy || prep.converting /* S6 */} className={`dropzone ${dragging ? "dragging" : ""} ${files.length ? "compact" : ""}`} onClick={() => fileInput.current?.click()} onDragOver={e => { e.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={e => { e.preventDefault(); setDragging(false); void addFiles(e.dataTransfer.files); }}><span className="photo-stack"><Images size={29} strokeWidth={1.3} /></span><strong>{files.length ? "Add more photos" : "Drop your photos here"}</strong><span>or <u>browse files</u></span><small>JPG, PNG or HEIC · 12–200 photos · Up to 20 MB each</small></button>
+            <CameraEntry existingCount={files.length} disabled={busy || prep.converting || !!resume} onAdd={addFiles} />{/* S9 phone camera */}
             {files.length > 0 && <div className="selected-files"><div className="file-summary"><span>{files.length} photos <span>· {formatBytes(totalBytes)}</span></span><button disabled={busy} onClick={() => { prep.reset() /* S6 */; files.forEach(item => URL.revokeObjectURL(item.url)); setFiles([]); }}>Clear</button></div><div className="thumbnails">{files.slice(0, 8).map((item, i) => <div key={item.url}><img src={item.url} alt={item.file.name} /><button aria-label={`Remove ${item.file.name}`} disabled={busy || !!resume} onClick={() => { URL.revokeObjectURL(item.url); setFiles(current => current.filter(x => x !== item)) /* S6: functional, so a concurrent add is kept */; }}><X size={11} /></button>{i === 7 && files.length > 8 && <span className="extra-count">+{files.length - 8}</span>}</div>)}</div>{files.length < MIN_IMAGES && <small className="validation-hint">Add {MIN_IMAGES - files.length} more photos to get started.</small>}</div>}
             {/* S6 capture prep: conversion progress + warn-only checks */}
             <PrepWarnings prep={prep} files={files} minImages={MIN_IMAGES} disabled={busy || !!resume} onRemove={remove => { const gone = new Set(remove); files.forEach(item => { if (gone.has(item.file)) URL.revokeObjectURL(item.url); }); setFiles(current => current.filter(item => !gone.has(item.file))); }} />

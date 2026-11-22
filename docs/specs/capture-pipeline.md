@@ -316,7 +316,7 @@ The budget is a fixed `ORPHAN_SWEEP_SUBREQUESTS` = 5, so one orphaned prefix (�
 
 **UI.** Each library row has rename and delete buttons (`aria-label` naming the capture). While the capture is processed (`aligning`/`training`/`exporting`), or this tab is uploading it, they are `aria-disabled` and say "Available once processing finishes" (or "…the upload finishes"); they stay focusable so the reason is announced. Rename opens a modal dialog with a labelled input (Enter saves, Esc cancels); delete opens a confirmation that names the capture and says it cannot be undone, with Cancel focused. Focus returns to the triggering button, or to the list heading after a delete; outcomes are announced in a polite status region.
 
-## 8. Client-side preparation (S6, R1.3, R1.6)
+## 8. Client-side preparation (S6, S9; R1.3, R1.4, R1.6)
 
 Everything here runs in the browser before upload. The server contract is unchanged: it accepts JPG/PNG only (§7.2).
 
@@ -365,3 +365,45 @@ libheif-js internals: `decodeHeif` frees the native context through `decoder.dec
 Not checked: overlap between non-duplicate photos (whether every photo shares features with a neighbour). That needs feature matching, so R1.6 stays partial.
 
 Accessibility: warnings are text that starts "Warning:"; the icons are decorative (`aria-hidden`). A visually hidden `role="status" aria-live="polite"` region announces conversion and check summaries once each, including the names of up to three photos that could not be added and why, and a confirmation after a removal. Link and note colours meet WCAG AA on the panel background (links #a63e1f, 6.0:1; notes #666a5e, 5.3:1; footer links #666a5e, 5.2:1).
+
+### 8.3 Camera capture (S9, R1.4)
+
+Phones can shoot straight into the selection. There are no API changes: every photo taken here goes through Studio's normal add path (`addFiles`: dedupe by name + size, JPEG/PNG and 20 MB validation, the §8.1/§8.2 preparation, then the usual upload).
+
+**Entry** (`components/CameraEntry.tsx`). Shown below the dropzone only on touch-first devices (`showCameraEntry`: `(pointer: coarse)`, or `(hover: none)` with `maxTouchPoints > 0`); desktops keep drag and drop. Two buttons:
+
+- **Take photos** (guided camera) opens the in-page viewfinder below.
+- **Camera app** clicks a hidden `<input type="file" accept="image/*" capture="environment" multiple>`. iOS ignores `multiple` together with `capture` and returns one photo per trip; every trip adds to the same selection. Files are renamed `camera-YYYYMMDD-HHMMSS-NNN.<ext>` (local time from `lastModified`, `NNN` continuing the selection count; `capturedFileName`) because iOS names every camera photo `image.jpg`, which Studio's name + size dedupe would otherwise drop or confuse with a picked file. HEIC from the camera app keeps its extension so §8.1 converts it.
+
+Calls to `addFiles` are queued (a promise chain plus a `setTimeout(0)`), because Studio runs one add at a time and reads the selection from a ref that updates after render.
+
+**Guided mode** (`components/CameraCapture.tsx`, `components/useCamera.ts`, pure logic in `lib/camera/camera.ts`):
+
+1. **Viewfinder.** A full-screen modal `<dialog>` (top layer, page behind is inert). `getUserMedia({ video: VIDEO_CONSTRAINTS, audio: false })` with `facingMode`, `width` and `height` all as `ideal` (back camera, up to 4032 × 3024, 4:3), so the request never fails on constraints. The `<video>` is `muted playsInline autoPlay` (iOS needs all three to play inline). Landscape phones (`max-height: 540px`) move the hints and controls into a side column so the stage keeps the height.
+2. **Shutter.** `ImageCapture.takePhoto()` where it exists (Chrome on Android: full sensor resolution, with EXIF), used only when the result is a JPEG within 20 MB whose orientation matches the preview (`photoMatchesPreview`; some Android builds return a landscape sensor image while the phone is upright, and Chrome's fake camera returns a PNG). Otherwise, and for the rest of the session once it has failed once, so a set never mixes sources: the current video frame drawn to a canvas at its native size (capped at 4096 × 4096 = 16.7 MP, iOS Safari's canvas limit; `frameSize`) and encoded as JPEG 0.92, stepped down with the §8.1 ladder if over 20 MB. A second tap while a photo is being taken is ignored. Each shot shows a short flash, vibrates 15 ms where supported (not iOS), and is announced.
+3. **Counter.** Shots taken plus photos already selected, against "min 12 · goal 40+" with a meter (`shotGuidance`). Messages step through the 12 minimum, the 30 recommended (§8.2) and the 40 goal; the shutter stops at the 200 maximum ("Photo limit reached").
+4. **Overlap hint.** A ghost of the last shot (≤480 px, taken from the video frame at the moment of the tap so it lines up with the viewfinder) at 35 % opacity, on by default, toggled by a pressed-state button; plus the text "Take a small step, then shoot when about two-thirds of the faded last photo still lines up (60–70 % overlap)." **Undo** deletes the last shot.
+5. **Motion cue (optional).** Where `deviceorientation` events arrive without a permission prompt (Android Chrome), a rotation of more than 25° since the last shot (`rotationBetween`, quaternion angle between the two Euler orientations) replaces the overlap text with "Big turn since the last photo. Turn back a little so the photos overlap." iOS needs `DeviceOrientationEvent.requestPermission()`, a second prompt this mode does not add, so iOS gets no motion cue.
+6. **Closing.** Done, the close button, Escape and the Android back gesture all close the dialog and **keep** the shots: they are handed to `addFiles` as `camera-<session start>-NNN.jpg`. Focus returns to the Take photos button. Shots are held in memory (one JPEG each, typically 1–4 MB) until the dialog closes.
+
+**Camera lifecycle.** A reducer (`cameraReducer`: `closed → starting → live ⇄ capturing`, `paused`, `error`) decides; one effect owns the `MediaStream` and exists exactly while `wantsStream(state)`. Every way out (Done, close, an error, the page hidden, unmounting) stops every track, so the camera indicator goes off. A stream that resolves after the user already closed (permission prompt still up) is stopped at once. When the page is hidden the stream is stopped (`paused`) and restarts when the page is visible again, with a **Resume** button as a fallback; a track that ends on its own (another app took the camera) shows "The camera stopped. Try again to continue where you left off."
+
+**Errors and fallbacks.** `classifyCameraError` maps `getUserMedia` failures to one message each (`problemMessages`):
+
+| Problem | Cause | Actions |
+|---|---|---|
+| `insecure` | Not a secure context (plain `http://` on a LAN IP) | No dialog: an inline note under the buttons, and the camera-app input opens in the same tap |
+| `unsupported` | No `navigator.mediaDevices.getUserMedia` | Same as `insecure` |
+| `denied` | `NotAllowedError` / `SecurityError` | "Camera access is blocked for this site. Allow it in your browser's site settings…", **Try again**, **Use camera app** |
+| `no-camera` | `NotFoundError`, `OverconstrainedError` | Try again, Use camera app |
+| `busy` | `NotReadableError`, `AbortError` | Try again, Use camera app |
+| `interrupted` | Track ended mid-session | Try again, Use camera app |
+| `failed` | Anything else | Try again, Use camera app |
+
+**Use camera app** stops the camera, closes the dialog, adds the shots already taken and opens the `capture` input inside the same tap (a file chooser needs a user gesture). The error panel says how many shots are kept.
+
+**Accessibility.** Every control has a name: "Close camera and keep N photos", "Take photo, N taken", "Delete the last photo", "Done, add N photos", the ghost toggle with `aria-pressed`. The shutter uses `aria-disabled` while the camera starts, so focus stays on it. The dialog is labelled "Camera" and described by the guidance text. Opening focuses the shutter; an error focuses its first action; when an error clears, lost focus goes back to the shutter. A polite live region announces each shot ("Photo 3 taken. 9 more photos to reach the minimum of 12."), undo and failures; the error panel is `role="alert"`. Buttons are at least 44 px, safe-area insets are respected, and the flash animation is shortened under `prefers-reduced-motion`.
+
+**Verified** in headless Chromium with a fake camera (`--use-fake-device-for-media-stream`), emulating iPhone 15 (393 × 659, iOS Safari user agent, touch) and Pixel 7 (412 × 839, portrait and landscape): entry visibility (and none on a 1280 × 800 desktop), the input's `accept`/`capture`/`multiple`, modal and focus, shots, counter, ghost and announcements, Escape and Done keeping shots with zero live tracks afterwards, numbering continuing across sessions, undo, two one-photo camera-app trips accumulating, 12 shots uploaded and submitted through the unchanged API (201/200/200), the denied, no-camera and insecure paths, no console errors. **Not verified**: real iOS Safari and Android Chrome hardware (WebKit itself was not run: the iPhone profile is Chromium with an iOS user agent), real-camera orientation and `takePhoto` EXIF, the motion cue (no orientation events in emulation), memory on long sessions near 200 shots.
+
+Known limitations: frames grabbed from the video carry no EXIF, so COLMAP uses its default focal-length prior for them (as for converted HEIC, §8.1); on iOS this is every guided shot, and the frame has the video resolution the browser grants, which may be below the camera app's. Use **Camera app** for full-quality iPhone photos with EXIF.
