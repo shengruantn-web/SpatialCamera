@@ -20,10 +20,26 @@ async function worker(path, method, data, lease) {
 let script;
 const newMiniflare = () => new Miniflare({ modules: true, script, compatibilityDate: '2026-01-01', d1Databases: ['DB'], r2Buckets: ['BUCKET'], bindings: { WORKER_TOKEN: token } });
 before(async () => {
-  const result = await build({ stdin: { contents: `import {handleApi, handleScheduled} from "./worker/api.ts";
+  const result = await build({ stdin: { contents: `import {handleApi, handleScheduled, collectAttemptGarbage} from "./worker/api.ts";
     // Test-only fault injection: "x-test-r2-put" makes BUCKET.put fail like a transient R2 error.
     const failingPut = bucket => new Proxy(bucket, { get: (target, key) => key === 'put' ? async () => { throw new Error('R2 unavailable'); } : target[key].bind(target) });
-    export default {fetch(request, env, ctx) { return handleApi(request, request.headers.has('x-test-r2-put') ? { ...env, BUCKET: failingPut(env.BUCKET) } : env, ctx); }, scheduled(controller, env, ctx) { ctx.waitUntil(handleScheduled(env)); }}`, resolveDir: process.cwd() }, bundle: true, write: false, format: 'esm', platform: 'browser' });
+    // Test-only: one garbage collection run that counts every D1 and R2 call it makes (each is a
+    // subrequest), with R2 list failing under captures whose id starts with "gc-broken".
+    const counting = (env, ops) => {
+      const count = fn => (...args) => { ops.count++; return fn(...args); };
+      const statement = stmt => ({ bind: (...args) => statement(stmt.bind(...args)), first: count((...args) => stmt.first(...args)), all: count(() => stmt.all()), run: count(() => stmt.run()) });
+      return { ...env,
+        DB: { prepare: sql => statement(env.DB.prepare(sql)), batch: count(statements => env.DB.batch(statements)) },
+        BUCKET: {
+          list: count(async options => { if (options?.prefix?.startsWith('gc-broken')) throw new Error('R2 list unavailable'); return env.BUCKET.list(options); }),
+          delete: count(keys => env.BUCKET.delete(keys)),
+        } };
+    };
+    const gcRun = async env => { const ops = { count: 0 }; const cleaned = await collectAttemptGarbage(counting(env, ops)); return Response.json({ cleaned, ops: ops.count }); };
+    export default {fetch(request, env, ctx) {
+      if (new URL(request.url).pathname === '/__test/gc') return gcRun(env);
+      return handleApi(request, request.headers.has('x-test-r2-put') ? { ...env, BUCKET: failingPut(env.BUCKET) } : env, ctx);
+    }, scheduled(controller, env, ctx) { ctx.waitUntil(handleScheduled(env)); }}`, resolveDir: process.cwd() }, bundle: true, write: false, format: 'esm', platform: 'browser' });
   script = result.outputFiles[0].text;
   mf = newMiniflare();
   // The API never creates tables; the schema comes only from drizzle/ migrations.
@@ -812,4 +828,77 @@ test('attempt garbage is collected on publish and by the cron, never the publish
     assert.deepEqual(await listKeys(`${id}/attempts/`), [`${id}/attempts/${'e'.repeat(32)}/result.n.spz`]);
     await db.prepare('DELETE FROM captures WHERE id=?').bind(id).run();
   }
+});
+
+// ---- Round 3: garbage collection that rotates and stays within a subrequest budget ----------------
+const GC_SUBREQUESTS_PER_RUN = 40;
+const GC_MAX_FAILURES = 5;
+const gcRun = async () => (await mf.dispatchFetch('http://localhost/__test/gc')).json();
+/** A failed capture whose objects under attempts/ all predate its failure, so all of them are garbage. */
+async function failedWithStrays(id, count, updatedAt) {
+  const db = await mf.getD1Database('DB');
+  const bucket = await mf.getR2Bucket('BUCKET');
+  await db.prepare("INSERT INTO captures (id,owner,name,status,created_at,updated_at,image_count,gc_pending) VALUES (?,?,'GC','failed',?,?,12,1)").bind(id, owner, updatedAt, updatedAt).run();
+  for (let i = 0; i < count; i += 50) {
+    await Promise.all(Array.from({ length: Math.min(50, count - i) }, (_, j) => bucket.put(`${id}/attempts/${String(i + j).padStart(32, '0')}/result.x.ply`, 'stray')));
+  }
+  await db.prepare('UPDATE captures SET updated_at=? WHERE id=?').bind(Date.now() + 60_000, id).run();
+}
+
+test('a capture whose collection keeps failing sinks behind the others and is given up after a few tries (round 3, item 6)', async () => {
+  const db = await mf.getD1Database('DB');
+  // Only this test's captures are marked, so the order below is deterministic.
+  await db.prepare('UPDATE captures SET gc_pending=0').run();
+  // Eleven captures whose R2 listing always throws, all older than the healthy one, fill the first
+  // run's batch of ten: before rotation, the healthy capture behind them was never reached.
+  const broken = Array.from({ length: 11 }, (_, i) => `gc-broken-${String(i).padStart(2, '0')}`);
+  for (const [i, id] of broken.entries()) {
+    await db.prepare("INSERT INTO captures (id,owner,name,status,created_at,updated_at,image_count,gc_pending) VALUES (?,?,'GC','failed',?,?,12,1)").bind(id, owner, i, i).run();
+  }
+  await failedWithStrays('gc-healthy', 3, Date.now() - 60_000);
+  const marks = async () => Object.fromEntries((await db.prepare("SELECT id,gc_pending FROM captures WHERE id LIKE 'gc-%' ORDER BY id").all()).results.map(r => [r.id, r.gc_pending]));
+
+  const first = await gcRun();
+  assert.equal(first.cleaned, 0);
+  assert.equal((await marks())['gc-healthy'], 1, 'not reached in the first run');
+  for (const id of broken.slice(0, 10)) assert.equal((await marks())[id], 2, `${id} failed once and moved back`);
+
+  const second = await gcRun();
+  assert.equal(second.cleaned, 1, 'the healthy capture is collected despite the failing ones');
+  assert.equal((await marks())['gc-healthy'], 0);
+  assert.deepEqual(await listKeys('gc-healthy/attempts/'), []);
+
+  // The failing ones are retried until they have failed GC_MAX_FAILURES times, then no longer selected.
+  let runs = 2;
+  let last;
+  do { last = await gcRun(); runs++; assert.ok(last.ops <= GC_SUBREQUESTS_PER_RUN, `run ${runs} made ${last.ops} calls`); } while (last.ops > 1 && runs < 20);
+  assert.equal(last.ops, 1, 'a run with nothing selectable makes only its query');
+  const final = await marks();
+  for (const id of broken) assert.equal(final[id], GC_MAX_FAILURES + 1, `${id} stays marked (truthy) after giving up`);
+  await db.prepare("DELETE FROM captures WHERE id LIKE 'gc-broken-%' OR id='gc-healthy'").run();
+});
+
+test('one collection run stays within its subrequest budget and the next run carries on (round 3, item 5)', async () => {
+  const db = await mf.getD1Database('DB');
+  await db.prepare('UPDATE captures SET gc_pending=0').run();
+  // 5 captures x 250 objects: 3 pages each, 8 calls each, 41 calls in all: one more than a run allows.
+  const ids = Array.from({ length: 5 }, (_, i) => `gc-bulk-${i}`);
+  for (const [i, id] of ids.entries()) await failedWithStrays(id, 250, Date.now() - 60_000 + i);
+  const remaining = async () => (await Promise.all(ids.map(id => listKeys(`${id}/attempts/`)))).reduce((n, keys) => n + keys.length, 0);
+  assert.equal(await remaining(), 1250);
+
+  const first = await gcRun();
+  assert.ok(first.ops <= GC_SUBREQUESTS_PER_RUN, `the first run made ${first.ops} calls`);
+  assert.equal(first.cleaned, 4);
+  const marked = (await db.prepare("SELECT id FROM captures WHERE id LIKE 'gc-bulk-%' AND gc_pending>0").all()).results.map(r => r.id);
+  assert.deepEqual(marked, ['gc-bulk-4'], 'the capture the budget ran out on stays marked');
+  const left = await remaining();
+  assert.ok(left > 0 && left < 250, `partly collected: ${left} objects left`);
+
+  const second = await gcRun();
+  assert.ok(second.ops <= GC_SUBREQUESTS_PER_RUN);
+  assert.equal(second.cleaned, 1);
+  assert.equal(await remaining(), 0);
+  assert.equal((await db.prepare("SELECT COUNT(*) AS n FROM captures WHERE id LIKE 'gc-bulk-%' AND gc_pending>0").first()).n, 0);
+  await db.prepare("DELETE FROM captures WHERE id LIKE 'gc-bulk-%'").run();
 });

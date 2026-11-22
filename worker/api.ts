@@ -86,13 +86,31 @@ const publishedSpzKey = (row: Published) => row.status !== "ready" || row.spz_by
 const GC_LIST_LIMIT = 100;
 const GC_CAPTURES_PER_RUN = 10;
 const GC_PAGES_PER_CAPTURE = 5;
+/**
+ * D1 and R2 calls one collection may make. Workers Free allows 50 subrequests per invocation: the cron
+ * spends 1 on the lease sweep and at most 40 here; the inline collection after a publish, which already
+ * made about 8, at most 12. Whatever is left over is picked up by the next cron tick.
+ */
+export const GC_SUBREQUESTS_PER_RUN = 40;
+const GC_SUBREQUESTS_INLINE = 12;
+/** Collecting a capture needs its row read, one list, one delete and the final mark update, plus one in reserve to record a failure. */
+const GC_MIN_PER_CAPTURE = 5;
+/**
+ * `gc_pending` is 0 (clean) or 1 + the number of failed collections. A capture that fails is retried after
+ * the others (the cron orders by it) and given up after GC_MAX_FAILURES, keeping a truthy mark for the logs.
+ */
+export const GC_MAX_FAILURES = 5;
+type Budget = { left: number };
+const spend = (budget: Budget) => { budget.left--; };
 /** Lists keys under a prefix, a bounded number of pages, and deletes those not kept; true if more remain. */
-async function deleteUnder(bucket: R2Bucket, prefix: string, keep: (object: R2Object) => boolean = () => false, pages = 1) {
+async function deleteUnder(bucket: R2Bucket, prefix: string, keep: (object: R2Object) => boolean = () => false, pages = 1, budget: Budget = { left: Infinity }, reserve = 0) {
   let cursor: string | undefined;
   for (let page = 0; page < pages; page++) {
+    if (budget.left < 2 + reserve) return true; // a list and a delete, keeping `reserve` for the caller
+    spend(budget);
     const listing = await bucket.list({ prefix, limit: GC_LIST_LIMIT, ...(cursor ? { cursor } : {}) });
     const doomed = listing.objects.filter(object => !keep(object)).map(object => object.key);
-    if (doomed.length) await bucket.delete(doomed);
+    if (doomed.length) { spend(budget); await bucket.delete(doomed); }
     if (!listing.truncated) return false;
     cursor = listing.cursor;
   }
@@ -107,26 +125,49 @@ const deleteAttempt = (bucket: R2Bucket, dir: string, why: string) =>
  * that died between its SPZ and its PLY, a superseded attempt, a duplicate PUT that lost. For a `failed`
  * capture, objects stored after it failed are left alone in case they belong to a newer attempt (the owner
  * may resubmit between this read and the listing); that attempt's own checks clean them up.
- * Returns true when the capture is clean and its mark was cleared.
+ * Returns true when the capture is clean and its mark was cleared; false when it is not terminal, changed
+ * meanwhile, or has more to delete than this budget allowed (it stays marked for the next run).
  */
-async function collectCapture(env: Pick<ApiEnv, "DB" | "BUCKET">, id: string) {
+async function collectCapture(env: Pick<ApiEnv, "DB" | "BUCKET">, id: string, budget: Budget) {
+  if (budget.left < GC_MIN_PER_CAPTURE) return false;
+  spend(budget);
   const row = await env.DB.prepare("SELECT status,result_key,spz_key,spz_bytes,updated_at FROM captures WHERE id=?").bind(id)
     .first<Published & { updated_at: number }>();
   if (!row || (row.status !== "ready" && row.status !== "failed")) return false;
   const keep = new Set([row.status === "ready" ? row.result_key : null, publishedSpzKey(row)].filter(Boolean));
+  // Two in reserve: the mark update below, and recording a failure should the next call throw.
   const more = await deleteUnder(env.BUCKET, `${id}/attempts/`,
-    object => keep.has(object.key) || (row.status === "failed" && object.uploaded.getTime() > row.updated_at), GC_PAGES_PER_CAPTURE);
+    object => keep.has(object.key) || (row.status === "failed" && object.uploaded.getTime() > row.updated_at), GC_PAGES_PER_CAPTURE, budget, 2);
   if (more) return false;
+  spend(budget);
   const cleared = await env.DB.prepare("UPDATE captures SET gc_pending=0 WHERE id=? AND status=? AND updated_at=?").bind(id, row.status, row.updated_at).run();
   return cleared.meta.changes > 0;
 }
-/** Cron: a bounded batch of terminal captures still marked for collection. Returns how many were cleaned. */
-export async function collectAttemptGarbage(env: Pick<ApiEnv, "DB" | "BUCKET">, limit = GC_CAPTURES_PER_RUN) {
-  const { results } = await env.DB.prepare("SELECT id FROM captures WHERE gc_pending=1 AND status IN ('ready','failed') ORDER BY updated_at LIMIT ?").bind(limit).all<{ id: string }>();
+/** Right after a publish: this capture only, within what is left of the request's subrequests. */
+const collectPublished = (env: Pick<ApiEnv, "DB" | "BUCKET">, id: string) => collectCapture(env, id, { left: GC_SUBREQUESTS_INLINE });
+/**
+ * Cron: terminal captures still marked, those that never failed first (oldest first), within a subrequest
+ * budget shared across captures. A capture whose collection throws has its mark incremented so it sinks
+ * behind the rest and cannot starve them; past GC_MAX_FAILURES it is no longer selected. Returns how many
+ * captures were cleaned.
+ */
+export async function collectAttemptGarbage(env: Pick<ApiEnv, "DB" | "BUCKET">, { limit = GC_CAPTURES_PER_RUN, budget = { left: GC_SUBREQUESTS_PER_RUN } }: { limit?: number; budget?: Budget } = {}) {
+  spend(budget);
+  const { results } = await env.DB.prepare("SELECT id,gc_pending FROM captures WHERE gc_pending BETWEEN 1 AND ? AND status IN ('ready','failed') ORDER BY gc_pending,updated_at LIMIT ?")
+    .bind(GC_MAX_FAILURES, limit).all<{ id: string; gc_pending: number }>();
   let cleaned = 0;
-  for (const { id } of results) {
-    try { if (await collectCapture(env, id)) cleaned++; }
-    catch (error) { console.error("Attempt garbage collection failed", id, error); }
+  for (const { id, gc_pending: marked } of results) {
+    if (budget.left < GC_MIN_PER_CAPTURE) break;
+    try { if (await collectCapture(env, id, budget)) cleaned++; }
+    catch (error) {
+      console.error("Attempt garbage collection failed", id, error);
+      try {
+        spend(budget);
+        // Stays truthy: only a successful collection (or a new claim, which resets it to 1) changes that.
+        await env.DB.prepare("UPDATE captures SET gc_pending=gc_pending+1 WHERE id=? AND gc_pending>0").bind(id).run();
+        if (marked >= GC_MAX_FAILURES) console.error(`Attempt garbage collection gave up after ${GC_MAX_FAILURES} failures; objects under ${id}/attempts/ need manual cleanup`);
+      } catch (markError) { console.error("Could not record the collection failure", id, markError); }
+    }
   }
   return cleaned;
 }
@@ -155,13 +196,13 @@ async function readJson(request: Request) {
   catch (error) { if (error instanceof ApiError) throw error; fail("Invalid JSON."); }
 }
 /** Follows the whole upload after its first bytes were vetted; `false` from either call rejects it (400). */
-type SplatCheck = { write(chunk: Uint8Array<ArrayBuffer>): Promise<boolean>; end(): Promise<boolean> };
+type SplatCheck = { write(chunk: Uint8Array<ArrayBuffer>): Promise<boolean>; end(): Promise<boolean>; abort(): void };
 type SplatFormat = {
   label: string; max: number; contentType: string; invalid: string;
   /** Vets the first bytes (at least 16 KB unless the file is shorter); null rejects before anything is stored. */
   inspect(prefix: Uint8Array<ArrayBuffer>, length: number): Promise<SplatCheck | null> | SplatCheck | null;
 };
-const HEADER_ONLY: SplatCheck = { write: async () => true, end: async () => true };
+const HEADER_ONLY: SplatCheck = { write: async () => true, end: async () => true, abort: () => {} };
 const PLY: SplatFormat = {
   label: "PLY", max: MAX_PLY_BYTES, contentType: "application/octet-stream",
   invalid: "Expected a Gaussian-splat PLY with scale, rotation, opacity and color properties.",
@@ -196,6 +237,12 @@ function exactInflation(expected: number): SplatCheck {
       if (ok) await writer.close().catch(() => { ok = false; });
       else await writer.abort().catch(() => {});
       return (await drained) && ok;
+    },
+    /** Releases the decompressor when the upload fails for another reason (a broken stream, R2). */
+    abort() {
+      ok = false;
+      writer.abort().catch(() => {});
+      reader.cancel().catch(() => {});
     },
   };
 }
@@ -266,7 +313,7 @@ async function storeSplat(request: Request, bucket: R2Bucket, key: string, forma
       if (received !== length) throw new Error("Body shorter than its Content-Length.");
       if (!(await check.end())) throw new InvalidSplat();
       await writer.close();
-    } catch (error) { await writer.abort(error).catch(() => {}); throw error; }
+    } catch (error) { check.abort(); await writer.abort(error).catch(() => {}); throw error; }
   };
   // If R2 gives up first, nothing reads the stream any more: abort it so the pump stops instead of hanging.
   const put = bucket.put(key, stream.readable, { httpMetadata: { contentType: format.contentType } })
@@ -427,7 +474,7 @@ export async function handleApi(request: Request, env: ApiEnv): Promise<Response
           .bind(key, bytes, done, done, job.id, lease, done - LEASE_TTL_MS).run();
         if (!result.meta.changes) return await unpublished(key, done);
         // Earlier attempts' leftovers go now; anything this misses stays marked for the cron (C3).
-        await collectCapture(env, job.id).catch(error => console.error("Attempt garbage collection failed", job.id, error));
+        await collectPublished(env, job.id).catch(error => console.error("Attempt garbage collection failed", job.id, error));
         return json({ ok: true });
       }
       fail("Unknown worker endpoint.", 404);
