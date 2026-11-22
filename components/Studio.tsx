@@ -12,7 +12,7 @@ import { useCapturePrep } from "./useCapturePrep"; // S6 capture prep
 import { useDropGuard } from "./useDropGuard"; // S6 capture prep
 import SharePanel from "./SharePanel"; // S8 share links
 import CameraEntry from "./CameraEntry"; // S9 phone camera
-import VideoUpload from "./VideoUpload"; // S10 video captures
+import { VideoPanel } from "./VideoUpload"; // S10 video captures
 
 const sample: SceneSource = { url: "https://sparkjs.dev/assets/splats/butterfly.spz", name: "The butterfly", sample: true };
 type Selected = { file: File; url: string };
@@ -299,7 +299,7 @@ export default function Studio() {
       {serverError && <div className="notice error" role="alert"><AlertCircle size={16} />{serverError}<button onClick={() => wake.current()}>Try again</button></div>}
       {tab === "studio" ? <div className="studio-grid">
         <section className="capture-panel" aria-label="Create a capture">
-          <div className="panel-heading"><span className="step-number">01</span><h2>{processing ? "Your capture" : resume || videoResume ? "Resume your upload" : videoMode ? "Start with a video" : "Start with your photos"}</h2>{(files.length > 0 || active) && !busy && <button className="icon-button" aria-label="Start a new capture" title="Start a new capture" onClick={clear}><Plus size={18} /></button>}</div>
+          <div className="panel-heading"><span className="step-number">01</span><h2>{processing ? "Your capture" : resume || (videoResume && !videoMode) ? "Resume your upload" : videoMode ? "Start with a video" : "Start with your photos"}</h2>{(files.length > 0 || active) && !busy && <button className="icon-button" aria-label="Start a new capture" title="Start a new capture" onClick={clear}><Plus size={18} /></button>}</div>
           {processing ? <div className="job-panel">
             <div className={`job-symbol ${active.status === "ready" ? "success" : ""}`}>{active.status === "ready" ? <Check size={28} /> : active.status === "failed" ? <AlertCircle size={28} /> : <Layers size={28} />}</div>
             <h3>{active.name}</h3><p>{sourceLabel(active)} · {statusLabels[active.status]}</p>
@@ -313,7 +313,7 @@ export default function Studio() {
             {active.status === "ready" && active.spz_bytes ? <p className="privacy-note">The viewer streams a {formatBytes(active.spz_bytes)} SPZ; the PLY is the full-precision archive.</p> : null}
             {active.status === "ready" && <SharePanel key={active.id} captureId={active.id} name={active.name} /> /* S8 share links */}
             <button className="text-button" onClick={clear}>Start another capture <ArrowRight size={15} /></button>
-          </div> : videoMode || videoResume ? <VideoUpload key={videoResume?.id ?? "new"} disabled={!!serverError} resume={videoResume && { id: videoResume.id, name: videoResume.name, bytes: videoResume.video_bytes ?? null, uploaded: !!videoResume.video_uploaded }} onCreated={id => { setActiveId(id); wake.current(); }} onSubmitted={id => { setActiveId(id); setVideoMode(false); wake.current(); }} onCancel={() => setVideoMode(false)} /> /* S10 */ : <>
+          </div> : videoMode || videoResume ? <VideoPanel videoMode={videoMode} capture={videoResume} disabled={!!serverError} onCreated={id => { setActiveId(id); wake.current(); }} onSubmitted={id => { setActiveId(id); wake.current(); }} onCancel={() => setVideoMode(false)} /> /* S10 */ : <>
             <p className="panel-description">One place, from different angles.<br />We’ll put the pieces together.</p>
             {resume && <div className="notice">Reselect the original photos. Uploaded files will be skipped.</div>}
             <input ref={fileInput} type="file" accept="image/jpeg,image/png,image/heic,image/heif,.heic,.heif" multiple className="sr-only" aria-label="Choose capture photos" disabled={busy || prep.converting /* S6 */} onChange={e => { if (e.target.files) void addFiles(e.target.files); e.target.value = ""; }} />

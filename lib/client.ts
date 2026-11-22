@@ -88,7 +88,7 @@ export const hasActiveCapture = (captures: readonly Capture[]) => captures.some(
  * every few seconds and would otherwise keep polling at the fastest rate for a whole training run.
  */
 export const pollSignature = (captures: readonly Capture[], processor: boolean) => JSON.stringify([processor, captures.map(c =>
-  [c.id, c.name, c.status, c.uploaded_count, c.image_count, c.error, c.alignment_ratio ?? null, c.ready_at ?? null, c.failed_at ?? null, c.spz_bytes ?? null, c.result_bytes ?? null])]);
+  [c.id, c.name, c.status, c.uploaded_count, c.image_count, c.error, c.alignment_ratio ?? null, c.ready_at ?? null, c.failed_at ?? null, c.spz_bytes ?? null, c.result_bytes ?? null, c.video_uploaded ?? null])]); // S10: a finished video upload moves its panel to submit-only
 
 /**
  * Orders overlapping requests for the same state: `begin()` numbers a request as it starts, and

@@ -150,6 +150,8 @@ test('polling stops at terminal states and ignores heartbeat-only changes', () =
   assert.notEqual(client.pollSignature([capture('exporting')], true), base);
   assert.notEqual(client.pollSignature([capture('training', { alignment_ratio: 0.9 })], true), base);
   assert.notEqual(client.pollSignature([capture('training')], false), base, 'processor connectivity is shown, so it counts');
+  const uploading = client.pollSignature([capture('uploading', { source_kind: 'video', video_uploaded: 0 })], true);
+  assert.notEqual(client.pollSignature([capture('uploading', { source_kind: 'video', video_uploaded: 1 })], true), uploading, 'S10: a finished video upload moves its panel to submit-only');
 });
 
 /** Fake timers and a poll whose responses the test releases one at a time. */

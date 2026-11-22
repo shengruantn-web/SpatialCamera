@@ -7,16 +7,27 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { AlertCircle, ArrowRight, Box, Film, LoaderCircle, LockKeyhole } from "lucide-react";
 import { MAX_NAME_LENGTH, MAX_VIDEO_BYTES } from "../lib/validation";
-import { uploadVideoCapture, VIDEO_ACCEPT, videoMime } from "../lib/video-upload";
+import { uploadVideoCapture, VIDEO_ACCEPT, videoMime, videoPanel, type VideoResume } from "../lib/video-upload";
+import type { Capture } from "../lib/types";
 
 const formatBytes = (n: number) => n < 1024 * 1024 * 1024 ? `${(n / 1024 / 1024).toFixed(1)} MB` : `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
-/** An unfinished video capture reopened from the library. */
-export type VideoResume = { id: string; name: string; bytes: number | null; uploaded: boolean };
+export type { VideoResume };
 
-export default function VideoUpload({ resume, disabled, onCreated, onSubmitted, onCancel }: {
-  resume?: VideoResume; disabled?: boolean;
-  onCreated: (id: string) => void; onSubmitted: (id: string) => void; onCancel: () => void;
-}) {
+type Handlers = { disabled?: boolean; onCreated: (id: string) => void; onSubmitted: (id: string) => void; onCancel: () => void };
+
+/**
+ * The Studio's video panel: a new video (videoMode) or the unfinished video capture that is active. A new upload
+ * keeps one VideoUpload for its whole life, even once the poll reveals its capture (review P1: a remount would
+ * cancel the upload and drop the chosen file); see `videoPanel`.
+ */
+export function VideoPanel({ videoMode, capture, ...handlers }: Handlers & { videoMode: boolean; capture?: Capture }) {
+  const panel = videoPanel(videoMode, capture?.id);
+  if (!panel) return null;
+  const resume = panel.resume && capture ? { id: capture.id, name: capture.name, bytes: capture.video_bytes ?? null, uploaded: !!capture.video_uploaded } : undefined;
+  return <VideoUpload key={panel.key} resume={resume} {...handlers} />;
+}
+
+export default function VideoUpload({ resume, disabled, onCreated, onSubmitted, onCancel }: Handlers & { resume?: VideoResume }) {
   const ids = useId();
   const [file, setFile] = useState<File | null>(null);
   const [name, setName] = useState(resume?.name ?? "");
@@ -24,6 +35,7 @@ export default function VideoUpload({ resume, disabled, onCreated, onSubmitted, 
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState("");
+  const [submitted, setSubmitted] = useState(false); // until the poll swaps this panel for the job panel
   const input = useRef<HTMLInputElement>(null);
   const abort = useRef<AbortController | null>(null);
   const createdId = useRef<string | undefined>(resume?.id);
@@ -61,6 +73,7 @@ export default function VideoUpload({ resume, disabled, onCreated, onSubmitted, 
           onProgress: fraction => setProgress(Math.round(fraction * 100)) });
       }
       controller.signal.throwIfAborted();
+      setSubmitted(true);
       onSubmitted(id!);
     } catch (e) {
       if (controller.signal.aborted) return;
@@ -89,7 +102,7 @@ export default function VideoUpload({ resume, disabled, onCreated, onSubmitted, 
       <label className="video-keep"><input type="checkbox" checked={keepVideo} disabled={busy} onChange={e => setKeepVideo(e.target.checked)} /><span>Keep the original video<small>Otherwise it is deleted once your scene is ready. Share links never include it.</small></span></label>
     </>}
     {error && <div className="notice error" role="alert"><AlertCircle size={16} />{error}</div>}
-    <button className="primary" disabled={busy || disabled || !ready} onClick={() => void start()}>{busy ? <><LoaderCircle size={16} className="spin" /> {resume?.uploaded ? "Starting" : `Uploading video · ${progress}%`}</> : <><Box size={17} />{resume ? "Resume & create splat" : "Create 3D splat"}<ArrowRight size={17} /></>}</button>
+    <button className="primary" disabled={busy || submitted || disabled || !ready} onClick={() => void start()}>{busy || submitted ? <><LoaderCircle size={16} className="spin" /> {resume?.uploaded || submitted ? "Starting" : `Uploading video · ${progress}%`}</> : <><Box size={17} />{resume ? "Resume & create splat" : "Create 3D splat"}<ArrowRight size={17} /></>}</button>
     {busy && !resume?.uploaded && <progress value={progress} max={100} aria-label="Video upload progress" />}
     <p className="sr-only" aria-live="polite">{busy ? `Uploading video, ${Math.floor(progress / 25) * 25}%` : ""}</p>
     {!resume && <button type="button" className="text-button video-switch" disabled={busy} onClick={onCancel}>Use photos instead <ArrowRight size={15} /></button>}

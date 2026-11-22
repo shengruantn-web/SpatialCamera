@@ -384,3 +384,75 @@ test('the browser client: creates, uploads every part, completes and submits; a 
   assert.equal((await detail(interrupted)).status, 'queued');
   await assert.rejects(client.uploadVideoCapture({ name: 'x', file: new File([bytes], 'clip.avi', { type: 'video/x-msvideo' }), keepVideo: false, fetcher }), /MP4 or MOV/);
 });
+
+const videoClient = async () => {
+  const bundled = await build({ entryPoints: ['lib/video-upload.ts'], bundle: true, write: false, format: 'esm', platform: 'neutral' });
+  return import(`data:text/javascript;base64,${Buffer.from(bundled.outputFiles[0].text).toString('base64')}`);
+};
+
+test('the browser client: a completion whose response was lost is only submitted on retry, never re-uploaded (review P2)', async () => {
+  const client = await videoClient();
+  const file = new File([videoBytes(PART + MiB, 11)], 'clip.mp4', { type: 'video/mp4' });
+  let seen = [], offline = false, dropAfterComplete = false;
+  // The completion reaches the server, but its response never reaches the browser (optionally the network then stays down).
+  const fetcher = async (url, init = {}) => {
+    seen.push(`${init.method ?? 'GET'} ${url.split('?')[0]}`);
+    if (offline) throw new TypeError('Failed to fetch');
+    const response = await mf.dispatchFetch(`http://localhost${url}`, { ...init, headers: { ...init.headers, ...as(owner) } });
+    if (url.includes('/video/complete')) { await response.arrayBuffer(); offline = dropAfterComplete; throw new TypeError('Failed to fetch'); }
+    return response;
+  };
+
+  // Lost response, network fine: the same call re-reads the capture, sees the video, and submits.
+  const id = await client.uploadVideoCapture({ name: 'Lost reply', file, keepVideo: false, fetcher });
+  assert.equal((await detail(id)).status, 'queued');
+  assert.deepEqual(seen.filter(entry => !entry.startsWith('PUT')).slice(-3), [`POST /api/captures/${id}/video/complete`, `GET /api/captures/${id}`, `POST /api/captures/${id}/submit`]);
+
+  // Lost response and the re-read fails too: this call fails, and the retry (same capture, same file) only submits.
+  dropAfterComplete = true; seen = [];
+  let created;
+  await assert.rejects(client.uploadVideoCapture({ name: 'Lost twice', file, keepVideo: false, fetcher, onCreated: value => { created = value; } }), /Failed to fetch/);
+  assert.equal((await row(created)).video_uploaded, 1, 'the completion committed');
+  offline = false; seen = [];
+  assert.equal(await client.uploadVideoCapture({ name: 'Lost twice', file, keepVideo: false, fetcher, resumeId: created }), created);
+  assert.deepEqual(seen, [`GET /api/captures/${created}`, `POST /api/captures/${created}/submit`], 'no new upload, so no 409');
+  assert.equal((await detail(created)).status, 'queued');
+});
+
+test('the browser client: a 409 on starting the upload means "already uploaded" when the capture says so (review P2, mocked fetch)', async () => {
+  const client = await videoClient();
+  const file = new File([videoBytes(MiB)], 'clip.mp4', { type: 'video/mp4' });
+  const mock = reads => {
+    const seen = [];
+    const fetcher = async (url, init = {}) => {
+      seen.push(`${init.method ?? 'GET'} ${url}`);
+      if ((init.method ?? 'GET') === 'GET') return Response.json({ capture: reads.shift() });
+      if (url.endsWith('/video/upload')) return Response.json({ error: 'This capture no longer accepts a video.' }, { status: 409 });
+      if (url.endsWith('/submit')) return Response.json({ capture: { status: 'queued' } });
+      throw new Error(`unexpected ${url}`);
+    };
+    return { seen, fetcher };
+  };
+  // The first read predates the completion (another tab finished it meanwhile): the 409 is re-checked, then submitted.
+  const raced = mock([{ status: 'uploading', video_uploaded: 0 }, { status: 'uploading', video_uploaded: 1 }]);
+  assert.equal(await client.uploadVideoCapture({ name: 'x', file, keepVideo: false, fetcher: raced.fetcher, resumeId: 'c1' }), 'c1');
+  assert.deepEqual(raced.seen, ['GET /api/captures/c1', 'POST /api/captures/c1/video/upload', 'GET /api/captures/c1', 'POST /api/captures/c1/submit']);
+  // A 409 for any other reason (the capture was already submitted) is still a failure.
+  const closed = mock([{ status: 'queued', video_uploaded: 1 }, { status: 'queued', video_uploaded: 1 }]);
+  await assert.rejects(client.uploadVideoCapture({ name: 'x', file, keepVideo: false, fetcher: closed.fetcher, resumeId: 'c2' }), /no longer accepts a video/);
+  assert.ok(!closed.seen.some(entry => entry.endsWith('/submit')));
+});
+
+test('the studio keeps one video panel for the life of a new upload (review P1)', async () => {
+  const { videoPanel } = await videoClient();
+  // "Or upload one video instead", the create, then the first poll reveals the uploading capture: the key must
+  // not change (a new key remounts VideoUpload, whose unmount aborts the upload and drops the chosen file).
+  const before = videoPanel(true, undefined);
+  const afterPoll = videoPanel(true, 'c1');
+  assert.equal(before.key, 'new');
+  assert.equal(afterPoll.key, before.key);
+  assert.equal(afterPoll.resume, false, 'the uploading panel keeps its own state; it does not switch to the resume UI');
+  // A capture reopened from the library resumes by its id; nothing else shows a video panel.
+  assert.deepEqual(videoPanel(false, 'c1'), { key: 'c1', resume: true });
+  assert.equal(videoPanel(false, undefined), null);
+});

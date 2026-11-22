@@ -22,6 +22,20 @@ export type VideoUploadOptions = {
   onProgress?: (fraction: number) => void;
 };
 
+/** An unfinished video capture reopened from the library. */
+export type VideoResume = { id: string; name: string; bytes: number | null; uploaded: boolean };
+
+/**
+ * Whether the Studio shows the video panel, its React key, and whether it shows the resume UI, given the
+ * new-video mode and the unfinished video capture that is active (if any). A new upload keeps the key "new" for
+ * its whole life: the poll that reveals its capture must not remount the component, because unmounting cancels
+ * the upload and drops the chosen file. Only a capture reopened from the library is keyed and resumed by its id.
+ */
+export function videoPanel(videoMode: boolean, resumeId: string | undefined): { key: string; resume: boolean } | null {
+  if (videoMode) return { key: "new", resume: false };
+  return resumeId ? { key: resumeId, resume: true } : null;
+}
+
 /** The MIME the server expects: browsers sometimes leave `type` empty for a .mov or .mp4. */
 export function videoMime(file: { name?: string; type: string }): string | null {
   if (Object.hasOwn(VIDEO_TYPES, file.type)) return file.type;
@@ -35,7 +49,9 @@ export function videoMime(file: { name?: string; type: string }): string | null 
  * Creates the capture (unless resuming), uploads the video in parts, completes the upload and submits the
  * capture; returns its id. Each part retries transient failures. A failure or an abort leaves the upload
  * open: retrying, or reopening the capture and choosing the same file, starts a fresh upload (the server
- * aborts the old one, and R2 aborts any upload left incomplete for 7 days).
+ * aborts the old one, and R2 aborts any upload left incomplete for 7 days). Before uploading into an existing
+ * capture it re-reads it: a video already uploaded (say a completion whose response was lost) is only
+ * submitted, and the server's 409 for "already uploaded" counts as done, not as a failure.
  */
 export async function uploadVideoCapture({ name, file, keepVideo, resumeId, fetcher = fetch, wait = sleep, signal, onCreated, onProgress }: VideoUploadOptions): Promise<string> {
   const mime = videoMime(file);
@@ -43,9 +59,15 @@ export async function uploadVideoCapture({ name, file, keepVideo, resumeId, fetc
   async function call<T = Json>(path: string, init: RequestInit = {}): Promise<T> {
     const response = await fetcher(`/api/${path}`, { ...init, signal, headers: init.body ? { "Content-Type": "application/json" } : undefined });
     const data = await response.json().catch(() => ({ error: "The server could not be reached. Please try again." })) as T & { error?: string };
-    if (!response.ok) throw new Error(data.error ?? "Request failed.");
+    if (!response.ok) throw Object.assign(new Error(data.error ?? "Request failed."), { status: response.status });
     return data;
   }
+  const submit = async (id: string) => { await call(`captures/${id}/submit`, { method: "POST" }); onProgress?.(1); return id; };
+  /** Whether the server already holds this capture's whole video (it may have committed a completion we never heard back from). */
+  const uploaded = async (id: string) => {
+    const { capture } = await call<{ capture: { status: string; video_uploaded?: number | null } }>(`captures/${id}`);
+    return capture.status === "uploading" && !!capture.video_uploaded;
+  };
   let id = resumeId;
   if (!id) {
     const created = await call<{ id: string }>("captures", { method: "POST", body: JSON.stringify({ name, source: "video", keep_video: keepVideo, video: { name: file.name || `video.${VIDEO_TYPES[mime]}`, bytes: file.size, mime } }) });
@@ -53,7 +75,14 @@ export async function uploadVideoCapture({ name, file, keepVideo, resumeId, fetc
   }
   signal?.throwIfAborted();
   onCreated?.(id);
-  const { upload, part_bytes: partBytes, parts } = await call<{ upload: string; part_bytes: number; parts: number }>(`captures/${id}/video/upload`, { method: "POST" });
+  if (resumeId && await uploaded(id)) return submit(id);
+  let started: { upload: string; part_bytes: number; parts: number };
+  try { started = await call(`captures/${id}/video/upload`, { method: "POST" }); }
+  catch (error) {
+    if ((error as { status?: number }).status === 409 && await uploaded(id)) return submit(id);
+    throw error;
+  }
+  const { upload, part_bytes: partBytes, parts } = started;
   if (parts !== Math.ceil(file.size / partBytes)) throw new Error("This is not the video this capture was created with. Choose the same file again.");
   const numbers = Array.from({ length: parts }, (_, index) => index + 1);
   const etags = new Map<number, string>();
@@ -67,7 +96,11 @@ export async function uploadVideoCapture({ name, file, keepVideo, resumeId, fetc
     etags.set(n, part.etag);
     done += body.size; onProgress?.(done / file.size);
   }, signal);
-  await call(`captures/${id}/video/complete?upload=${encodeURIComponent(upload)}`, { method: "POST", body: JSON.stringify({ parts: numbers.map(n => ({ part_number: n, etag: etags.get(n) })) }) });
-  await call(`captures/${id}/submit`, { method: "POST" });
-  return id;
+  try { await call(`captures/${id}/video/complete?upload=${encodeURIComponent(upload)}`, { method: "POST", body: JSON.stringify({ parts: numbers.map(n => ({ part_number: n, etag: etags.get(n) })) }) }); }
+  catch (error) {
+    // The completion may have committed even though its response never arrived.
+    signal?.throwIfAborted();
+    if (!await uploaded(id).catch(() => false)) throw error;
+  }
+  return submit(id);
 }
