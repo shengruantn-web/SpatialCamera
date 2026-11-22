@@ -4,10 +4,17 @@ export const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 export const MAX_TOTAL_BYTES = 1024 * 1024 * 1024;
 export type ImageInput = { name: string; bytes: number; mime: string };
 
+export const MAX_NAME_LENGTH = 80;
+/** A capture name, trimmed: used on create and on rename (S7). */
+export function validateName(value: unknown): string {
+  if (typeof value !== "string" || !value.trim() || value.trim().length > MAX_NAME_LENGTH) throw new Error(`Give your capture a name of 1–${MAX_NAME_LENGTH} characters.`);
+  return value.trim();
+}
+
 export function validateManifest(value: unknown): { name: string; images: ImageInput[] } {
   if (!value || typeof value !== "object") throw new Error("Invalid capture.");
   const input = value as Record<string, unknown>;
-  if (typeof input.name !== "string" || !input.name.trim() || input.name.trim().length > 80) throw new Error("Give your capture a name of 1–80 characters.");
+  const name = validateName(input.name);
   if (!Array.isArray(input.images) || input.images.length < MIN_IMAGES || input.images.length > MAX_IMAGES) throw new Error(`Choose ${MIN_IMAGES}–${MAX_IMAGES} overlapping photos.`);
   let total = 0;
   const images = input.images.map((image: unknown) => {
@@ -20,7 +27,7 @@ export function validateManifest(value: unknown): { name: string; images: ImageI
     return { name: item.name, bytes: item.bytes, mime: item.mime };
   });
   if (total > MAX_TOTAL_BYTES) throw new Error("Keep the complete capture under 1 GB.");
-  return { name: input.name.trim(), images };
+  return { name, images };
 }
 export function isImage(bytes: Uint8Array, mime: string) {
   if (mime === "image/jpeg") return bytes.length > 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;

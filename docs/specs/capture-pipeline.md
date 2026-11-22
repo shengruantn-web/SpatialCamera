@@ -1,6 +1,6 @@
 # Spec: Capture state machine and worker protocol
 
-**Status**: draft — documents behaviour at commit `5d136af` plus the Brush backend, updated for shipment S2 (API integrity + hot path: T2, T3, T6, T7 and the API half of T1) and S5 (SPZ delivery, §7.6). §5 lists known defects; §6 lists the target changes; §7 describes storage and concurrency as implemented.
+**Status**: draft — documents behaviour at commit `5d136af` plus the Brush backend, updated for shipment S2 (API integrity + hot path: T2, T3, T6, T7 and the API half of T1) S5 (SPZ delivery, §7.6) and S7 (rename, delete and retention, §7.9). §5 lists known defects; §6 lists the target changes; §7 describes storage and concurrency as implemented.
 **Related**: PRD R2–R3, ADR-0001, ADR-0003, ADR-0005, ADR-0007
 
 ## 1. Capture states
@@ -11,6 +11,8 @@ uploading ──submit──▶ queued ──claim──▶ aligning ──▶ t
     │                   └──── submit ──── failed ◀───────┴─────────────┘
     │                                      ▲   (worker reports failure, or no update for 10 min)
     └── (new capture)
+
+uploading / queued / ready / failed ──owner DELETE──▶ deleting ──purge──▶ (rows removed)     [S7, §7.9]
 ```
 
 | State | Entered when | Left when |
@@ -20,6 +22,7 @@ uploading ──submit──▶ queued ──claim──▶ aligning ──▶ t
 | `aligning` / `training` / `exporting` | Worker claim / `PATCH status` (forward by exactly one step, or same step as heartbeat) | Next stage, `failed`, or lease expiry |
 | `ready` | Worker `PUT result` while `exporting` with a valid lease; the same conditional UPDATE sets `result_key` and, if the attempt stored an SPZ, `spz_bytes` | Terminal |
 | `failed` | Worker reports `failed`, or `updated_at` older than 10 min in an active state (lease expiry, see §7.4) | Owner resubmits |
+| `deleting` (S7) | Owner `DELETE` on a capture with no live lease (`uploading`, `queued`, `ready`, `failed`) | Its objects are purged and its rows removed, by the same request or by the cron (§7.9). Hidden from the owner (404 everywhere), never claimed, resubmitted, renamed or uploaded to |
 
 Each transition records its entry time in `queued_at`, `aligning_at`, `training_at`, `exporting_at`, `ready_at` or `failed_at` (ms). A same-stage heartbeat does not move the timestamp. Resubmitting resets `aligning_at`…`failed_at` and `alignment_ratio`, so the columns always describe the current attempt (PRD X2).
 
@@ -30,6 +33,7 @@ Invariants:
 - I4. Progress shown to the user is derived only from these states (ADR-0005).
 - I5. From submit onwards, the image objects a capture references (`images.object_key`) never change (§7.2).
 - I6. The published result object is written only by the attempt that published it; a stale or losing attempt can never overwrite it (§7.3).
+- I7. (S7) A capture's rows outlive its objects: the `captures` and `images` rows are removed only after a listing of `{id}/` came back empty while the row was `deleting`, and no write stored after the status flip is ever committed (§7.9).
 
 ## 2. Owner API (browser)
 
@@ -45,6 +49,8 @@ All routes require the `oai-authenticated-user-email` header (or `LOCAL_DEV` on 
 | POST | `/api/captures/:id/submit` | `uploading`/`failed` → `queued` |
 | GET | `/api/captures/:id/scene?v=<ready_at>` | What the viewer loads when `ready`: the SPZ if the attempt published one, otherwise the PLY. `X-Splat-Format: spz\|ply`. Cached `private, max-age=31536000, immutable` only when `v` equals the capture's `ready_at` (a resubmit changes it, so the URL changes); otherwise `private, no-store` (§7.6) |
 | GET | `/api/captures/:id/result.ply[?download]` | The PLY archive (full precision) when `ready`, read from `result_key`; `?download` adds `Content-Disposition: attachment` |
+| PATCH | `/api/captures/:id` | (S7) Rename: `{ name }`, trimmed, 1–80 characters (the create rule, `validateName`), else 400 → `{ capture }`. Any state but `deleting`; `updated_at` is not changed (it is the lease clock) |
+| DELETE | `/api/captures/:id` | (S7) Delete the capture, its photos and its results (§7.9). 409 while `aligning`/`training`/`exporting` hold a live lease; 200 `{ deleted: true }` when everything is gone; 202 `{ deleted: true, pending: true }` when the cron finishes a large capture (it is already hidden) |
 
 ## 3. Worker API
 
@@ -189,7 +195,7 @@ Per-request keys (§7.1) mean an attempt that dies between its SPZ and its PLY, 
 
 - **Marking.** Every claim sets `captures.gc_pending = 1` in the same UPDATE that hands out the lease, so any capture that ever had an attempt is marked. The column is 0 when clean, otherwise 1 plus the number of failed collections (it stays truthy wherever it is read as a flag).
 - **When.** A successful `result` PUT collects its own capture immediately after publishing (§7.3 step 5). The 5-minute Cron Trigger (`handleScheduled`) runs the lease sweep and then `collectAttemptGarbage`, which takes up to 10 marked captures in a terminal state (`ready` or `failed`) ordered by `gc_pending, updated_at` (those that never failed first, then oldest), using `captures_gc_pending_idx`. Captures still in flight are not touched.
-- **Budget.** Every D1 query and R2 call counts against a subrequest budget per run, shared across captures: 40 for the cron (Workers Free allows 50 per invocation; the sweep uses 1) and 12 for the collection inline after a publish, which has already used about 8. A capture is started only with at least 5 left (its row read, a list, a delete, the mark update, one to record a failure), and another page is listed only with at least 4 left. When the budget runs out part-way, the capture keeps its mark and the next cron tick carries on where the listing left off, since what was deleted is gone.
+- **Budget.** Every D1 query and R2 call counts against a subrequest budget per run, shared across captures: 40 for the cron, less what that run's deletions used (Workers Free allows 50 per invocation; the sweep uses 1; §7.9) and 12 for the collection inline after a publish, which has already used about 8. A capture is started only with at least 5 left (its row read, a list, a delete, the mark update, one to record a failure), and another page is listed only with at least 4 left. When the budget runs out part-way, the capture keeps its mark and the next cron tick carries on where the listing left off, since what was deleted is gone.
 - **What.** Everything under `{id}/attempts/` is deleted except, for a `ready` capture, the published `result_key` and SPZ. For a `failed` capture, objects uploaded after its `updated_at` are kept, because the owner may have resubmitted and a new attempt may be uploading; that attempt's own checks (§7.3 step 4) or a later collection remove them. R2 is listed 100 keys per page, at most 5 pages per capture per run.
 - **Clearing the mark.** Only when the listing is exhausted, with `UPDATE captures SET gc_pending=0 WHERE id=? AND status=? AND updated_at=?`. If the row changed meanwhile (resubmitted, claimed again), the mark stays and a later run looks again. A capture with more than 500 leftover keys keeps its mark and is finished over several runs.
 - **Errors** are logged per capture and never fail the publish or the cron. A collection that throws (R2 or D1 unavailable) records `gc_pending = gc_pending + 1`, so the capture sinks behind the others instead of filling every batch. After 5 failures (`gc_pending` reaches 6) it is no longer selected, a "gave up" line names its `attempts/` prefix for manual cleanup, and its mark stays truthy. A new claim resets it to 1; a successful collection clears it to 0.
@@ -199,6 +205,28 @@ Image uploads (§7.2) are not covered here: they replace their predecessor in th
 ### 7.8 Platform limits and the 0003 deploy
 
 - Full SPZ inflation on upload (§7.6) and attempt collection assume Workers Paid CPU and subrequest limits: inflating a multi-megabyte SPZ can exceed Workers Free's 10 ms of CPU, and the budgets above fit in 50 subrequests with little to spare. Drain the job queue before deploying migration 0003: a capture that was `exporting` with a legacy fixed `attempts/{attempt}/result.spz` when 0003 ships publishes its PLY only, and that `.spz` is orphaned, since its claim predates `gc_pending` and nothing marks the capture for collection.
+
+### 7.9 Capture deletion and retention (S7, PRD R5.3)
+
+Captures are kept until their owner deletes them; nothing expires on its own. No migration: `deleting` is a new value of the free-text `captures.status`.
+
+**Request.** `DELETE /api/captures/:id`, after the usual owner lookup (which expires a stale lease, §7.4), runs one conditional UPDATE: `SET status='deleting', lease=NULL, gc_pending=0, updated_at=now WHERE id=? AND owner=? AND status IN ('uploading','queued','ready','failed')`. If it changes no row, a capture that is `aligning`/`training`/`exporting` gets 409 and anything else 404. The request then purges inline within a budget of 30 subrequests (it has made at most 4 before); if that finishes it returns 200, otherwise (or if R2/D1 fails) 202, and the cron finishes it.
+
+**Purge** (`purgeCapture`). Repeatedly list `{id}/` with `limit: 1000` and no cursor (what was deleted is gone, so each listing starts at what is left), deleting each page in one call (R2 takes ≤ 1000 keys). When a listing is not truncated, one D1 batch runs `DELETE FROM images WHERE capture_id=? AND EXISTS (capture is 'deleting')` and `DELETE FROM captures WHERE id=? AND status='deleting'`, rows last. A page needs a list and a delete and the final batch one more, so a pass starts only with ≥ 3 calls left. The prefix covers every layout in §7.1, including pre-S2 images and results.
+
+**Cron** (`purgeDeletedCaptures`). Each 5-minute run purges first: up to 5 `deleting` captures, oldest `updated_at` first, within 20 subrequests (1 for the query). Attempt collection (§7.7) gets the rest of the run's 40. A purge that throws is logged and its `updated_at` moved to now, so it goes behind the others. A capture with more objects than one run can delete (about 9,000 at 1000 per page) takes several runs and stays `deleting`, hidden, meanwhile. The 30 inline calls cover about 14,000 objects; a full capture (200 photos plus a few attempts) needs 3.
+
+**Why it is race-free.** Every writer stores its object first and then commits with a conditional UPDATE that `deleting` (or a missing row) fails, and a writer whose UPDATE fails deletes what it stored:
+- *Image PUT* (§7.2): `deleting` is not `uploading`, so the batch marks nothing and the new object is deleted (409). After the rows are gone, the image lookup or the UPDATE fails the same way.
+- *Worker `result`/`result.spz` PUT and heartbeat*: a `deleting` row is not in an active state, so the job route answers 409 and deletes the attempt's folder before storing anything. A PUT that passed its checks before the flip stores its object, then its conditional UPDATE (lease, `exporting`, freshness) fails, and `unpublished` deletes the attempt's folder (§7.3 step 4). Once the rows are gone, the job lookup finds nothing, no attempt folder is derived, and nothing is stored.
+- *Claim vs delete*: a claim moves only `queued` rows and the delete only lease-free states, and both are single conditional UPDATEs, so D1 serialises them: a claimed capture can't be deleted (409), and a deleted one is never claimed.
+- *Owner routes*: every owner lookup filters `status != 'deleting'`, so submit, rename, uploads and reads see 404; the list hides it.
+
+So any object that exists when the purge's final listing runs either belongs to a write that committed before the flip (and is listed and deleted) or will be deleted by its own writer. The rows go only after that empty listing (I7). The residual risk is the one §7.2/§7.3 already carry: a writer's own cleanup delete can fail (R2 unavailable), orphaning one object, which is logged with its key.
+
+**Rename** is `UPDATE captures SET name=? WHERE id=? AND owner=? AND status!='deleting' RETURNING …`; it is not progress, so `updated_at` is unchanged and polling picks it up through the name in `pollSignature`.
+
+**UI.** Each library row has rename and delete buttons (`aria-label` naming the capture). While the capture is processed (`aligning`/`training`/`exporting`), or this tab is uploading it, they are `aria-disabled` and say "Available once processing finishes" (or "…the upload finishes"); they stay focusable so the reason is announced. Rename opens a modal dialog with a labelled input (Enter saves, Esc cancels); delete opens a confirmation that names the capture and says it cannot be undone, with Cancel focused. Focus returns to the triggering button, or to the list heading after a delete; outcomes are announced in a polite status region.
 
 ## 8. Client-side preparation (S6, R1.3, R1.6)
 

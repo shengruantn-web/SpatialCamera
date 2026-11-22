@@ -1,5 +1,5 @@
 import {
-  isGaussianPly, isGzip, isImage, parseSpzHeader, parseWorkerMetrics, validateManifest, MAX_IMAGE_BYTES, MAX_PLY_BYTES, MAX_SPZ_BYTES,
+  isGaussianPly, isGzip, isImage, parseSpzHeader, parseWorkerMetrics, validateManifest, validateName, MAX_IMAGE_BYTES, MAX_PLY_BYTES, MAX_SPZ_BYTES,
 } from "../lib/validation";
 
 export interface ApiEnv {
@@ -60,7 +60,12 @@ async function expireCapture(db: D1Database, id: string, now: number) {
 export async function handleScheduled(env: Pick<ApiEnv, "DB" | "BUCKET">) {
   if (!env.DB) return;
   await sweepStaleLeases(env.DB);
-  if (env.BUCKET) await collectAttemptGarbage(env);
+  if (!env.BUCKET) return;
+  // S7: deletions first, within their own share of the run's subrequests; the attempt collection gets
+  // the rest, so the run as a whole still makes at most 1 + GC_SUBREQUESTS_PER_RUN calls.
+  const purge = { left: PURGE_SUBREQUESTS_PER_RUN };
+  await purgeDeletedCaptures(env, { budget: purge }).catch(error => console.error("Capture deletion run failed", error));
+  await collectAttemptGarbage(env, { budget: { left: GC_SUBREQUESTS_PER_RUN - (PURGE_SUBREQUESTS_PER_RUN - purge.left) } });
 }
 
 /** Leases are bearer secrets, so R2 keys carry a digest of the lease rather than the lease itself. */
@@ -171,6 +176,65 @@ export async function collectAttemptGarbage(env: Pick<ApiEnv, "DB" | "BUCKET">, 
   }
   return cleaned;
 }
+// ---- S7: capture deletion (spec §7.9) -------------------------------------------------------------
+/** R2 returns at most 1000 keys per list and deletes at most 1000 per call. */
+const PURGE_LIST_LIMIT = 1000;
+/**
+ * Calls the DELETE request may spend purging (it has made at most 4 before this), and the cron's share
+ * of its collection budget. A capture with more objects than that stays `deleting` for the next tick.
+ */
+export const PURGE_SUBREQUESTS_INLINE = 30;
+export const PURGE_SUBREQUESTS_PER_RUN = 20;
+const PURGE_CAPTURES_PER_RUN = 5;
+/**
+ * Removes every object under `{id}/` (uploads, legacy images, attempts, published and legacy results),
+ * then the image rows and the capture row, in that order, so a row exists for as long as any object may.
+ * Runs only on a row already `deleting`: from then on every writer's conditional UPDATE fails and the
+ * writer deletes the object it just stored (§7.2, §7.3), so an object stored after a listing below either
+ * belongs to a write that committed before the status flip (so it was stored before, and is listed) or
+ * removes itself. Returns true when the capture is gone; false when the budget ran out first.
+ */
+async function purgeCapture(env: Pick<ApiEnv, "DB" | "BUCKET">, id: string, budget: Budget) {
+  // A page needs a list and a delete, and the final batch one more.
+  while (budget.left >= 3) {
+    spend(budget);
+    // No cursor: what this deletes is gone, so the next listing starts at what is left.
+    const listing = await env.BUCKET.list({ prefix: `${id}/`, limit: PURGE_LIST_LIMIT });
+    if (listing.objects.length) { spend(budget); await env.BUCKET.delete(listing.objects.map(object => object.key)); }
+    if (listing.truncated) continue;
+    spend(budget);
+    await env.DB.batch([
+      env.DB.prepare("DELETE FROM images WHERE capture_id=? AND EXISTS (SELECT 1 FROM captures WHERE id=? AND status='deleting')").bind(id, id),
+      env.DB.prepare("DELETE FROM captures WHERE id=? AND status='deleting'").bind(id),
+    ]);
+    return true;
+  }
+  return false;
+}
+/**
+ * Cron: finishes deletions the DELETE request could not complete, oldest first. A capture whose purge
+ * throws has its `updated_at` moved forward so it goes behind the others next time. Returns how many
+ * captures were removed.
+ */
+export async function purgeDeletedCaptures(env: Pick<ApiEnv, "DB" | "BUCKET">, { budget = { left: PURGE_SUBREQUESTS_PER_RUN } }: { budget?: Budget } = {}) {
+  spend(budget);
+  const { results } = await env.DB.prepare("SELECT id FROM captures WHERE status='deleting' ORDER BY updated_at LIMIT ?")
+    .bind(PURGE_CAPTURES_PER_RUN).all<{ id: string }>();
+  let removed = 0;
+  for (const { id } of results) {
+    if (budget.left < 3) break;
+    try { if (await purgeCapture(env, id, budget)) removed++; }
+    catch (error) {
+      console.error("Capture deletion failed; the next run retries it", id, error);
+      if (budget.left < 1) break;
+      spend(budget);
+      await env.DB.prepare("UPDATE captures SET updated_at=? WHERE id=? AND status='deleting'").bind(Date.now(), id).run()
+        .catch(markError => console.error("Could not reschedule the deletion", id, markError));
+    }
+  }
+  return removed;
+}
+// ---- end S7 ---------------------------------------------------------------------------------------
 const imageKey = (captureId: string, image: ImageRow) => image.object_key ?? `${captureId}/images/${image.id}`;
 
 async function boundedBody(request: Request, max: number) {
@@ -486,7 +550,8 @@ export async function handleApi(request: Request, env: ApiEnv): Promise<Response
     }
     if (path[1] !== "captures") fail("Not found.", 404);
     if (path.length === 2 && request.method === "GET") {
-      const list = () => env.DB.prepare(`SELECT ${publicColumns} FROM captures WHERE owner=? ORDER BY created_at DESC LIMIT 100`).bind(owner).all<Record<string, unknown>>();
+      // S7: a capture being deleted is hidden.
+      const list = () => env.DB.prepare(`SELECT ${publicColumns} FROM captures WHERE owner=? AND status!='deleting' ORDER BY created_at DESC LIMIT 100`).bind(owner).all<Record<string, unknown>>();
       let results = (await list()).results;
       // Staleness is checked lazily so polling stays write-free; the cron sweep catches the rest.
       if (results.some(row => isStale(row, now))) { await sweepStaleLeases(env.DB, now); results = (await list()).results; }
@@ -504,7 +569,8 @@ export async function handleApi(request: Request, env: ApiEnv): Promise<Response
       return json({ id, images }, 201);
     }
     const id = path[2] ?? "";
-    const loadOwned = () => env.DB.prepare("SELECT * FROM captures WHERE id=? AND owner=?").bind(id, owner).first<Job & Record<string, unknown>>();
+    // S7: a capture being deleted is gone as far as its owner can tell (every route below 404s).
+    const loadOwned = () => env.DB.prepare("SELECT * FROM captures WHERE id=? AND owner=? AND status!='deleting'").bind(id, owner).first<Job & Record<string, unknown>>();
     let job = await loadOwned();
     if (!job) fail("Capture not found.", 404);
     if (isStale(job, now)) {
@@ -515,6 +581,34 @@ export async function handleApi(request: Request, env: ApiEnv): Promise<Response
     if (path.length === 3 && request.method === "GET") {
       const images = await env.DB.prepare("SELECT id,name,bytes,mime,uploaded FROM images WHERE capture_id=? ORDER BY id").bind(id).all();
       return json({ capture: toPublic(job), images: images.results });
+    }
+    // S7: rename, in every visible state. updated_at is left alone: the lease checks and the attempt
+    // collection read it as the attempt's clock, and a new name is not progress.
+    if (path.length === 3 && request.method === "PATCH") {
+      const input = await readJson(request);
+      if (!input || typeof input !== "object") fail("Invalid capture.");
+      const name = validateName((input as Record<string, unknown>).name);
+      const renamed = await env.DB.prepare(`UPDATE captures SET name=? WHERE id=? AND owner=? AND status!='deleting' RETURNING ${publicColumns}`)
+        .bind(name, id, owner).first<Record<string, unknown>>();
+      if (!renamed) fail("Capture not found.", 404);
+      return json({ capture: toPublic(renamed) });
+    }
+    // S7: delete (spec §7.9). One conditional UPDATE settles the race with a claim: it moves only a row
+    // with no live lease, and a claim moves only a `queued` row, so exactly one of them wins. A lease that
+    // went stale was expired just above, so a dead attempt never blocks a delete.
+    if (path.length === 3 && request.method === "DELETE") {
+      const started = await env.DB.prepare("UPDATE captures SET status='deleting',lease=NULL,gc_pending=0,updated_at=? WHERE id=? AND owner=? AND status IN ('uploading','queued','ready','failed')")
+        .bind(now, id, owner).run();
+      if (!started.meta.changes) {
+        const current = await loadOwned();
+        if (current && active.includes(current.status)) fail("This capture is being processed. You can delete it once it is ready or has failed.", 409);
+        fail("Capture not found.", 404);
+      }
+      try {
+        if (await purgeCapture(env, id, { left: PURGE_SUBREQUESTS_INLINE })) return json({ deleted: true });
+      } catch (error) { console.error("Capture deletion will be finished by the cron", id, error); }
+      // Already hidden everywhere; the cron removes what is left within a few minutes.
+      return json({ deleted: true, pending: true }, 202);
     }
     if (path[3] === "images") {
       const image = await env.DB.prepare("SELECT * FROM images WHERE id=? AND capture_id=?").bind(path[4] ?? "", id).first<ImageRow>();

@@ -9,6 +9,7 @@ A web-first photo-to-Gaussian-splat prototype. Capture photos are stored on the 
 - Warn-only checks before upload: blurry or low-detail photos, near-duplicates, and fewer than 30 usable photos.
 - Persistent capture manifests in D1, image/result storage in R2, and owner-scoped APIs.
 - Resumable uploads: reselect the original files from an incomplete capture.
+- Rename and delete captures from the library (S7). Delete asks for confirmation, removes the photos, results and records for good, and is refused while a GPU worker holds the capture. Captures are kept until deleted. A very large capture disappears at once and its files are removed by the 5-minute cron (see [spec §7.9](docs/specs/capture-pipeline.md)).
 - A durable job queue with atomic claims, worker leases, real stage reporting, and stale-job recovery.
 - Interactive splat viewing, orbit/pan/zoom, rotation, reset, and fullscreen. Finished captures stream as compressed SPZ (about 7× smaller than the PLY) with real download progress, and the full-precision PLY stays available as a download. One WebGL context is reused across scenes.
 - Status polling backs off from 2 s to 20 s while nothing changes, resets on any change or action, and stops once no capture is processing.
@@ -98,11 +99,11 @@ All endpoints require `Authorization: Bearer <WORKER_TOKEN>`. After claiming, se
 
 Each attempt's results are stored under their own keys and published atomically, so a stale attempt can't overwrite a finished scene. Photos can't change after submit. Stale leases are expired by a Cron Trigger every 5 minutes, by the claim path, and when the capture is read. Details are in [the capture pipeline spec](docs/specs/capture-pipeline.md) §7.
 
-The prototype limits captures to 12–200 photos, 20 MB per image, 1 GB total, 90 MB per returned PLY, and 48 MB per SPZ. JPEG/PNG signatures are checked on upload and decoding is checked in the browser; deeper image validation happens in the reconstruction tools. GPU jobs should run in an isolated environment. Large datasets, video extraction, progressive level-of-detail loading (ADR-0007), camera metadata ingestion, deletion controls, and public sharing are future work.
+The prototype limits captures to 12–200 photos, 20 MB per image, 1 GB total, 90 MB per returned PLY, and 48 MB per SPZ. JPEG/PNG signatures are checked on upload and decoding is checked in the browser; deeper image validation happens in the reconstruction tools. GPU jobs should run in an isolated environment. Large datasets, video extraction, progressive level-of-detail loading (ADR-0007), camera metadata ingestion, and public sharing are future work.
 
 ## Hosting and architecture
 
-The Sites vinext starter produces a Cloudflare Worker. `.openai/hosting.json` declares DB (D1) and BUCKET (R2). `worker/api.ts` handles capture and worker routes; the remainder goes through vinext. The schema comes only from the Drizzle migrations in `drizzle/` (edit `db/schema.ts`, then `npm run db:generate`). The build packages them for the host, and the API never runs DDL. Locally, `npm run dev` applies them first through its `predev` hook (idempotent, and it creates `.wrangler/` on a fresh checkout); `npm run db:migrate:local` runs the same step by itself. The Worker also exports a `scheduled` handler for the stale-lease Cron Trigger, configured in `vite.config.ts`.
+The Sites vinext starter produces a Cloudflare Worker. `.openai/hosting.json` declares DB (D1) and BUCKET (R2). `worker/api.ts` handles capture and worker routes; the remainder goes through vinext. The schema comes only from the Drizzle migrations in `drizzle/` (edit `db/schema.ts`, then `npm run db:generate`). The build packages them for the host, and the API never runs DDL. Locally, `npm run dev` applies them first through its `predev` hook (idempotent, and it creates `.wrangler/` on a fresh checkout); `npm run db:migrate:local` runs the same step by itself. The Worker also exports a `scheduled` handler for the 5-minute Cron Trigger (stale leases, finishing capture deletions, then attempt garbage collection), configured in `vite.config.ts`.
 
 Cloudflare hosts the web app, metadata, and files; Gaussian-splat training runs on the separate CUDA host. Browser requests cannot choose worker commands or file paths. User-facing responses never include worker tokens or leases.
 

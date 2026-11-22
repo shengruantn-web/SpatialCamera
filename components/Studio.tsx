@@ -10,6 +10,9 @@ import { createPoller, hasActiveCapture, latestOnly, pollSignature, putWithRetry
 import PrepWarnings from "./PrepWarnings"; // S6 capture prep
 import { useCapturePrep } from "./useCapturePrep"; // S6 capture prep
 import { useDropGuard } from "./useDropGuard"; // S6 capture prep
+import type { FormEvent } from "react"; // S7 rename/delete
+import { Pencil, Trash2 } from "lucide-react"; // S7 rename/delete
+import { MAX_NAME_LENGTH, validateName } from "../lib/validation"; // S7 rename/delete
 
 const sample: SceneSource = { url: "https://sparkjs.dev/assets/splats/butterfly.spz", name: "The butterfly", sample: true };
 type Selected = { file: File; url: string };
@@ -186,6 +189,72 @@ export default function Studio() {
     try { await api(`captures/${active.id}/submit`, { method: "POST" }); wake.current(); }
     catch (e) { setError((e as Error).message); } finally { setBusy(false); }
   }
+  // ── S7 rename/delete (spec §7.9). Both wait while a capture is processed (aligning, training and
+  // exporting hold a worker lease, and the server refuses a delete then) and while this tab uploads it.
+  const [manage, setManage] = useState<{ kind: "rename" | "delete"; capture: Capture } | null>(null);
+  const [manageName, setManageName] = useState("");
+  const [manageError, setManageError] = useState("");
+  const [managing, setManaging] = useState(false);
+  const [manageNotice, setManageNotice] = useState("");
+  const manageRef = useRef<HTMLDialogElement>(null);
+  const manageInput = useRef<HTMLInputElement>(null);
+  const manageCancel = useRef<HTMLButtonElement>(null);
+  const manageReturn = useRef<HTMLElement | null>(null);
+  const libraryHeading = useRef<HTMLHeadingElement>(null);
+  useEffect(() => {
+    const dialog = manageRef.current;
+    if (!dialog) return;
+    if (!manage) { if (dialog.open) dialog.close(); return; }
+    if (!dialog.open) dialog.showModal();
+    if (manage.kind === "rename") { manageInput.current?.focus(); manageInput.current?.select(); }
+    else manageCancel.current?.focus(); // the safe choice is the default one
+  }, [manage]);
+  const lockReason = (c: Capture) => ["aligning", "training", "exporting"].includes(c.status) ? "Available once processing finishes"
+    : busy && c.id === activeId ? "Available once the upload finishes" : "";
+  function openManage(kind: "rename" | "delete", capture: Capture, trigger: HTMLElement) {
+    if (lockReason(capture)) return;
+    manageReturn.current = trigger;
+    setManageName(capture.name); setManageError(""); setManageNotice(""); setManage({ kind, capture });
+  }
+  function closeManage() {
+    if (managing) return;
+    setManage(null); setManageError("");
+    // Back to the button that opened the dialog, or to the list heading when its row is gone.
+    requestAnimationFrame(() => { const back = manageReturn.current; (back?.isConnected ? back : libraryHeading.current)?.focus(); });
+  }
+  async function submitRename(e: FormEvent) {
+    e.preventDefault();
+    if (!manage || managing) return;
+    let next: string;
+    try { next = validateName(manageName); } catch (err) { setManageError((err as Error).message); manageInput.current?.focus(); return; }
+    const { id } = manage.capture;
+    setManaging(true); setManageError("");
+    try {
+      const { capture } = await api<{ capture: Capture }>(`captures/${id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: next }) });
+      setCaptures(current => current.map(c => c.id === id ? { ...c, name: capture.name } : c));
+      if (resume?.id === id) setName(capture.name);
+      setManageNotice(`Renamed to “${capture.name}”.`);
+      setManaging(false); setManage(null);
+      requestAnimationFrame(() => manageReturn.current?.focus());
+      wake.current();
+    } catch (err) { setManageError((err as Error).message); setManaging(false); }
+  }
+  async function confirmDelete() {
+    if (!manage || managing) return;
+    const { id, name: deletedName } = manage.capture;
+    setManaging(true); setManageError("");
+    try {
+      // 200 when everything is gone; 202 when the cron finishes a large capture. Either way it is gone for the owner.
+      await api(`captures/${id}`, { method: "DELETE" });
+      if (activeId === id) clear();
+      setCaptures(current => current.filter(c => c.id !== id));
+      setManageNotice(`Deleted “${deletedName}”.`);
+      setManaging(false); setManage(null);
+      requestAnimationFrame(() => libraryHeading.current?.focus());
+      wake.current();
+    } catch (err) { setManageError((err as Error).message); setManaging(false); wake.current(); }
+  }
+  // ── end S7
   const processing = active && active.status !== "uploading" && !busy;
   return <>
     <header className="header">
@@ -231,7 +300,20 @@ export default function Studio() {
           <input ref={splatInput} type="file" accept=".ply,.spz,.splat,.ksplat" className="sr-only" aria-label="Open an existing splat" onChange={e => { const file = e.target.files?.[0]; if (file) { if (file.size > 100 * 1024 * 1024) setError("Choose a splat smaller than 100 MB for this prototype."); else { setActiveId(null); setSource({ file, name: file.name.replace(/\.[^.]+$/, "") }); setError(""); } } e.target.value = ""; }} />
           <div className="capture-tip"><span className="tip-icon"><Footprints size={20} strokeWidth={1.4} /></span><div><strong>A little movement makes all the difference.</strong><p>Walk around your subject. Keep photos sharp, overlapping, and taken in consistent light.</p></div><button aria-label="Read capture tips" onClick={() => setGuide(true)}><ArrowUpRight size={19} /></button></div>
         </section>
-      </div> : <section className="library"><div className="library-heading"><h2>{captures.length} {captures.length === 1 ? "capture" : "captures"}</h2><button className="primary small" onClick={() => { clear(); setTab("studio"); }}><Plus size={16} /> New capture</button></div>{captures.length === 0 ? <div className="empty-library"><Scan size={36} strokeWidth={1} /><h3>Your first world starts here.</h3><p>Capture a favorite place. We’ll keep it here for you.</p><button className="text-button" onClick={() => setTab("studio")}>Create your first capture <ArrowRight size={16} /></button></div> : <div className="capture-list">{captures.map(c => <button key={c.id} className="capture-row" onClick={() => void openCapture(c)}><span className={`capture-icon ${c.status === "ready" ? "ready" : ""}`}><Box size={23} strokeWidth={1.4} /></span><span className="capture-info"><strong>{c.name}</strong><small>{c.image_count} photos · {new Date(c.created_at).toLocaleDateString(undefined, { month: "short", day: "numeric" })}</small></span><span className={`status-pill ${c.status}`}>{statusLabels[c.status]}</span><ChevronRight size={17} /></button>)}</div>}</section>}
+      </div> : <section className="library"><div className="library-heading"><h2 ref={libraryHeading} tabIndex={-1} /* S7: focus lands here after a delete */>{captures.length} {captures.length === 1 ? "capture" : "captures"}</h2><button className="primary small" onClick={() => { clear(); setTab("studio"); }}><Plus size={16} /> New capture</button></div>
+        <p className="sr-only" role="status">{manageNotice /* S7 */}</p>
+        {captures.length === 0 ? <div className="empty-library"><Scan size={36} strokeWidth={1} /><h3>Your first world starts here.</h3><p>Capture a favorite place. We’ll keep it here for you.</p><button className="text-button" onClick={() => setTab("studio")}>Create your first capture <ArrowRight size={16} /></button></div> : <div className="capture-list">{captures.map(c => {
+          const locked = lockReason(c); // S7
+          return <div key={c.id} className="capture-item" /* S7: the row plus its rename/delete actions */>
+            <button className="capture-row" onClick={() => void openCapture(c)}><span className={`capture-icon ${c.status === "ready" ? "ready" : ""}`}><Box size={23} strokeWidth={1.4} /></span><span className="capture-info"><strong>{c.name}</strong><small>{c.image_count} photos · {new Date(c.created_at).toLocaleDateString(undefined, { month: "short", day: "numeric" })}</small></span><span className={`status-pill ${c.status}`}>{statusLabels[c.status]}</span><ChevronRight size={17} /></button>
+            {/* S7: aria-disabled rather than disabled keeps the buttons focusable, so the reason is announced. */}
+            <div className="capture-actions">
+              {locked && <small id={`lock-${c.id}`} className="capture-lock">{locked}</small>}
+              <button className="icon-button" aria-label={`Rename ${c.name}`} title={locked || "Rename"} aria-disabled={locked ? true : undefined} aria-describedby={locked ? `lock-${c.id}` : undefined} onClick={e => openManage("rename", c, e.currentTarget)}><Pencil size={15} /></button>
+              <button className="icon-button delete-button" aria-label={`Delete ${c.name}`} title={locked || "Delete"} aria-disabled={locked ? true : undefined} aria-describedby={locked ? `lock-${c.id}` : undefined} onClick={e => openManage("delete", c, e.currentTarget)}><Trash2 size={15} /></button>
+            </div>
+          </div>;
+        })}</div>}</section>}
       <footer><span><Scan size={14} /> CAPTURE SOMETHING REAL.</span><span>Photos in. A little world out.<span className="footer-dot">·</span>Spatial Camera Lab<span className="footer-dot">·</span><a href="/third-party-notices.txt">Open-source notices</a>{/* S6: LGPL notice for the HEIC decoder */}</span></footer>
     </main>
     <dialog ref={guideRef} onCancel={() => setGuide(false)} onClick={e => { if (e.target === e.currentTarget) setGuide(false); }}><div className="guide"><button className="dialog-close icon-button" aria-label="Close capture guide" onClick={() => setGuide(false)}><X size={20} /></button><div className="eyebrow">A BETTER CAPTURE, A BETTER WORLD</div><h2>Take the long way <em>around.</em></h2><p>A good splat starts with photos that tell the whole story.</p><div className="guide-steps">{[
@@ -240,5 +322,23 @@ export default function Studio() {
       { icon: Sun, title: "Keep the world still.", text: "Use even light. Avoid people moving through the scene, mirrors, glass, and featureless walls. Keep zoom and exposure consistent." },
       { icon: Cloud, title: "Upload once. Come back to explore.", text: "Photos are stored privately. A connected GPU worker estimates camera positions and trains your splat. Timing depends on scene size and hardware." },
     ].map(({ icon: Icon, title, text }) => <div key={title}><span><Icon size={21} /></span><section><h3>{title}</h3><p>{text}</p></section></div>)}</div><div className="notice">Time-lapse capture works when you move between photos. For a place changing over days, create a separate capture for each visit.</div><button className="primary" onClick={() => setGuide(false)}>Ready to capture <ArrowRight size={16} /></button></div></dialog>
+    {/* ── S7 rename/delete dialog: Esc or a backdrop click cancels (not while a request runs). */}
+    <dialog ref={manageRef} className="manage-dialog" aria-labelledby="manage-title" aria-describedby={manage?.kind === "delete" ? "manage-description" : undefined} onCancel={e => { e.preventDefault(); closeManage(); }} onClick={e => { if (e.target === e.currentTarget) closeManage(); }}>
+      {manage && <div className="manage">
+        {manage.kind === "rename" ? <form onSubmit={submitRename} noValidate>
+          <h2 id="manage-title">Rename capture</h2>
+          <label className="field-label" htmlFor="manage-name">Name <span>Up to {MAX_NAME_LENGTH} characters</span></label>
+          <input ref={manageInput} id="manage-name" className="name-input" maxLength={MAX_NAME_LENGTH} value={manageName} readOnly={managing} aria-invalid={manageError ? true : undefined} aria-describedby={manageError ? "manage-error" : undefined} onChange={e => setManageName(e.target.value)} />
+          {manageError && <div id="manage-error" className="notice error" role="alert"><AlertCircle size={16} />{manageError}</div>}
+          <div className="manage-actions"><button type="button" className="secondary-button" onClick={closeManage}>Cancel</button><button type="submit" className="primary" aria-busy={managing || undefined}>{managing ? <><LoaderCircle size={16} className="spin" /> Saving</> : "Save name"}</button></div>
+        </form> : <>
+          <h2 id="manage-title">Delete “{manage.capture.name}”?</h2>
+          <p id="manage-description">Its {manage.capture.image_count} photos and its 3D scene will be permanently deleted. This cannot be undone.</p>
+          {manageError && <div className="notice error" role="alert"><AlertCircle size={16} />{manageError}</div>}
+          <div className="manage-actions"><button ref={manageCancel} type="button" className="secondary-button" onClick={closeManage}>Cancel</button><button type="button" className="primary danger" aria-busy={managing || undefined} onClick={() => void confirmDelete()}>{managing ? <><LoaderCircle size={16} className="spin" /> Deleting</> : <><Trash2 size={16} /> Delete permanently</>}</button></div>
+        </>}
+      </div>}
+    </dialog>
+    {/* ── end S7 */}
   </>;
 }
