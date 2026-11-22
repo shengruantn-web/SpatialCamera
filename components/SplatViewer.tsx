@@ -2,7 +2,8 @@
 import { useEffect, useRef, useState } from "react";
 import { Expand, RotateCcw, Pause, Play, Move, LoaderCircle, AlertCircle } from "lucide-react";
 import type { SplatMesh } from "@sparkjsdev/spark";
-import { DownloadError, openScene, sceneOutcome, type Download } from "../lib/scene";
+import type { WebGLRenderer } from "three";
+import { attemptController, describeFailure, DownloadError, EngineError, openScene, sceneOutcome, type Download } from "../lib/scene";
 /** `fallbackUrl`: loaded instead when `url` downloads but cannot be decoded (the PLY behind an SPZ). */
 export type SceneSource = { url?: string; fallbackUrl?: string; file?: File; name: string; sample?: boolean };
 
@@ -13,11 +14,27 @@ type EngineEvents = { onLost: () => void; onRestored: () => void };
  * the renderer per scene eventually loses the oldest one. After a context loss the component builds a
  * fresh engine (a new generation) rather than trusting Spark's GPU state to survive a restore.
  */
-async function createEngine(host: HTMLDivElement, { onLost, onRestored }: EngineEvents) {
-  const [THREE, { SparkRenderer, SplatMesh }, { OrbitControls }] = await Promise.all([
+async function createEngine(host: HTMLDivElement, events: EngineEvents) {
+  // A chunk that fails to load is a network problem: "Reload scene" rebuilds the engine and retries it.
+  const modules: Modules = await Promise.all([
     import("three"), import("@sparkjsdev/spark"), import("three/addons/controls/OrbitControls.js"),
-  ]);
-  const renderer = new THREE.WebGLRenderer({ antialias: false, alpha: true });
+  ]).catch(error => { throw new DownloadError(`Could not load the 3D viewer: ${String(error)}`); });
+  let renderer: WebGLRenderer;
+  try { renderer = new modules[0].WebGLRenderer({ antialias: false, alpha: true }); }
+  catch (error) { throw new EngineError(String(error)); }
+  // Each build step registers its undo, so a failure part-way leaves no listener, observer, Spark renderer,
+  // canvas or WebGL context behind.
+  const undo: (() => void)[] = [];
+  try { return buildEngine(host, events, modules, renderer, undo); }
+  catch (error) {
+    for (const step of undo.reverse()) { try { step(); } catch { /* keep releasing the rest */ } }
+    try { renderer.dispose(); renderer.forceContextLoss(); } catch { /* already unusable */ }
+    renderer.domElement.remove();
+    throw new EngineError(String(error));
+  }
+}
+type Modules = [typeof import("three"), typeof import("@sparkjsdev/spark"), typeof import("three/addons/controls/OrbitControls.js")];
+function buildEngine(host: HTMLDivElement, { onLost, onRestored }: EngineEvents, [THREE, { SparkRenderer, SplatMesh }, { OrbitControls }]: Modules, renderer: WebGLRenderer, undo: (() => void)[]) {
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5)); renderer.setClearColor(0x000000, 0);
   const canvas = renderer.domElement;
   canvas.setAttribute("role", "img");
@@ -42,16 +59,22 @@ async function createEngine(host: HTMLDivElement, { onLost, onRestored }: Engine
   // preventDefault tells the browser we can handle a restore; without it the context stays lost for good.
   const contextLost = (event: Event) => { event.preventDefault(); lost = true; cancelAnimationFrame(frameId); frameId = 0; onLost(); };
   const contextRestored = () => onRestored();
+  undo.push(() => orbit.dispose());
   canvas.addEventListener("webglcontextlost", contextLost);
   canvas.addEventListener("webglcontextrestored", contextRestored);
+  undo.push(() => { canvas.removeEventListener("webglcontextlost", contextLost); canvas.removeEventListener("webglcontextrestored", contextRestored); });
   orbit.addEventListener("change", requestRender);
+  undo.push(() => { disposed = true; cancelAnimationFrame(frameId); orbit.removeEventListener("change", requestRender); });
   const spark = new SparkRenderer({ renderer, onDirty: requestRender }); scene.add(spark);
+  undo.push(() => spark.dispose());
   const resize = () => {
     if (!host.clientWidth || !host.clientHeight) return;
     renderer.setSize(host.clientWidth, host.clientHeight);
     camera.aspect = host.clientWidth / host.clientHeight; camera.updateProjectionMatrix(); requestRender();
   };
-  const observer = new ResizeObserver(resize); observer.observe(host); resize();
+  const observer = new ResizeObserver(resize); observer.observe(host);
+  undo.push(() => observer.disconnect());
+  resize();
   let shown: SplatMesh | null = null;
   /** Replaces the displayed mesh, disposing the previous one (its GPU textures and worker buffers). */
   function show(mesh: SplatMesh | null) {
@@ -132,11 +155,13 @@ export default function SplatViewer({ source }: { source: SceneSource }) {
         setState(current => ({ ...current, loaded, total, received: done }));
       };
       let download: Download | null = null;
+      let attempt: AbortController | null = null;
       let mesh: SplatMesh;
       if (bytes) mesh = new SplatMesh({ fileBytes: bytes, fileName: source.file!.name });
       else {
         if (!url) throw new Error("No scene to load.");
-        const opened = await openScene(url, abort.signal, onBytes);
+        attempt = attemptController(abort.signal);
+        const opened = await openScene(url, attempt.signal, onBytes);
         if (!alive) { void opened.stream.cancel().catch(() => {}); return; }
         download = opened.download;
         mesh = new SplatMesh({ stream: opened.stream, streamLength: opened.streamLength, fileName: opened.fileName });
@@ -150,6 +175,9 @@ export default function SplatViewer({ source }: { source: SceneSource }) {
       if (!alive) return; // the cleanup discards it
       const failure = (download as Download | null)?.failure;
       const outcome = sceneOutcome({ failure, decodeError, url, fallbackUrl: source.fallbackUrl });
+      // Spark holds the stream locked, so close this attempt's connection through its own signal; the
+      // PLY fallback below gets a fresh attempt.
+      if (outcome !== "show") attempt?.abort();
       if (outcome === "download-error") throw new DownloadError(String(failure));
       if (outcome === "decode-error") throw decodeError;
       if (outcome === "fallback") {
@@ -180,10 +208,7 @@ export default function SplatViewer({ source }: { source: SceneSource }) {
     (created ? load(created) : Promise.reject(new Error("Viewer is not mounted."))).catch(error => {
       if (pending) { discard(pending); pending = null; }
       if (!alive) return;
-      const failed = { ...opening, loading: false };
-      if (error instanceof DownloadError) setState({ ...failed, retry: true, error: "This scene could not be downloaded. Check your connection and try again." });
-      else if (error instanceof Error && /WebGL/.test(error.message)) setState({ ...failed, error: "This browser could not start WebGL2. Try a browser with hardware acceleration enabled." });
-      else setState({ ...failed, error: source.fallbackUrl ? "Neither the compact SPZ nor the full PLY of this scene could be decoded." : "This scene could not be decoded. The file may be damaged or in an unsupported format." });
+      setState({ ...opening, loading: false, ...describeFailure(error, Boolean(source.fallbackUrl)) });
     });
     return () => {
       alive = false; controls.current = null;

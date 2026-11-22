@@ -3,6 +3,8 @@
  */
 /** The scene's bytes never arrived in full (network, HTTP status, or an abort). Not a decoding problem. */
 export class DownloadError extends Error {}
+/** The 3D engine (WebGL renderer, Spark renderer) could not be built in this browser. Not the scene's fault. */
+export class EngineError extends Error {}
 export type Download = { failure: unknown };
 /**
  * Fetches a scene on the main thread (so an AbortSignal can stop it) and hands Spark a stream of its body,
@@ -54,4 +56,30 @@ export function sceneOutcome({ failure, decodeError, url, fallbackUrl }: { failu
   if (failure) return "download-error";
   if (!decodeError) return "show";
   return fallbackUrl && url !== fallbackUrl ? "fallback" : "decode-error";
+}
+
+/**
+ * One controller per download attempt, aborted with `parent` (unmount, new scene) but also abortable on its
+ * own: when an SPZ fails to decode, its attempt is aborted before the PLY fallback starts, closing the SPZ
+ * connection that Spark's locked stream would otherwise keep open through the larger download.
+ */
+export function attemptController(parent: AbortSignal) {
+  const attempt = new AbortController();
+  if (parent.aborted) attempt.abort(parent.reason);
+  // An aborted attempt removes its listener; the parent lives only as long as one scene effect anyway.
+  else parent.addEventListener("abort", () => attempt.abort(parent.reason), { once: true, signal: attempt.signal });
+  return attempt;
+}
+
+/**
+ * What the viewer says when a scene fails, decided by where the error came from rather than its message:
+ * a download (retryable), building the engine (the browser cannot run WebGL2), or decoding the file.
+ */
+export function describeFailure(error: unknown, hasFallback: boolean): { error: string; retry: boolean } {
+  if (error instanceof DownloadError) return { retry: true, error: "This scene could not be downloaded. Check your connection and try again." };
+  if (error instanceof EngineError) return { retry: false, error: "This browser could not start WebGL2. Try a browser with hardware acceleration enabled." };
+  return {
+    retry: false,
+    error: hasFallback ? "Neither the compact SPZ nor the full PLY of this scene could be decoded." : "This scene could not be decoded. The file may be damaged or in an unsupported format.",
+  };
 }

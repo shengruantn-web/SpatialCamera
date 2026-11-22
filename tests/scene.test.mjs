@@ -98,3 +98,40 @@ test('an SPZ that downloads whole but will not decode falls back to the PLY once
   assert.equal(scene.sceneOutcome({ failure: new TypeError('network'), decodeError: bad, url: spz, fallbackUrl: ply }), 'download-error', 'a connection problem, not a bad file');
   assert.equal(scene.sceneOutcome({ failure: new TypeError('network'), decodeError: null, url: spz, fallbackUrl: ply }), 'download-error', 'never show a partial scene');
 });
+
+test('a failed attempt is aborted on its own before the PLY fallback; unmount still aborts every attempt (round 3, item 1)', async () => {
+  const outer = new AbortController();
+  // A fetch-like body that errors when its request's signal aborts, as browsers do.
+  const fetcher = async (url, { signal }) => new Response(new ReadableStream({
+    start(c) { c.enqueue(new Uint8Array(4)); signal.addEventListener('abort', () => c.error(signal.reason)); },
+  }), { headers: { 'content-length': '1000', 'x-splat-format': url.endsWith('.ply') ? 'ply' : 'spz' } });
+  const spzAttempt = scene.attemptController(outer.signal);
+  const spz = await scene.openScene('/scene?v=1', spzAttempt.signal, () => {}, fetcher);
+  const spzReader = spz.stream.getReader(); // Spark holds this lock; the viewer cannot cancel the stream itself
+  await spzReader.read();
+  const pending = spzReader.read();
+  spzAttempt.abort();                        // what the viewer does when the SPZ will not decode
+  assert.equal((await pending).done, true, "the SPZ's connection is closed");
+  assert.equal(outer.signal.aborted, false, 'the scene effect itself carries on');
+
+  const plyAttempt = scene.attemptController(outer.signal);
+  const ply = await scene.openScene('/result.ply', plyAttempt.signal, () => {}, fetcher);
+  assert.equal(plyAttempt.signal.aborted, false, 'the fallback starts with a live signal');
+  const plyReader = ply.stream.getReader();
+  await plyReader.read();
+  const next = plyReader.read();
+  outer.abort(new DOMException('unmounted', 'AbortError'));
+  assert.equal((await next).done, true, 'unmount stops the fallback download too');
+  assert.equal(plyAttempt.signal.reason.message, 'unmounted');
+  assert.equal(scene.attemptController(outer.signal).signal.aborted, true, 'an attempt started after unmount is born aborted');
+});
+
+test('a failure is described by where it came from, not by its message (round 3, item 4)', () => {
+  const download = scene.describeFailure(new scene.DownloadError('HTTP 503'), true);
+  assert.deepEqual([download.retry, /could not be downloaded/.test(download.error)], [true, true]);
+  const engine = scene.describeFailure(new scene.EngineError('Error creating context'), true);
+  assert.deepEqual([engine.retry, /WebGL2/.test(engine.error)], [false, true]);
+  // A decoder message that mentions WebGL is still a decode failure.
+  assert.match(scene.describeFailure(new Error('WebGL texture too large for this SPZ'), true).error, /Neither the compact SPZ nor the full PLY/);
+  assert.match(scene.describeFailure(new Error('bad file'), false).error, /could not be decoded/);
+});

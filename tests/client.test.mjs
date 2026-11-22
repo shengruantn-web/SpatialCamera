@@ -157,11 +157,11 @@ function pollerHarness({ hidden = () => false } = {}) {
   const timers = [];
   const pending = [];
   let polls = 0;
-  const poller = client.createPoller(() => { polls++; return new Promise(resolve => pending.push(resolve)); }, {
+  const poller = client.createPoller(() => { polls++; return new Promise((resolve, reject) => pending.push({ resolve, reject })); }, {
     hidden,
     timers: { set: (callback, ms) => { const t = { callback, ms }; timers.push(t); return t; }, clear: t => { const i = timers.indexOf(t); if (i >= 0) timers.splice(i, 1); } },
   });
-  return { poller, timers, pending, polls: () => polls, async reply(result) { pending.shift()(result); await tick(); await tick(); } };
+  return { poller, timers, pending, polls: () => polls, async reply(result) { pending.shift().resolve(result); await tick(); await tick(); }, async fail(error) { pending.shift().reject(error); await tick(); await tick(); } };
 }
 
 test('a wake during an in-flight poll re-polls right after it and ignores the stale result (H2)', async () => {
@@ -224,4 +224,29 @@ test('latestOnly drops a response that started before one already applied (H2)',
   const third = order.begin();
   assert.equal(order.accept(third), true);
   assert.equal(order.accept(third), false, 'applied once');
+});
+
+test('a poll that throws keeps polling at the fastest rate instead of stopping for good (round 3, item 2)', async () => {
+  const h = pollerHarness();
+  void h.poller.wake();
+  await h.reply({ signature: 'a', active: false });
+  assert.deepEqual(h.timers.map(t => t.ms), [client.IDLE_REFRESH_MS]);
+  h.timers.shift().callback();
+  await h.fail(new TypeError('Failed to fetch'));
+  assert.deepEqual(h.timers.map(t => t.ms), [client.POLL_MIN_MS], 'rescheduled, treated as a changed, active result');
+  h.timers.shift().callback();
+  assert.equal(h.polls(), 3, 'the next tick polls again');
+  await h.fail(new Error('still down'));
+  assert.equal(h.timers.length, 1, 'still scheduled after repeated failures');
+  // A throw during a dirty re-poll is handled the same way.
+  h.timers.shift().callback();
+  void h.poller.wake();
+  await h.reply({ signature: 'b', active: true });
+  await h.fail(new Error('flaky'));
+  assert.deepEqual(h.timers.map(t => t.ms), [client.POLL_MIN_MS]);
+  h.timers.shift();
+  const woke = h.poller.wake();
+  await h.fail(new Error('down again'));
+  await woke; // resolves: a throwing poll never surfaces as an unhandled rejection from tick()
+  h.poller.stop();
 });

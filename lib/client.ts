@@ -105,13 +105,15 @@ export function latestOnly() {
 
 export type PollResult = { signature: string; active: boolean };
 export type Timers = { set: (callback: () => void, ms: number) => unknown; clear: (handle: unknown) => void };
+const POLL_ERROR: PollResult = { signature: "error", active: true };
 const browserTimers: Timers = { set: (callback, ms) => setTimeout(callback, ms), clear: handle => clearTimeout(handle as ReturnType<typeof setTimeout>) };
 /**
  * Adaptive polling of server-owned state: every 2 s after a change, backing off to 20 s while nothing
  * changes, once a minute when nothing is in flight, and not at all while the page is hidden (the caller
  * wakes it when it becomes visible). `wake()` (a user action) polls at once and resets the backoff; one
  * arriving while a poll is in flight marks it dirty, so another poll runs right after it and the first
- * one's result is discarded (it may predate the action). `poll` must not throw.
+ * one's result is discarded (it may predate the action). A `poll` that throws counts as a changed, active
+ * result, so polling carries on at the fastest rate instead of stopping for good.
  */
 export function createPoller(poll: () => Promise<PollResult>, { hidden = () => false, timers = browserTimers }: { hidden?: () => boolean; timers?: Timers } = {}) {
   let timer: unknown;
@@ -128,7 +130,10 @@ export function createPoller(poll: () => Promise<PollResult>, { hidden = () => f
     running = true;
     let result: PollResult;
     try {
-      do { dirty = false; result = await poll(); } while (dirty && !stopped);
+      do {
+        dirty = false;
+        try { result = await poll(); } catch { result = POLL_ERROR; }
+      } while (dirty && !stopped);
     } finally { running = false; }
     if (stopped) return;
     delay = nextPollDelay(delay, result.signature !== last); last = result.signature;
