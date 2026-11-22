@@ -1,9 +1,13 @@
 """Pull-based Gaussian-splat worker: CUDA/Nerfstudio or Apple Silicon/Brush."""
 import argparse
+import http.client
 import json
+import math
 import os
 from pathlib import Path
 import shutil
+import signal
+import struct
 import subprocess
 import sys
 import tempfile
@@ -13,9 +17,199 @@ import urllib.error
 import urllib.request
 
 
+def validate_ply(path):
+    types = {
+        "char": "b", "int8": "b", "uchar": "B", "uint8": "B",
+        "short": "h", "int16": "h", "ushort": "H", "uint16": "H",
+        "int": "i", "int32": "i", "uint": "I", "uint32": "I",
+        "float": "f", "float32": "f", "double": "d", "float64": "d",
+    }
+
+    def invalid(reason):
+        raise RuntimeError(f"Invalid Gaussian-splat PLY: {reason}")
+
+    with path.open("rb") as source:
+        if source.readline(80).strip() != b"ply":
+            invalid("missing PLY signature.")
+        vertex_count = None
+        element = None
+        properties = []
+        names = set()
+        has_format = False
+        while True:
+            line = source.readline(65537)
+            if not line or len(line) > 65536 or source.tell() > 1024 * 1024:
+                invalid("missing or oversized ASCII header.")
+            try:
+                fields = line.decode("ascii").split()
+            except UnicodeDecodeError:
+                invalid("header must be ASCII.")
+            if not fields:
+                invalid("empty header directive.")
+            if fields[0] in ("comment", "obj_info"):
+                continue
+            if fields == ["end_header"]:
+                break
+            if fields[0] == "format":
+                if has_format or fields != ["format", "binary_little_endian", "1.0"]:
+                    invalid("format must be binary_little_endian 1.0.")
+                has_format = True
+            elif fields[0] == "element" and len(fields) == 3:
+                try:
+                    count = int(fields[2])
+                except ValueError:
+                    invalid("element count must be an integer.")
+                element = fields[1]
+                if element == "vertex":
+                    if vertex_count is not None or count <= 0:
+                        invalid("expected one vertex element with N > 0.")
+                    vertex_count = count
+                elif count != 0:
+                    invalid("only vertex payloads are supported.")
+            elif fields[0] == "property":
+                if element is None or len(fields) != 3 or fields[1] not in types:
+                    invalid("properties must use supported scalar types; lists are not supported.")
+                if element == "vertex":
+                    if fields[2] in names:
+                        invalid("duplicate vertex property.")
+                    names.add(fields[2])
+                    properties.append((fields[2], types[fields[1]]))
+            else:
+                invalid("unrecognized header directive.")
+        if not has_format or vertex_count is None:
+            invalid("missing binary format or vertex element.")
+        if not all(any(name == axis and kind in "fd" for name, kind in properties)
+                   for axis in ("x", "y", "z")):
+            invalid("x, y and z must be float or double properties.")
+        vertex = struct.Struct("<" + "".join(kind for _, kind in properties))
+        header_len = source.tell()
+        if header_len + vertex_count * vertex.size != os.fstat(source.fileno()).st_size:
+            invalid("file size does not match header length + vertex count × stride.")
+        position_indices = [i for i, (name, _) in enumerate(properties) if name in ("x", "y", "z")]
+        sample_count = min(vertex_count, 1000)
+        for sample in range(sample_count):
+            index = sample * (vertex_count - 1) // max(1, sample_count - 1)
+            source.seek(header_len + index * vertex.size)
+            data = source.read(vertex.size)
+            if len(data) != vertex.size:
+                invalid("truncated vertex payload.")
+            values = vertex.unpack(data)
+            if any(not math.isfinite(values[i]) for i in position_indices):
+                invalid(f"non-finite float value at vertex {index}.")
+
+
+def terminate_process_group(process, timeout=10):
+    def signal_group(sig):
+        process.poll()  # Reap a zombie leader before killpg (required on macOS).
+        try:
+            os.killpg(process.pid, sig)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            # macOS can deny killpg while the leader is still exiting.
+            # Keep waiting if it cannot yet be reaped, including after SIGKILL.
+            return process.poll() is None
+
+    if not signal_group(signal.SIGTERM):
+        process.wait()
+        return
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not signal_group(0):
+            process.wait()
+            return
+        time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+    signal_group(signal.SIGKILL)
+    process.wait()
+
+
+class ExitSignals:
+    """Turns SIGTERM/SIGHUP (and Ctrl-C) into exceptions only at safe points.
+
+    A handler that raises at an arbitrary bytecode can escape Popen after the
+    child exists (orphaning its new session) or leak Popen's waitpid lock
+    between acquire() and try (so the final wait() blocks forever). While the
+    main thread owns a stage's process group, signals are recorded and raised
+    from sleep() or once the group has been terminated.
+    """
+
+    def __init__(self):
+        self.depth = 0
+        self.interruptible = False
+        self.pending = None
+
+    def install(self):
+        signals = [signal.SIGTERM, signal.SIGHUP]
+        if signal.getsignal(signal.SIGINT) is signal.default_int_handler:
+            signals.append(signal.SIGINT)
+        for signum in signals:
+            signal.signal(signum, self.handle)
+
+    @staticmethod
+    def error(signum):
+        return KeyboardInterrupt() if signum == signal.SIGINT else SystemExit(128 + signum)
+
+    def handle(self, signum, frame):
+        if self.depth and not self.interruptible:
+            if self.pending is None:
+                self.pending = signum
+            return
+        self.interruptible = False
+        raise self.error(signum)
+
+    def raise_pending(self):
+        signum, self.pending = self.pending, None
+        if signum is not None:
+            raise self.error(signum)
+
+    def deferred(self):
+        return _SignalDeferral(self)
+
+    def sleep(self, seconds):
+        if not self.depth or threading.current_thread() is not threading.main_thread():
+            time.sleep(seconds)
+            return
+        try:
+            self.interruptible = True
+            if self.pending is not None:
+                self.interruptible = False
+                self.raise_pending()
+            time.sleep(seconds)
+        finally:
+            self.interruptible = False
+
+
+class _SignalDeferral:
+    def __init__(self, signals):
+        self.signals = signals
+        self.active = False
+
+    def __enter__(self):
+        # Handlers only run on the main thread, so only it may defer them.
+        if threading.current_thread() is threading.main_thread():
+            self.active = True
+            self.signals.depth += 1
+
+    def __exit__(self, exc_type, exc, tb):
+        if not self.active:
+            return
+        self.signals.depth -= 1
+        if self.signals.depth:
+            return
+        if exc_type is not None and issubclass(exc_type, (SystemExit, KeyboardInterrupt)):
+            self.signals.pending = None  # Already exiting.
+        else:
+            self.signals.raise_pending()
+
+
+EXIT_SIGNALS = ExitSignals()
+
+
 class Worker:
     def __init__(self, base_url, token, iterations, backend="nerfstudio", brush="brush_app",
-                 max_resolution=1200, max_splats=300000):
+                 max_resolution=1200, max_splats=300000, *, heartbeat_interval=25,
+                 retry_delays=(5, 15, 45, 120), recovery_dir=None):
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.iterations = iterations
@@ -23,6 +217,10 @@ class Worker:
         self.brush = brush
         self.max_resolution = max_resolution
         self.max_splats = max_splats
+        self.heartbeat_interval = heartbeat_interval
+        self.retry_delays = tuple(retry_delays)
+        self.recovery_dir = (Path(recovery_dir).expanduser() if recovery_dir is not None
+                             else Path.home() / ".cache/spatial-camera/recovered")
         # Optional headers supplied by the chosen hosting gateway; never log them.
         self.gateway_headers = json.loads(os.environ.get("SPATIAL_GATEWAY_HEADERS", "{}"))
 
@@ -35,6 +233,8 @@ class Worker:
             headers["Content-Type"] = "application/json"
         elif payload is not None:
             headers["Content-Type"] = "application/octet-stream"
+            if hasattr(payload, "fileno"):
+                headers["Content-Length"] = str(os.fstat(payload.fileno()).st_size)
         request = urllib.request.Request(self.base_url + "/api/worker/" + path, data=payload, headers=headers, method=method)
         with urllib.request.urlopen(request, timeout=180) as response:
             data = response.read()
@@ -44,6 +244,98 @@ class Worker:
                 return json.loads(data)
             except json.JSONDecodeError as exc:
                 raise RuntimeError("The worker endpoint returned a non-JSON response. Check hosting gateway authentication.") from exc
+
+    def upload_result(self, job_id, lease, path, lease_lost):
+        if lease_lost.is_set():
+            raise RuntimeError("The processing lease was lost before result upload.")
+        attempt = 0
+        unknown_outcome = False
+        while True:
+            # A ready capture rejects heartbeats, but accepts an idempotent PUT.
+            # After an ambiguous response, allow exactly one confirmation even
+            # if the heartbeat lost the lease or the retry budget is exhausted.
+            confirming = lease_lost.is_set()
+            if confirming and not unknown_outcome:
+                raise RuntimeError("The processing lease was lost during result upload retries.")
+            attempt += 1
+            try:
+                # Reopen for each attempt so retries stream from byte zero.
+                with path.open("rb") as source:
+                    self.request(f"{job_id}/result", "PUT", source, lease, raw=True)
+                return
+            except urllib.error.HTTPError as exc:
+                code = exc.code
+                exc.close()
+                if code in (401, 403, 409):
+                    lease_lost.set()
+                    raise RuntimeError(f"Result upload aborted: HTTP {code}; authorization or processing lease lost.") from exc
+                if code != 429 and not 500 <= code < 600:
+                    raise RuntimeError(f"Result upload failed: HTTP {code}.") from exc
+                detail = f"HTTP {code}"
+                unknown_outcome = unknown_outcome or 500 <= code < 600
+            except (OSError, urllib.error.URLError, http.client.HTTPException) as exc:
+                detail = type(exc).__name__
+                unknown_outcome = True
+            if confirming:
+                raise RuntimeError(f"The processing lease was lost; confirming result upload failed ({detail}).")
+            if not lease_lost.is_set():
+                # Servers may close an unauthorized PUT before reading its body,
+                # which urllib exposes as a network error instead of HTTP 409.
+                try:
+                    self.request(f"{job_id}/status", "PATCH", {"status": "exporting"}, lease)
+                except urllib.error.HTTPError as exc:
+                    exc.close()
+                    if exc.code in (401, 403, 409):
+                        lease_lost.set()
+                except (OSError, urllib.error.URLError, http.client.HTTPException):
+                    pass
+            if lease_lost.is_set():
+                continue
+            if attempt > len(self.retry_delays):
+                raise RuntimeError(f"Result upload failed after {attempt} attempts ({detail}).")
+            delay = self.retry_delays[attempt - 1]
+            print(f"Result upload failed ({detail}); retrying in {delay:g}s.", flush=True)
+            lease_lost.wait(delay)
+
+    def prune_recovery(self):
+        files = sorted((path for path in self.recovery_dir.glob("*.ply") if path.is_file()),
+                       key=lambda path: path.stat().st_mtime_ns, reverse=True)
+        for path in files[10:]:
+            path.unlink()
+
+    def recover_result(self, job_id, path):
+        self.recovery_dir.mkdir(parents=True, exist_ok=True)
+        destination = self.recovery_dir / f"{Path(job_id).name}-{time.time_ns()}.ply"
+        shutil.move(str(path), destination)
+        print(f"Capture {job_id}: recovered result PLY: {destination}", flush=True)
+        self.prune_recovery()
+
+    def run(self, command, log_path, stage, lease_lost, timeout=7200,
+            poll_interval=2, terminate_timeout=10):
+        if lease_lost.is_set():
+            raise RuntimeError("The processing lease was lost.")
+        print(f"{stage.capitalize()}: {log_path.name}", flush=True)
+        # From fork until the group is reaped, signals only raise from
+        # EXIT_SIGNALS.sleep() or after terminate_process_group() returns.
+        with log_path.open("wb") as log, EXIT_SIGNALS.deferred():
+            process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT,
+                                       start_new_session=True)
+            try:
+                deadline = time.monotonic() + timeout
+                while process.poll() is None:
+                    # Event.wait can replace a signal's SystemExit with a lock
+                    # RuntimeError while reacquiring its condition on Python 3.13.
+                    EXIT_SIGNALS.sleep(poll_interval)
+                    if lease_lost.is_set():
+                        raise RuntimeError("The server connection or processing lease was lost.")
+                    if time.monotonic() > deadline:
+                        raise RuntimeError("Processing exceeded the two-hour stage limit.")
+            finally:
+                # Descendants can survive even when their direct parent has exited.
+                terminate_process_group(process, terminate_timeout)
+        if process.returncode:
+            print(log_path.read_text(errors="replace")[-6000:], flush=True)
+            raise RuntimeError(f"{stage.capitalize()} failed. Try sharper photos with more overlap and a still subject.")
 
     def process(self, job):
         job_id, lease = job["id"], job["lease"]
@@ -60,12 +352,13 @@ class Worker:
 
         def heartbeat():
             failures = 0
-            while not stop.wait(25):
+            while not stop.wait(self.heartbeat_interval):
                 try:
                     with lock:
                         self.request(f"{job_id}/status", "PATCH", {"status": stage}, lease)
                     failures = 0
                 except urllib.error.HTTPError as exc:
+                    exc.close()
                     failures += 1
                     if exc.code in (401, 403, 409) or failures >= 5:
                         lease_lost.set()
@@ -77,33 +370,16 @@ class Worker:
                         return
 
         def run(command, log_path):
-            with log_path.open("wb") as log:
-                process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
-                print(f"{stage.capitalize()}: {log_path.name}", flush=True)
-                deadline = time.monotonic() + 7200
-                try:
-                    while process.poll() is None:
-                        if lease_lost.wait(2):
-                            raise RuntimeError("The server connection or processing lease was lost.")
-                        if time.monotonic() > deadline:
-                            raise RuntimeError("Processing exceeded the two-hour stage limit.")
-                    if process.returncode:
-                        # Keep detailed logs on this machine; expose an actionable message to users.
-                        print(log_path.read_text(errors="replace")[-6000:], flush=True)
-                        raise RuntimeError(f"{stage.capitalize()} failed. Try sharper photos with more overlap and a still subject.")
-                finally:
-                    if process.poll() is None:
-                        process.terminate()
-                        try:
-                            process.wait(timeout=10)
-                        except subprocess.TimeoutExpired:
-                            process.kill()
-                            process.wait()
+            self.run(command, log_path, stage, lease_lost)
 
         thread = threading.Thread(target=heartbeat, daemon=True)
+        root = None
+        uploaded = False
+        validated_result = None
         thread.start()
         try:
-            with tempfile.TemporaryDirectory(prefix="spatial-capture-") as directory:
+            try:
+                directory = tempfile.mkdtemp(prefix="spatial-capture-")
                 root = Path(directory)
                 photos = root / "photos"
                 photos.mkdir()
@@ -145,14 +421,25 @@ class Worker:
                     raise RuntimeError("No Gaussian-splat PLY was produced.")
                 if results[0].stat().st_size > 90 * 1024 * 1024:
                     raise RuntimeError("This splat exceeds the prototype's 90 MB delivery limit. Try a smaller scene.")
-                # Stop heartbeats before finalization; ready jobs no longer accept their lease.
+                validate_ply(results[0])
+                validated_result = results[0]
+                self.upload_result(job_id, lease, results[0], lease_lost)
+                uploaded = True
+                print(f"Completed capture {job_id}", flush=True)
+            finally:
                 stop.set()
                 thread.join(timeout=185)
-                self.request(f"{job_id}/result", "PUT", results[0].read_bytes(), lease)
-                print(f"Completed capture {job_id}", flush=True)
+                if root is not None:
+                    try:
+                        if validated_result is not None and not uploaded:
+                            self.recover_result(job_id, validated_result)
+                    except OSError as exc:
+                        print(f"Capture {job_id}: could not recover result PLY ({type(exc).__name__}).", flush=True)
+                    finally:
+                        shutil.rmtree(root, ignore_errors=True)
+                        if root.exists():
+                            print(f"Capture {job_id}: could not remove working directory {root}.", flush=True)
         except Exception as exc:
-            stop.set()
-            thread.join(timeout=185)
             message = str(exc) if isinstance(exc, RuntimeError) else "Processing could not finish. Check the GPU worker and retry your capture."
             try:
                 status("failed", message)
@@ -163,6 +450,7 @@ class Worker:
             stop.set()
 
     def serve(self, once=False):
+        self.prune_recovery()
         print(f"Worker started ({self.backend}). Waiting for queued captures.", flush=True)
         while True:
             try:
@@ -188,6 +476,7 @@ class Worker:
 
 
 if __name__ == "__main__":
+    EXIT_SIGNALS.install()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", default=os.environ.get("SPATIAL_URL", "http://localhost:3000"))
     parser.add_argument("--iterations", type=int, default=7000)
@@ -195,6 +484,8 @@ if __name__ == "__main__":
     parser.add_argument("--brush", default=str(Path(__file__).resolve().parent.parent / ".local/bin/brush_app"))
     parser.add_argument("--max-resolution", type=int, default=1200)
     parser.add_argument("--max-splats", type=int, default=300000)
+    parser.add_argument("--recovery-dir", type=Path, default=Path.home() / ".cache/spatial-camera/recovered",
+                        help="Keep the newest 10 validated PLYs whose upload failed")
     parser.add_argument("--env-file", type=Path, help="Read WORKER_TOKEN from a local dotenv file without executing it")
     parser.add_argument("--once", action="store_true", help="Process at most one queued capture and exit")
     args = parser.parse_args()
@@ -220,4 +511,4 @@ if __name__ == "__main__":
         if not shutil.which(binary):
             parser.error(f"Missing {binary}. Run npm run setup:mac for Brush, or use a CUDA-enabled Nerfstudio environment.")
     Worker(args.url, token, args.iterations, args.backend, args.brush,
-           args.max_resolution, args.max_splats).serve(args.once)
+           args.max_resolution, args.max_splats, recovery_dir=args.recovery_dir).serve(args.once)

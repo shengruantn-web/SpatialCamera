@@ -35,3 +35,7 @@ Every shipment also requires: `npm run typecheck`, `npm run lint`, `npm test` an
 
 | Date | Shipment | Result |
 |---|---|---|
+| 2026-11-22 | S0 | `372f9be`: branch created, Mac backend + PRD/spec/ADRs committed |
+| 2026-11-22 | S2 | `81b799a`: done. typecheck/lint/build pass, 17/17 Miniflare tests. Codex review: 5 findings (1 high: backfills in a hosted migration), all fixed and re-verified. Open: whether Sites honours `triggers.crons` (claim-path and per-row expiry cover it if not) |
+| 2026-11-22 | S1 | Done. 55 worker tests pass on Python 3.12/3.13/3.14 (macOS) and 3.12 (Linux container); signal/process-group tests 0 failures in 144 runs at 48-way parallelism (plus 576 by the fixing agent). Four rounds: Codex implemented; python-reviewer found 9 then 4 issues; orchestrator stress testing exposed a signal-inside-`Popen`/`poll` race (orphaned stage, deadlock), fixed with safe-point signal deferral and deterministic regression tests |
+| 2026-11-22 | S3 | Done. `.github/workflows/ci.yml` (Node: typecheck, lint, test, build; Python 3.12: py_compile + unittest). Same commands pass locally. Not yet run on GitHub (branch not pushed) |
