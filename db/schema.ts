@@ -1,4 +1,4 @@
-import { sqliteTable, text, integer, real, index } from "drizzle-orm/sqlite-core";
+import { sqliteTable, text, integer, real, index, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 export const captures = sqliteTable("captures", {
   id: text("id").primaryKey(),
@@ -55,3 +55,21 @@ export const workerHealth = sqliteTable("worker_health", {
   id: text("id").primaryKey(),
   lastSeen: integer("last_seen").notNull(),
 });
+// S8 (ADR-0010): read-only share links. The token is a bearer secret shown to the owner once; only its
+// SHA-256 is stored, so a database leak does not reveal live links. Deleting a capture deletes its links.
+export const shares = sqliteTable("shares", {
+  id: text("id").primaryKey(),
+  captureId: text("capture_id").notNull().references(() => captures.id, { onDelete: "cascade" }),
+  // Lowercase hex SHA-256 of the 128-bit token; the public routes look links up by this.
+  tokenHash: text("token_hash").notNull(),
+  createdAt: integer("created_at").notNull(),
+  // Set once by revoke; a revoked link is never served again.
+  revokedAt: integer("revoked_at"),
+  // Page loads (share page and embed), not scene or download requests.
+  views: integer("views").notNull().default(0),
+  // Owner opt-in: 1 lets viewers download the full PLY.
+  allowDownload: integer("allow_download").notNull().default(0),
+}, (t) => [
+  uniqueIndex("shares_token_hash_idx").on(t.tokenHash),
+  index("shares_capture_created_idx").on(t.captureId, t.createdAt),
+]);

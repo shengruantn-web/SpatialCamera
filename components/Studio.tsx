@@ -10,6 +10,7 @@ import { createPoller, hasActiveCapture, latestOnly, pollSignature, putWithRetry
 import PrepWarnings from "./PrepWarnings"; // S6 capture prep
 import { useCapturePrep } from "./useCapturePrep"; // S6 capture prep
 import { useDropGuard } from "./useDropGuard"; // S6 capture prep
+import SharePanel from "./SharePanel"; // S8 share links
 
 const sample: SceneSource = { url: "https://sparkjs.dev/assets/splats/butterfly.spz", name: "The butterfly", sample: true };
 type Selected = { file: File; url: string };
@@ -210,6 +211,7 @@ export default function Studio() {
             {active.status === "failed" && <button className="primary" onClick={retry}><RotateCcw size={16} /> Retry reconstruction</button>}
             {active.status === "ready" && <a className="primary" href={`/api/captures/${active.id}/result.ply?download`}><Download size={16} /> Download PLY{active.result_bytes ? ` · ${formatBytes(active.result_bytes)}` : ""}</a>}
             {active.status === "ready" && active.spz_bytes ? <p className="privacy-note">The viewer streams a {formatBytes(active.spz_bytes)} SPZ; the PLY is the full-precision archive.</p> : null}
+            {active.status === "ready" && <SharePanel key={active.id} captureId={active.id} name={active.name} /> /* S8 share links */}
             <button className="text-button" onClick={clear}>Start another capture <ArrowRight size={15} /></button>
           </div> : <>
             <p className="panel-description">One place, from different angles.<br />We’ll put the pieces together.</p>

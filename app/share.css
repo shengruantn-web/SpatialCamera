@@ -1,0 +1,40 @@
+/* S8 share links (ADR-0010): the owner's Share panel (components/SharePanel.tsx) and the public
+   page / embed (components/SharedScene.tsx). Kept out of globals.css so it never collides with S7. */
+.share-panel{border-top:1px solid var(--line);margin-top:18px;padding-top:12px}
+.share-toggle{display:flex;align-items:center;gap:8px;width:100%;padding:6px 0;font-size:11px;font-weight:550;text-align:left}
+.share-toggle:hover{color:var(--orange)}
+.share-count{margin-left:auto;font-size:9px;font-weight:400;color:var(--green);background:#e3ecda;border-radius:4px;padding:2px 6px}
+.share-body{padding:6px 0 4px}
+.share-help{font-size:10px;line-height:1.6;color:var(--muted);margin:4px 0 10px}
+.share-create{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
+.share-check{display:inline-flex;align-items:center;gap:7px;font-size:10.5px;color:#55594f;cursor:pointer}
+.share-check input{width:15px;height:15px;margin:0;accent-color:var(--orange)}
+.share-created{border:1px solid #e3d3c4;background:#fffaf5;border-radius:6px;padding:10px 12px;margin:12px 0}
+.share-once{font-size:10.5px;line-height:1.6;color:#7a4a1c}
+.share-created .field-label{margin:10px 0 5px}
+.share-copy-row{display:flex;gap:6px;align-items:stretch}
+.share-copy-row input,.share-copy-row textarea{flex:1;min-width:0;border:1px solid #dedfd5;background:#fff;border-radius:5px;padding:7px 9px;font:10px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--ink);resize:none}
+.share-copy-row input:focus-visible,.share-copy-row textarea:focus-visible,.share-check input:focus-visible{outline:2px solid var(--orange);outline-offset:2px}
+.share-copy{display:inline-flex;align-items:center;gap:5px;padding:0 10px;border:1px solid #dedfd5;border-radius:5px;font-size:10px;background:#fbfaf6}
+.share-copy:hover{border-color:var(--orange);color:var(--orange)}
+.share-created>.text-button{margin-top:8px}
+.share-list{list-style:none;margin:12px 0 0;padding:0}
+.share-list li{border-top:1px solid var(--line);padding:9px 0;display:flex;flex-direction:column;gap:6px}
+.share-list li.revoked{color:#9a9f90}
+.share-line{display:flex;justify-content:space-between;align-items:center;gap:10px}
+.share-line strong{display:block;font-size:10.5px;font-weight:550}
+.share-line small{display:block;font-size:9.5px;color:var(--muted);margin-top:3px}
+.share-state{font-size:9px;border-radius:4px;background:#eeece2;color:#8b8166;padding:3px 7px}
+.share-confirm{display:inline-flex;gap:10px;align-items:center}
+.share-danger{padding:3px 10px;border-radius:4px;background:#a63e1f;color:#fff;font-size:10px;font-weight:600}
+.share-danger:hover:not(:disabled){background:#8f3519}
+.share-status{display:flex;align-items:center;justify-content:center;gap:8px;min-height:200px;font-size:12px;color:#667a57}
+.share-status.notice{min-height:0;justify-content:flex-start}
+.share-main{padding-bottom:40px}
+.share-title{font-size:clamp(34px,4vw,52px);margin:28px 0 20px;overflow-wrap:anywhere}
+.share-meta{display:flex;justify-content:space-between;align-items:center;gap:16px;margin:16px 0;font-size:11px;color:var(--muted);flex-wrap:wrap}
+.share-meta .primary{width:auto;margin:0}
+main.share-embed{max-width:none;padding:0;margin:0;height:100vh;height:100dvh}
+.share-embed .viewer{height:100%;border-radius:0}
+.share-embed>.share-status{height:100%;margin:0;padding:16px}
+@media(max-width:720px){.share-title{margin-top:20px}.share-meta{align-items:flex-start;flex-direction:column}}

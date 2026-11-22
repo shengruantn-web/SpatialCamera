@@ -1,6 +1,7 @@
 import {
   isGaussianPly, isGzip, isImage, parseSpzHeader, parseWorkerMetrics, validateManifest, MAX_IMAGE_BYTES, MAX_PLY_BYTES, MAX_SPZ_BYTES,
 } from "../lib/validation";
+import { handleOwnerShares } from "./share"; // S8
 
 export interface ApiEnv {
   DB: D1Database;
@@ -78,10 +79,10 @@ const uploadKeyIn = (dir: string, extension: "ply" | "spz") => `${dir}/result.${
 const inDir = (key: string | null | undefined, dir: string): key is string => Boolean(key?.startsWith(`${dir}/`));
 /** Rows published before per-upload keys kept their SPZ beside a fixed `{attempt}/result.ply`. */
 const legacySpzKeyFor = (resultKey: string) => resultKey.replace(/\/result\.ply$/, "/result.spz");
-const legacyResultKey = (id: string) => `${id}/result.ply`;
+export const legacyResultKey = (id: string) => `${id}/result.ply`; // S8: exported for worker/share.ts
 type Published = Pick<Job, "status" | "result_key" | "spz_key" | "spz_bytes">;
-/** The SPZ a ready capture serves, if any. */
-const publishedSpzKey = (row: Published) => row.status !== "ready" || row.spz_bytes == null ? null
+/** The SPZ a ready capture serves, if any. S8: exported for worker/share.ts. */
+export const publishedSpzKey = (row: Published) => row.status !== "ready" || row.spz_bytes == null ? null
   : row.spz_key ?? (row.result_key && /\/result\.ply$/.test(row.result_key) ? legacySpzKeyFor(row.result_key) : null);
 const GC_LIST_LIMIT = 100;
 const GC_CAPTURES_PER_RUN = 10;
@@ -516,6 +517,9 @@ export async function handleApi(request: Request, env: ApiEnv): Promise<Response
       const images = await env.DB.prepare("SELECT id,name,bytes,mime,uploaded FROM images WHERE capture_id=? ORDER BY id").bind(id).all();
       return json({ capture: toPublic(job), images: images.results });
     }
+    // S8: share links (ADR-0010, spec §7.9). `job` was loaded for this owner, so another owner never
+    // reaches its links (404 above); worker/share.ts scopes every query to this capture.
+    if (path[3] === "shares") return handleOwnerShares(request, env, job, path.slice(4), now);
     if (path[3] === "images") {
       const image = await env.DB.prepare("SELECT * FROM images WHERE id=? AND capture_id=?").bind(path[4] ?? "", id).first<ImageRow>();
       if (!image) fail("Photo not found.", 404);

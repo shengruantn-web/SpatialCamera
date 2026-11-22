@@ -12,6 +12,7 @@ A web-first photo-to-Gaussian-splat prototype. Capture photos are stored on the 
 - A durable job queue with atomic claims, worker leases, real stage reporting, and stale-job recovery.
 - Interactive splat viewing, orbit/pan/zoom, rotation, reset, and fullscreen. Finished captures stream as compressed SPZ (about 7× smaller than the PLY) with real download progress, and the full-precision PLY stays available as a download. One WebGL context is reused across scenes.
 - Status polling backs off from 2 s to 20 s while nothing changes, resets on any change or action, and stops once no capture is processing.
+- Read-only share links and embeds for finished captures (S8). See "Sharing" below.
 - Local PLY/SPZ/SPLAT/KSPLAT viewing without uploading the file.
 - A separately attributed Spark sample scene. The sample is not a reconstruction of uploaded photos.
 
@@ -35,6 +36,24 @@ Photos are prepared in the browser, in Web Workers, as soon as they are added. T
   - The low-detail or blurry photos, or the extra copies, can be removed in bulk after a confirmation that lists them.
 - Thresholds and how they were calibrated are in [docs/specs/capture-pipeline.md §8](docs/specs/capture-pipeline.md).
 - The code is in `lib/capture-prep/`, `components/useCapturePrep.ts` and `components/PrepWarnings.tsx`.
+
+## Sharing
+
+Open **Share** under a finished capture to create a read-only link (ADR-0010, spec [§7.9](docs/specs/capture-pipeline.md)).
+
+- Anyone with the link can view the scene at `/s/<token>`, without signing in. `/s/<token>/embed` is the viewer alone, for an `<iframe>` on any site; the panel gives you the snippet.
+- The link is shown **once**. Only a hash of it is stored, so copy it when it is created; if it is lost, create another and revoke the old one.
+- Viewers get the compact SPZ (or the PLY if the capture has no SPZ). The full PLY download is off unless you tick "Allow PLY download" for that link. Photos are never shared.
+- Each link shows its page views. Revoking a link stops it on the next request, cached scene bytes included. A scene someone already has open stays on their screen until they reload.
+- Reprocessing a capture pauses its links (404) until it is `ready` again; then they show the new result. Revoke them first if you do not want that.
+- Up to 20 active links per capture. Public routes are rate-limited per IP (best effort, per isolate; `SHARE_RATE_LIMIT`, default 120 per minute). A request without `CF-Connecting-IP` is not limited (logged once per isolate), so one header-less client cannot lock out the others.
+
+Deploy notes for sharing:
+
+- The hosting gateway must let anonymous requests reach `/s/*` **only**. `/api/*` and the owner pages stay behind sign-in.
+- The gateway must strip or overwrite `oai-authenticated-user-email` on every request, anonymous `/s/*` requests included, so no visitor can send their own.
+- The gateway must forward the real client IP as `CF-Connecting-IP`. If it sends its own address, all visitors share one rate-limit budget.
+- The built-in limiter is per isolate. For production, add a Workers Rate Limiting binding or a WAF rate-limiting rule on `/s/*`.
 
 ## Local development
 
@@ -98,7 +117,7 @@ All endpoints require `Authorization: Bearer <WORKER_TOKEN>`. After claiming, se
 
 Each attempt's results are stored under their own keys and published atomically, so a stale attempt can't overwrite a finished scene. Photos can't change after submit. Stale leases are expired by a Cron Trigger every 5 minutes, by the claim path, and when the capture is read. Details are in [the capture pipeline spec](docs/specs/capture-pipeline.md) §7.
 
-The prototype limits captures to 12–200 photos, 20 MB per image, 1 GB total, 90 MB per returned PLY, and 48 MB per SPZ. JPEG/PNG signatures are checked on upload and decoding is checked in the browser; deeper image validation happens in the reconstruction tools. GPU jobs should run in an isolated environment. Large datasets, video extraction, progressive level-of-detail loading (ADR-0007), camera metadata ingestion, deletion controls, and public sharing are future work.
+The prototype limits captures to 12–200 photos, 20 MB per image, 1 GB total, 90 MB per returned PLY, and 48 MB per SPZ. JPEG/PNG signatures are checked on upload and decoding is checked in the browser; deeper image validation happens in the reconstruction tools. GPU jobs should run in an isolated environment. Large datasets, video extraction, progressive level-of-detail loading (ADR-0007), camera metadata ingestion, and deletion controls are future work.
 
 ## Hosting and architecture
 
