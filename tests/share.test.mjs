@@ -18,7 +18,7 @@ let script, mf, db, bucket;
 // for the vinext app route (it says which page it rendered and sets a header the handler must override).
 const newMiniflare = bindings => new Miniflare({ modules: true, script, compatibilityDate: '2026-01-01', d1Databases: ['DB'], r2Buckets: ['BUCKET'], bindings });
 before(async () => {
-  const result = await build({ stdin: { contents: `import { handleApi } from "./worker/api.ts";
+  const result = await build({ stdin: { contents: `import { handleApi, purgeDeletedCaptures } from "./worker/api.ts";
     import { handleSharePublic, isSharePath, newShareToken } from "./worker/share.ts";
     import { refuseFraming } from "./worker/framing.ts";
     const renderPage = async request => new Response('<!doctype html><title>rendered</title>' + new URL(request.url).pathname,
@@ -27,6 +27,7 @@ before(async () => {
       const url = new URL(request.url);
       if (url.pathname === '/__test/is-share-path') return Response.json(JSON.parse(url.searchParams.get('paths')).map(isSharePath));
       if (url.pathname === '/__test/tokens') return Response.json(Array.from({ length: 50 }, newShareToken));
+      if (url.pathname === '/__test/purge') return purgeDeletedCaptures(env).then(removed => Response.json(removed)); // S7
       if (url.pathname.startsWith('/api/')) return handleApi(request, env, ctx);
       if (isSharePath(url.pathname)) {
         // workerd always fills in CF-Connecting-IP (127.0.0.1 locally); this test-only header removes it,
@@ -317,6 +318,26 @@ test('deleting a capture cascades to its links (D1 enforces the foreign key)', a
   await db.prepare('DELETE FROM captures WHERE id=?').bind(id).run();
   assert.equal((await db.prepare('SELECT COUNT(*) AS n FROM shares WHERE capture_id=?').bind(id).first()).n, 0);
   assert.equal((await pub(`/s/${token}/info`)).status, 404);
+});
+
+// S7: the owner's DELETE (spec §7.10) ends every link at once; the purge then removes the rows.
+test('an owner DELETE ends its links at once, and the purge removes them with the capture', async () => {
+  const id = await readyCapture();
+  const { token } = await createShare(id, { allow_download: true });
+  await createShare(id);
+  const routes = t => [`/s/${t}`, `/s/${t}/embed`, `/s/${t}/info`, `/s/${t}/scene`, `/s/${t}/download`];
+  for (const path of routes(token)) assert.equal((await pub(path)).status, 200, path);
+  assert.equal((await api(`captures/${id}`, { method: 'DELETE' })).status, 200);
+  for (const path of routes(token)) assert.equal((await pub(path)).status, 404, path);
+  assert.equal((await api(`captures/${id}/shares`)).status, 404, "the owner's list is gone too");
+  // Past the grace window, the purge empties the prefix and deletes the row; the FK takes the links.
+  await db.prepare("UPDATE captures SET updated_at=? WHERE id=? AND status='deleting'").bind(Date.now() - 61 * 60_000, id).run();
+  for (let run = 0; run < 3 && (await db.prepare('SELECT COUNT(*) AS n FROM captures WHERE id=?').bind(id).first()).n; run++) {
+    await (await pub('/__test/purge')).json();
+  }
+  assert.equal((await db.prepare('SELECT COUNT(*) AS n FROM captures WHERE id=?').bind(id).first()).n, 0);
+  assert.equal((await db.prepare('SELECT COUNT(*) AS n FROM shares WHERE capture_id=?').bind(id).first()).n, 0);
+  assert.equal((await bucket.list({ prefix: `${id}/` })).objects.length, 0);
 });
 
 test('every spelling of /s is routed through the token check', async () => {

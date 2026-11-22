@@ -20,7 +20,17 @@ async function worker(path, method, data, lease) {
 }
 let script;
 before(async () => {
-  const result = await build({ stdin: { contents: `import {handleApi, handleScheduled, purgeDeletedCaptures} from "./worker/api.ts";
+  const result = await build({ stdin: { contents: `import {handleApi, handleScheduled, purgeDeletedCaptures, sweepOrphanedPrefixes} from "./worker/api.ts";
+    // "x-test-hold-put: 1" pauses this request's R2 put until /__test/release (an R2 write that completes
+    // late); /__test/reached says whether the put has been called. Shared flags polled with timers, since
+    // a promise cannot be resolved from another request.
+    let gate = null;
+    const holding = bucket => new Proxy(bucket, { get: (t, key) => key === 'put' ? async (...args) => {
+      const mine = gate;
+      mine.reached = true;
+      while (!mine.released) await new Promise(resolve => setTimeout(resolve, 5));
+      return t.put(...args);
+    } : t[key].bind(t) });
     // Test-only: "x-test-r2-page: N" (or ?page=N) makes R2 list return at most N keys per page, so a
     // capture of a few hundred objects needs more calls than one request or cron run may make.
     const paged = (bucket, n) => new Proxy(bucket, { get: (target, key) => key === 'list' ? options => target.list({ ...options, limit: Math.min(options?.limit ?? 1000, n) }) : target[key].bind(target) });
@@ -41,6 +51,15 @@ before(async () => {
       let scoped = page ? { ...env, BUCKET: paged(env.BUCKET, page) } : env;
       if (fail.includes('batch')) scoped = { ...scoped, DB: broken(scoped.DB, 'batch', 'D1 batch') };
       if (fail.includes('delete')) scoped = { ...scoped, BUCKET: broken(scoped.BUCKET, 'delete', 'R2 delete') };
+      if (request.headers.has('x-test-hold-put')) { gate = { reached: false, released: false }; scoped = { ...scoped, BUCKET: holding(scoped.BUCKET) }; }
+      if (url.pathname === '/__test/reached') return new Response(String(gate?.reached ?? false));
+      if (url.pathname === '/__test/release') { gate.released = true; return new Response('released'); }
+      // ?start= positions the sweep's listing; ?age= shifts its clock forward (ms) to age the objects.
+      if (url.pathname === '/__test/sweep') {
+        const ops = { count: 0 };
+        const options = { start: url.searchParams.get('start') ?? undefined, now: Date.now() + Number(url.searchParams.get('age') || 0) };
+        return sweepOrphanedPrefixes(counting(scoped, ops), options).then(deleted => Response.json({ deleted, ops: ops.count }));
+      }
       if (url.pathname === '/__test/purge') {
         const ops = { count: 0 };
         return purgeDeletedCaptures(counting(scoped, ops)).then(removed => Response.json({ removed, ops: ops.count }));
@@ -357,4 +376,65 @@ test('a rejected result PUT deletes its own object even when its attempt holds m
   assert.equal((await late.response).status, 409);
   assert.deepEqual((await listKeys(`${dir}/`)).filter(key => key.startsWith(`${dir}/result.`)), [], 'its own object went by name');
   assert.equal(await status(capture.id), 'failed');
+});
+
+// S7 round 3: the orphan sweep (spec §7.10), the backstop that makes I7 hold whatever R2's write latency.
+const sweep = async (start, age = 0) => (await mf.dispatchFetch(`http://localhost/__test/sweep?start=${encodeURIComponent(start)}&age=${age}`)).json();
+const OLD = 61 * 60_000; // past ORPHAN_MIN_AGE_MS (1 hour)
+const SWEEP_BUDGET = 5; // ORPHAN_SWEEP_SUBREQUESTS
+
+test('the orphan sweep deletes old objects under prefixes with no capture row, and nothing else', async () => {
+  const bucket = await mf.getR2Bucket('BUCKET');
+  // Ids at the top of the key space, so a listing that starts after "fffffff0" reaches them first.
+  const orphans = [1, 2].map(n => `fffffff0-0000-4000-8000-00000000000${n}`);
+  for (const id of orphans) await Promise.all([bucket.put(`${id}/uploads/a/1`, 'x'), bucket.put(`${id}/attempts/b/result.c.ply`, 'x')]);
+  // Prefixes whose rows exist are never touched, in any state: a ready capture, and a tombstone that
+  // (like a late writer's leftovers) still has an object.
+  const { capture: ready } = await readyCapture('Kept, ready');
+  const readyKeys = await listKeys(`${ready.id}/`);
+  assert.ok(readyKeys.length > 0);
+  const gone = await createCapture('Kept, tombstone');
+  assert.equal((await request(`captures/${gone.id}`, 'DELETE')).status, 200);
+  await bucket.put(`${gone.id}/uploads/late/1`, 'x');
+
+  // Younger than the safety age: kept. Listing, wrap-around listing, lookup, then the first orphan's
+  // listing; the budget leaves no room to list the second.
+  assert.deepEqual(await sweep('fffffff0'), { deleted: 0, ops: 4 });
+  for (const id of orphans) assert.equal((await listKeys(`${id}/`)).length, 2);
+
+  // Old enough: one orphan per run within the budget of 5 calls; the next run takes the next one.
+  assert.deepEqual(await sweep('fffffff0', OLD), { deleted: 2, ops: SWEEP_BUDGET });
+  assert.deepEqual(await listKeys(`${orphans[0]}/`), []);
+  assert.equal((await listKeys(`${orphans[1]}/`)).length, 2, 'the budget stopped the run after one orphan');
+  assert.deepEqual(await sweep('fffffff0', OLD), { deleted: 2, ops: SWEEP_BUDGET });
+  assert.deepEqual(await listKeys(`${orphans[1]}/`), []);
+
+  // A run from anywhere in the key space wraps around and stays within budget; rows keep their objects.
+  for (const start of ['0', '8', 'fffffff0', crypto.randomUUID()]) assert.ok((await sweep(start, OLD)).ops <= SWEEP_BUDGET);
+  assert.deepEqual(await listKeys(`${ready.id}/`), readyKeys);
+  assert.deepEqual(await listKeys(`${gone.id}/`), [`${gone.id}/uploads/late/1`]);
+  await tombstone(gone.id);
+  // The cron as a whole stays within its budget with the sweep in it (1 lease sweep + 40).
+  await cron();
+});
+
+test('a writer whose R2 put completes after the tombstone was removed is cleaned up by the orphan sweep (I7)', async () => {
+  const capture = await createCapture('Very late writer');
+  const target = capture.images[0];
+  // Admitted while uploading; its R2 put is called and then takes longer than the whole grace window.
+  const late = request(`captures/${capture.id}/images/${target.id}`, 'PUT', png, { 'x-test-hold-put': '1', 'x-test-fail': 'batch,delete' });
+  while (await (await mf.dispatchFetch('http://localhost/__test/reached')).text() !== 'true') await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal((await request(`captures/${capture.id}`, 'DELETE')).status, 200);
+  await pastGrace(capture.id);
+  await purgeRun(1000);
+  assert.deepEqual(await rows(capture.id), { capture: 0, images: 0 }, 'the tombstone is gone');
+  // Now R2 completes the write; the commit and the writer's own cleanup both fail.
+  await (await mf.dispatchFetch('http://localhost/__test/release')).text();
+  assert.equal((await late).status, 500);
+  assert.equal((await listKeys(`${capture.id}/`)).length, 1, 'an object with no row');
+  // Starting the listing at the id makes `{id}/` the first prefix it reaches.
+  assert.equal((await sweep(capture.id)).deleted, 0, 'kept until it is older than the safety age');
+  assert.equal((await listKeys(`${capture.id}/`)).length, 1);
+  assert.equal((await sweep(capture.id, OLD)).deleted, 1);
+  assert.deepEqual(await listKeys(`${capture.id}/`), []);
 });

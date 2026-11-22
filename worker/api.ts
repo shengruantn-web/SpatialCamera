@@ -63,10 +63,13 @@ export async function handleScheduled(env: Pick<ApiEnv, "DB" | "BUCKET">) {
   await sweepStaleLeases(env.DB);
   if (!env.BUCKET) return;
   // S7: deletions first, within their own share of the run's subrequests; the attempt collection gets
-  // the rest, so the run as a whole still makes at most 1 + GC_SUBREQUESTS_PER_RUN calls.
+  // the rest less the orphan sweep's fixed share, so the run as a whole still makes at most
+  // 1 + GC_SUBREQUESTS_PER_RUN calls (§7.10).
   const purge = { left: PURGE_SUBREQUESTS_PER_RUN };
   await purgeDeletedCaptures(env, { budget: purge }).catch(error => console.error("Capture deletion run failed", error));
-  await collectAttemptGarbage(env, { budget: { left: GC_SUBREQUESTS_PER_RUN - (PURGE_SUBREQUESTS_PER_RUN - purge.left) } });
+  await collectAttemptGarbage(env, { budget: { left: GC_SUBREQUESTS_PER_RUN - ORPHAN_SWEEP_SUBREQUESTS - (PURGE_SUBREQUESTS_PER_RUN - purge.left) } })
+    .catch(error => console.error("Attempt collection run failed", error)); // S7: the orphan sweep still runs
+  await sweepOrphanedPrefixes(env).catch(error => console.error("Orphan sweep failed", error)); // S7
 }
 
 /** Leases are bearer secrets, so R2 keys carry a digest of the lease rather than the lease itself. */
@@ -251,6 +254,51 @@ export async function purgeDeletedCaptures(env: Pick<ApiEnv, "DB" | "BUCKET">, {
     }
   }
   return removed;
+}
+/**
+ * S7 backstop for I7: R2 gives no bound on how long a put may take to complete, so a writer can store an
+ * object after its capture's tombstone was removed, and if its commit and its own cleanup both fail the
+ * object has no row. A capture row is always inserted before any object under `{id}/` is written and an
+ * id is never reused, so a prefix with no row only exists after a deletion. Each cron run lists up to
+ * ORPHAN_PREFIXES_PER_RUN top-level prefixes from a random point in the key space (wrapping to the start),
+ * looks them up in one D1 query, and deletes the objects older than ORPHAN_MIN_AGE_MS under prefixes with
+ * no row. A prefix whose row exists, in any status, is never touched (a tombstone is the purge's job).
+ */
+export const ORPHAN_SWEEP_SUBREQUESTS = 5; // list + wrap-around list + lookup + one orphan's list and delete
+export const ORPHAN_MIN_AGE_MS = PURGE_GRACE_MS;
+const ORPHAN_PREFIXES_PER_RUN = 1000; // R2's list limit; the lookup binds them as one JSON parameter
+const CAPTURE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+export async function sweepOrphanedPrefixes(env: Pick<ApiEnv, "DB" | "BUCKET">,
+  { budget = { left: ORPHAN_SWEEP_SUBREQUESTS }, start = crypto.randomUUID(), now = Date.now() }: { budget?: Budget; start?: string; now?: number } = {}) {
+  let deleted = 0;
+  if (budget.left < 4) return deleted; // a listing, the lookup, and one prefix's list and delete
+  spend(budget);
+  const first = await env.BUCKET.list({ delimiter: "/", startAfter: start, limit: ORPHAN_PREFIXES_PER_RUN });
+  const prefixes = new Set(first.delimitedPrefixes);
+  if (!first.truncated && prefixes.size < ORPHAN_PREFIXES_PER_RUN && budget.left >= 4) {
+    spend(budget); // reached the end of the key space: carry on from the start, up to `start`
+    const wrapped = await env.BUCKET.list({ delimiter: "/", limit: ORPHAN_PREFIXES_PER_RUN - prefixes.size });
+    for (const prefix of wrapped.delimitedPrefixes) if (prefix <= start) prefixes.add(prefix);
+  }
+  const ids = [...prefixes].map(prefix => prefix.slice(0, -1)).filter(id => CAPTURE_ID.test(id));
+  if (!ids.length || budget.left < 3) return deleted;
+  spend(budget);
+  const { results } = await env.DB.prepare("SELECT id FROM captures WHERE id IN (SELECT value FROM json_each(?))")
+    .bind(JSON.stringify(ids)).all<{ id: string }>();
+  const known = new Set(results.map(row => row.id));
+  for (const id of ids) {
+    if (known.has(id)) continue;
+    if (budget.left < 2) break;
+    spend(budget);
+    const listing = await env.BUCKET.list({ prefix: `${id}/`, limit: PURGE_LIST_LIMIT });
+    const doomed = listing.objects.filter(object => now - object.uploaded.getTime() > ORPHAN_MIN_AGE_MS).map(object => object.key);
+    if (!doomed.length) continue;
+    spend(budget);
+    await env.BUCKET.delete(doomed);
+    console.warn("Deleted objects with no capture row", id, doomed.length);
+    deleted += doomed.length;
+  }
+  return deleted;
 }
 /** A writer stored `key` and now commits it: if the commit throws, the object goes with it (§7.10). */
 async function committing<T>(bucket: R2Bucket, key: string, commit: () => Promise<T>) {
