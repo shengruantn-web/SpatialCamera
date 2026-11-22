@@ -1,4 +1,4 @@
-// S7: rename, delete and retention (spec §7.9). Own Miniflare instance, same harness as api.test.mjs.
+// S7: rename, delete and retention (spec §7.10). Own Miniflare instance, same harness as api.test.mjs.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';

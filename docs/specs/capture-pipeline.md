@@ -1,6 +1,6 @@
 # Spec: Capture state machine and worker protocol
 
-**Status**: draft — documents behaviour at commit `5d136af` plus the Brush backend, updated for shipment S2 (API integrity + hot path: T2, T3, T6, T7 and the API half of T1) S5 (SPZ delivery, §7.6) and S7 (rename, delete and retention, §7.9). §5 lists known defects; §6 lists the target changes; §7 describes storage and concurrency as implemented.
+**Status**: draft — documents behaviour at commit `5d136af` plus the Brush backend, updated for shipment S2 (API integrity + hot path: T2, T3, T6, T7 and the API half of T1), S5 (SPZ delivery, §7.6), S8 (share links and embeds, §7.9) and S7 (rename, delete and retention, §7.10). §5 lists known defects; §6 lists the target changes; §7 describes storage and concurrency as implemented.
 **Related**: PRD R2–R3, ADR-0001, ADR-0003, ADR-0005, ADR-0007
 
 ## 1. Capture states
@@ -12,7 +12,7 @@ uploading ──submit──▶ queued ──claim──▶ aligning ──▶ t
     │                                      ▲   (worker reports failure, or no update for 10 min)
     └── (new capture)
 
-uploading / queued / ready / failed ──owner DELETE──▶ deleting ──purge, then grace──▶ (rows removed)     [S7, §7.9]
+uploading / queued / ready / failed ──owner DELETE──▶ deleting ──purge, then grace──▶ (rows removed)     [S7, §7.10]
 ```
 
 | State | Entered when | Left when |
@@ -22,7 +22,7 @@ uploading / queued / ready / failed ──owner DELETE──▶ deleting ──p
 | `aligning` / `training` / `exporting` | Worker claim / `PATCH status` (forward by exactly one step, or same step as heartbeat) | Next stage, `failed`, or lease expiry |
 | `ready` | Worker `PUT result` while `exporting` with a valid lease; the same conditional UPDATE sets `result_key` and, if the attempt stored an SPZ, `spz_bytes` | Terminal |
 | `failed` | Worker reports `failed`, or `updated_at` older than 10 min in an active state (lease expiry, see §7.4) | Owner resubmits |
-| `deleting` (S7) | Owner `DELETE` on a capture with no live lease (`uploading`, `queued`, `ready`, `failed`) | Its objects are purged by the same request or by the cron; the row stays as a tombstone for `PURGE_GRACE_MS` (1 h) and is removed by the cron after a final empty listing (§7.9). Hidden from the owner (404 everywhere), never claimed, resubmitted, renamed or uploaded to |
+| `deleting` (S7) | Owner `DELETE` on a capture with no live lease (`uploading`, `queued`, `ready`, `failed`) | Its objects are purged by the same request or by the cron; the row stays as a tombstone for `PURGE_GRACE_MS` (1 h) and is removed by the cron after a final empty listing (§7.10). Hidden from the owner (404 everywhere), never claimed, resubmitted, renamed or uploaded to |
 
 Each transition records its entry time in `queued_at`, `aligning_at`, `training_at`, `exporting_at`, `ready_at` or `failed_at` (ms). A same-stage heartbeat does not move the timestamp. Resubmitting resets `aligning_at`…`failed_at` and `alignment_ratio`, so the columns always describe the current attempt (PRD X2).
 
@@ -33,7 +33,7 @@ Invariants:
 - I4. Progress shown to the user is derived only from these states (ADR-0005).
 - I5. From submit onwards, the image objects a capture references (`images.object_key`) never change (§7.2).
 - I6. The published result object is written only by the attempt that published it; a stale or losing attempt can never overwrite it (§7.3).
-- I7. (S7) A capture's row outlives its objects: the `captures` row is removed only after a listing of `{id}/` that started more than `PURGE_GRACE_MS` after the flip to `deleting` came back empty. No request admitted before the flip can store after `REQUEST_DEADLINE_MS`, so no object can appear under `{id}/` after the row is gone. No write stored after the flip is ever committed (§7.9).
+- I7. (S7) A capture's row outlives its objects: the `captures` row is removed only after a listing of `{id}/` that started more than `PURGE_GRACE_MS` after the flip to `deleting` came back empty. No request admitted before the flip can store after `REQUEST_DEADLINE_MS`, so no object can appear under `{id}/` after the row is gone. No write stored after the flip is ever committed (§7.10).
 
 ## 2. Owner API (browser)
 
@@ -50,7 +50,21 @@ All routes require the `oai-authenticated-user-email` header (or `LOCAL_DEV` on 
 | GET | `/api/captures/:id/scene?v=<ready_at>` | What the viewer loads when `ready`: the SPZ if the attempt published one, otherwise the PLY. `X-Splat-Format: spz\|ply`. Cached `private, max-age=31536000, immutable` only when `v` equals the capture's `ready_at` (a resubmit changes it, so the URL changes); otherwise `private, no-store` (§7.6) |
 | GET | `/api/captures/:id/result.ply[?download]` | The PLY archive (full precision) when `ready`, read from `result_key`; `?download` adds `Content-Disposition: attachment` |
 | PATCH | `/api/captures/:id` | (S7) Rename: `{ name }`, trimmed, 1–80 characters (the create rule, `validateName`), else 400 → `{ capture }`. Any state but `deleting`; `updated_at` is not changed (it is the lease clock) |
-| DELETE | `/api/captures/:id` | (S7) Delete the capture, its photos and its results (§7.9). 409 while `aligning`/`training`/`exporting` hold a live lease; 200 `{ deleted: true }` once every object is gone (the hidden tombstone row stays until the grace window ends); 202 `{ deleted: true, pending: true }` when the cron finishes a large capture (it is already hidden) |
+| DELETE | `/api/captures/:id` | (S7) Delete the capture, its photos and its results (§7.10). 409 while `aligning`/`training`/`exporting` hold a live lease; 200 `{ deleted: true }` once every object is gone (the hidden tombstone row stays until the grace window ends); 202 `{ deleted: true, pending: true }` when the cron finishes a large capture (it is already hidden) |
+| GET | `/api/captures/:id/shares` | S8: the capture's share links, newest first (at most 100): `{ id, created_at, revoked_at, views, allow_download }`. Never a token or its hash (§7.9) |
+| POST | `/api/captures/:id/shares` | S8: create a link `{ allow_download?: boolean }` → 201 `{ share, token, path }`. The only response that ever contains the token. 409 unless `ready`, or when the capture already has 20 active links |
+| PATCH | `/api/captures/:id/shares/:shareId` | S8: `{ allow_download: boolean }` → `{ share }`; 409 if the link is revoked |
+| POST | `/api/captures/:id/shares/:shareId/revoke` | S8: revoke → `{ share }`. Idempotent; the first `revoked_at` is kept |
+
+S8 public share routes (ADR-0010, §7.9). These carry no gateway identity: the token in the path is the only credential. A revoked, unknown or malformed token, or a capture that is not `ready`, gets the same 404 on every route. Only `GET` and `HEAD`; rate-limited per client IP.
+
+| Method | Route | Purpose |
+|---|---|---|
+| GET | `/s/:token` | Read-only viewer page. Counts a view. Cannot be framed |
+| GET | `/s/:token/embed` | The viewer alone, for an `<iframe>` on any site. Counts a view |
+| GET | `/s/:token/info` | `{ name, format, scene_bytes, download, download_bytes }` for those pages |
+| GET | `/s/:token/scene` | The SPZ, or the PLY only when the capture has no SPZ. `X-Splat-Format: spz\|ply`; `private, no-cache` + ETag |
+| GET | `/s/:token/download` | The PLY as an attachment, only when the owner allowed downloads on this link; otherwise 404 |
 
 ## 3. Worker API
 
@@ -71,6 +85,8 @@ Any job request whose lease is stale (`updated_at` older than 10 min) expires th
 Worker behaviour: heartbeat every 25 s, kept running through the result upload; stage timeout 2 h; poll every 10 s when idle; abort the stage after 5 consecutive heartbeat failures or any 401/403/409. Since S1:
 
 - Each stage runs in its own session/process group (`start_new_session=True`); stop, timeout or worker exit terminates the whole group (`os.killpg` SIGTERM, then SIGKILL after 10 s), so COLMAP/Brush grandchildren cannot survive. SIGTERM/SIGHUP are deferred while a stage's group is live and raised only at safe points (poll sleep, or after the group is reaped), so a signal can't orphan a stage or deadlock `Popen`'s wait lock.
+- On macOS, a separate `caffeinate -i -w <worker pid>` child prevents idle sleep from claim processing through upload and cleanup. It is terminated and reaped on completion, failure, stop, lease loss or timeout; spawn/cleanup defer signals at unsafe points. Missing caffeinate logs once per worker and does not fail jobs. The child is outside stage process groups, and `-w` also releases its assertion if the worker dies.
+- On the aligning → training PATCH, both backends send `metrics: { alignment_ratio: registered / input_count }`. Brush reads the selected reconstruction’s `registered` count from `alignment.json`; Nerfstudio counts registered `frames` in `transforms.json` from `ns-process-data`. The denominator is all downloaded input images, including any Brush skips as unreadable. Later heartbeats omit metrics, retaining the stored ratio (§7.5).
 - The PLY is validated in full before upload: header, vertex count × stride equals the payload length, and finite x/y/z.
 - The result upload is streamed and retried with backoff (5, 15, 45, 120 s) on network errors, 429 and 5xx (the server returns 503 for transient failures). A 2xx PUT wins over a concurrent heartbeat 409. If an attempt's outcome is unknown (timeout mid-response), one confirming PUT is sent; the server's idempotent finalisation makes that safe.
 - Since S5, after validation the worker converts the PLY to SPZ (`gpu-worker/spz.py`, numpy) and uploads it to `result.spz` (same backoff, but only the first two retries, since the PLY alone is still a complete delivery), then uploads the PLY to `result`. SPZ is best effort: a conversion error (including missing numpy), an SPZ over 48 MB, or any SPZ upload failure other than a lost lease (e.g. 404 from a server that predates SPZ, or a 400 rejection) is logged and the job delivers the PLY alone. Workers that predate S5 never call `result.spz` and keep working unchanged.
@@ -88,10 +104,10 @@ Mac backend notes (S4; measured in `docs/plan/runs/2026-11-22-mac-dryrun.md` and
 - **Frames.** Brush writes the PLY in the COLMAP world frame unchanged. COLMAP's frame is arbitrary (usually the first camera's: up = −Y), but the viewer rotates server results by −π/2 about X, which assumes Nerfstudio's Z-up. `mac_pipeline.py` therefore rotates the sparse model before undistortion so world up is +Z (D7). The rows of `cam_from_world` are the camera's right, down and forward axes. Methods, in order: (1) `camera-right`: photos are held without roll, so each camera's right axis is horizontal whatever its pitch; up is the smallest singular vector of the stacked right axes, signed to agree with the mean camera up. It needs the right axes to span a plane (cameras facing more than one way) and to lie close to it (thinnest singular value < 30% of the middle one, i.e. consistent rolls). (2) `camera-up`: the normalised mean camera up, if |mean| ≥ 0.5. This is biased by the mean pitch on paths that are not a closed orbit (about 20° for a half arc pitched 30° down), so it is only the fallback for sets where every camera faces the same way. (3) `centre-plane`: the normal of the plane through the camera centres, signed by the mean up (rolls disagree, e.g. mixed sideways shots). Otherwise the model is left unrotated and the alignment log warns. The method and tilt are recorded in `alignment.json`. On the South Building set (a near-full orbit looking up about 16°) `camera-right` and the earlier mean-up estimate differ by 1.9°.
 - **EXIF orientation.** COLMAP ignores the orientation tag. Photos with orientation ≠ 1 are re-encoded upright (JPEG q95, source chroma subsampling kept) with the tag removed and other EXIF kept for the focal-length prior (including FocalLengthIn35mmFilm); upright photos are hard-linked unchanged. `images/` is cleared first. Files Pillow cannot open are skipped with a warning and counted in `alignment.json` (`skipped`). Because COLMAP groups images into cameras by image size and EXIF focal length, a mixed portrait/landscape set now produces two COLMAP cameras (expected; not yet exercised end to end with Brush).
 - **Matching.** Exhaustive matching is O(n²). Up to 100 photos it is used directly (64 photos: 156 s at 8 threads). Above that, sequential matching (overlap 20, quadratic) runs in upload order, with an exhaustive retry if fewer than 90% of photos register. The retry maps into `sparse-exhaustive/`, and whichever model registered more photos is kept (`alignment.json`: `matcher`, `retry_registered`). Above 300 photos the retry is skipped, because quadratic matching would outlast the job. Threads default to `os.cpu_count()`; override with `SPATIAL_COLMAP_THREADS`.
-- **Working directory.** Brush writes a Burn autotune cache to `<cwd>/target/`; `/target/` is gitignored. Running Brush with its cwd in the job's temp dir (worker.py) is deferred until after S5.
+- **Working directory.** Brush runs with `cwd` set to the job’s absolute temporary directory. Dataset and export paths are absolute; its Burn autotune cache (`<cwd>/target/`) is removed with the job, rather than written under the worker’s launch directory.
+- **Signal isolation.** The Brush startup check uses `importlib.util.find_spec("pycolmap")` without importing the module, which installs its own SIGTERM handler. `mac_pipeline.py` runs in a stage subprocess and imports pycolmap lazily inside stage functions; the worker process retains its own handlers.
 - **Setup.** `setup_mac.py` checks an existing `brush_app` against the pinned sha256 and reinstalls on mismatch, and always sets `.dev.vars` to mode 0600. A new token is written to a 0600 temp file in the same directory and moved into place with `os.replace`, so an existing 0644 file never holds it. The Brush archive is deleted on every path (including an interrupted download), and the extracted files are removed if `brush_app` fails its checksum.
-- **Sleep.** macOS idle sleep suspends the worker and its heartbeat. A sleep longer than `LEASE_TTL_MS` (10 min) expires the lease. The S4 e2e first attempt failed this way after 17 min asleep mid-training. Run the worker under `caffeinate -i` (README). Proposed for worker.py: hold a sleep assertion while a job is active.
-- **Signals (open, worker.py).** The preflight `import pycolmap` in `worker.py` `main()` runs after `EXIT_SIGNALS.install()`. pycolmap's glog then installs its failure handler for SIGTERM at the C level, replacing the worker's handler. A `kill`/SIGTERM to a brush worker aborts it with a glog stack trace instead of the graceful path, which stops the stage's process group and reports failure. During a job that can orphan `brush_app`. SIGINT (Ctrl-C) is unaffected. Fix: check with `importlib.util.find_spec("pycolmap")` instead of importing it, or install the signal handlers after the import.
+- **Sleep.** macOS idle sleep suspends the worker and its heartbeat. A sleep longer than `LEASE_TTL_MS` (10 min) expires the lease. The S4 e2e first attempt failed this way after 17 min asleep mid-training. The worker now holds a per-job caffeinate idle-sleep assertion (§3), replacing the README’s manual wrapper. Forced sleep still suspends heartbeats.
 
 ## 5. Known defects (2026-11-16 review)
 
@@ -115,7 +131,7 @@ Mac backend notes (S4; measured in `docs/plan/runs/2026-11-22-mac-dryrun.md` and
 - **T4 (D5)** Start stage processes with `start_new_session=True`; terminate with `os.killpg`.
 - **T5 (D6)** Worker validates vertex count × stride == payload length and finite values before upload.
 - **T6 (D8)** DDL moves to Drizzle migrations; stale-lease sweep moves to a Cron Trigger; add indexes `images(capture_id,uploaded)`, `captures(owner,created_at)`, `captures(status,created_at)`, `captures(status,updated_at)`. *Done in S2* (migration `0001_api_integrity_hot_path`; §7.4–7.5).
-- **T7** Record per-stage timestamps and alignment ratio on the capture row (PRD X2). *Done in S2 (server side)*: columns and the optional `metrics.alignment_ratio` PATCH field (§3). Sending it is worker work.
+- **T7** Record per-stage timestamps and alignment ratio on the capture row (PRD X2). *Done in S2 (server side)*: columns and the optional `metrics.alignment_ratio` PATCH field (§3). The worker now sends it on the transition to training for both backends (§3).
 - **T1 (server half)** *Done in S2*: repeated `PUT result` from the publishing lease returns 200.
 
 ## 7. Storage and concurrency (as of S5)
@@ -171,6 +187,8 @@ The API runs no DDL. The schema lives in `db/schema.ts`; `npm run db:generate` e
 
 Migrations are schema-only, as the host requires: no `UPDATE` backfills or seed data, and an added column's default is a constant. The code is correct on un-backfilled legacy rows instead: a NULL `result_key` on a `ready` row reads `{id}/result.ply` (§7.1); `uploaded_count` is recounted on every image upload (§7.2) and reported as `image_count` once past `uploading`; and the sweep clears leftover leases (§7.4). `uploaded_count` is maintained on upload, so list and detail reads need no per-row COUNT. Migration `0002_spz_result` (S5) adds the nullable `captures.spz_bytes`; existing rows read NULL, meaning "PLY only", which is exactly what they are. Migration `0003_attempt_keys_gc` (S5 review) adds the nullable `captures.spz_key` (NULL on older rows, which then read the SPZ beside their PLY, §7.1), `gc_pending` (integer, default 0) and the index `captures_gc_pending_idx (gc_pending, updated_at)`. Rows that predate it are never marked, so their leftover attempts, if any, stay until a later claim of the same capture.
 
+The worker’s alignment ratio is persisted by the status PATCH using `alignment_ratio=COALESCE(?,alignment_ratio)`. The training transition supplies it for both backends; heartbeat and exporting requests omit it and preserve the value. A new submission clears it (§3).
+
 ### 7.6 SPZ delivery (S5, ADR-0007)
 
 **Format.** The worker writes the gzip "legacy" SPZ container that Spark and Niantic's reference library read, version 3 by default (v2 supported). It starts with a 16-byte little-endian header `<IIIBBBB>`: magic `NGSP` (0x5053474e), version, point count, SH degree, fractional bits, flags (0), reserved (0). Then come the attribute streams: 24-bit fixed-point positions (12 fractional bits, fewer for scenes too large to fit), 8-bit opacity, 8-bit colour (scale 0.15), 8-bit log scale (stored range −10…5.94), rotation (v3 smallest-three in 32 bits: a 2-bit index plus three signed 9-bit components; v2 three bytes, w rebuilt) and SH coefficients (degree 1 keeps 5 bits, higher degrees 4). Quantisation follows the reference encoder (`packGaussians`). On the S4 Brush scene the SPZ is 7.1× smaller than the PLY (35.5 MB → 5.0 MB; [run log](../plan/runs/2026-11-22-s5-spz-size.md)).
@@ -195,7 +213,7 @@ Per-request keys (§7.1) mean an attempt that dies between its SPZ and its PLY, 
 
 - **Marking.** Every claim sets `captures.gc_pending = 1` in the same UPDATE that hands out the lease, so any capture that ever had an attempt is marked. The column is 0 when clean, otherwise 1 plus the number of failed collections (it stays truthy wherever it is read as a flag).
 - **When.** A successful `result` PUT collects its own capture immediately after publishing (§7.3 step 5). The 5-minute Cron Trigger (`handleScheduled`) runs the lease sweep and then `collectAttemptGarbage`, which takes up to 10 marked captures in a terminal state (`ready` or `failed`) ordered by `gc_pending, updated_at` (those that never failed first, then oldest), using `captures_gc_pending_idx`. Captures still in flight are not touched.
-- **Budget.** Every D1 query and R2 call counts against a subrequest budget per run, shared across captures: 40 for the cron, less what that run's deletions used (Workers Free allows 50 per invocation; the sweep uses 1; §7.9) and 12 for the collection inline after a publish, which has already used about 8. A capture is started only with at least 5 left (its row read, a list, a delete, the mark update, one to record a failure), and another page is listed only with at least 4 left. When the budget runs out part-way, the capture keeps its mark and the next cron tick carries on where the listing left off, since what was deleted is gone.
+- **Budget.** Every D1 query and R2 call counts against a subrequest budget per run, shared across captures: 40 for the cron, less what that run's deletions used (Workers Free allows 50 per invocation; the sweep uses 1; §7.10) and 12 for the collection inline after a publish, which has already used about 8. A capture is started only with at least 5 left (its row read, a list, a delete, the mark update, one to record a failure), and another page is listed only with at least 4 left. When the budget runs out part-way, the capture keeps its mark and the next cron tick carries on where the listing left off, since what was deleted is gone.
 - **What.** Everything under `{id}/attempts/` is deleted except, for a `ready` capture, the published `result_key` and SPZ. For a `failed` capture, objects uploaded after its `updated_at` are kept, because the owner may have resubmitted and a new attempt may be uploading; that attempt's own checks (§7.3 step 4) or a later collection remove them. R2 is listed 100 keys per page, at most 5 pages per capture per run.
 - **Clearing the mark.** Only when the listing is exhausted, with `UPDATE captures SET gc_pending=0 WHERE id=? AND status=? AND updated_at=?`. If the row changed meanwhile (resubmitted, claimed again), the mark stays and a later run looks again. A capture with more than 500 leftover keys keeps its mark and is finished over several runs.
 - **Errors** are logged per capture and never fail the publish or the cron. A collection that throws (R2 or D1 unavailable) records `gc_pending = gc_pending + 1`, so the capture sinks behind the others instead of filling every batch. After 5 failures (`gc_pending` reaches 6) it is no longer selected, a "gave up" line names its `attempts/` prefix for manual cleanup, and its mark stays truthy. A new claim resets it to 1; a successful collection clears it to 0.
@@ -206,7 +224,64 @@ Image uploads (§7.2) are not covered here: they replace their predecessor in th
 
 - Full SPZ inflation on upload (§7.6) and attempt collection assume Workers Paid CPU and subrequest limits: inflating a multi-megabyte SPZ can exceed Workers Free's 10 ms of CPU, and the budgets above fit in 50 subrequests with little to spare. Drain the job queue before deploying migration 0003: a capture that was `exporting` with a legacy fixed `attempts/{attempt}/result.spz` when 0003 ships publishes its PLY only, and that `.spz` is orphaned, since its claim predates `gc_pending` and nothing marks the capture for collection.
 
-### 7.9 Capture deletion and retention (S7, PRD R5.3)
+### 7.9 Share links and embeds (S8, ADR-0010, PRD R5.4)
+
+**Schema.** Migration `0004_share_links` adds `shares`: `id` (UUID, primary key), `capture_id` (FK → `captures.id`, `ON DELETE CASCADE`, so deleting a capture deletes its links), `token_hash` (text, unique index `shares_token_hash_idx`), `created_at`, `revoked_at` (nullable), `views` (integer, default 0) and `allow_download` (integer, default 0: the PLY download is opt-in per link). The index `shares_capture_created_idx (capture_id, created_at)` serves the owner's list. It is schema-only, like every migration (§7.5).
+
+**Tokens.** A token is 16 bytes from `crypto.getRandomValues`, base64url without padding (22 characters). Only its SHA-256 (lowercase hex) is stored. The token is returned once, by the create call, and the Share panel shows it once with a warning; it cannot be shown again, so a lost link is replaced by creating another. Each public request checks the shape (`^[A-Za-z0-9_-]{22}$`), hashes the token and looks it up through the unique index (no table scan; a test checks the query plan). A plain hash is enough: the input has 128 bits of entropy, so there is nothing for a slow hash or salt to protect. A capture can have at most 20 active links, and links can be created only for a `ready` capture. Both rules are in the INSERT itself (`INSERT … SELECT … WHERE EXISTS (ready capture) AND (SELECT COUNT(*) FROM shares WHERE capture_id=? AND revoked_at IS NULL) < 20`), so concurrent creates cannot overshoot the cap: a test fires 25 at once and gets exactly 20 links and 5 × 409. When nothing is inserted the handler re-reads the capture only to pick the 409 message.
+
+**Owner routes** (§2) run inside `handleApi` after it has loaded the capture for the signed-in owner and rejected cross-origin mutations, so another owner's capture or link is a 404, the same as a capture that does not exist.
+
+**What is public.** The public routes join `shares` to `captures` and select only the name, status, the published result and SPZ keys and their sizes. They never read the owner, the photos, the lease, errors or ids other than the link's. `/info` returns the capture name, the format and the sizes. `/scene` returns the published SPZ (§7.6); a capture without one (pre-S5 or PLY-only) returns its PLY, because that is the only scene it has. `/download` returns the PLY only when `allow_download` is set. No other path under `/s/` exists: everything else, including image, `result.ply` and RSC variants, is 404. `worker/index.ts` sends every path whose first segment decodes to `s` in any case (`/s/`, `/S/`, `/%73/`, `//s/`) to the share handler, so the app router cannot render the share page without the token check.
+
+**Revocation and readiness are checked on every request**, scene bytes included. A revoked link, a capture that is no longer `ready` (resubmitted, failed, deleting) or a deleted capture (its links cascade away) answers 404 on the next request. The page and embed are rendered by the app router only after that check passes. A resubmit pauses links rather than revoking them: when the capture returns to `ready`, its unrevoked links work again and show the new result. The Share panel says so, and an owner who does not want that revokes first (ADR-0010, Risks). Links are not revoked on resubmit.
+
+**Errors.** `handleSharePublic` wraps the whole public path in `try/catch`. A D1 or R2 error is logged and answers 503 with `Retry-After: 30` and `no-store`: `{"error":"Sharing is not available right now."}` on data routes, a minimal HTML page on page and embed routes. The error text is never sent to the client.
+
+**Caching.**
+- Page and embed: `no-store`. Every load reaches the worker, so it is checked and counted.
+- `/info`, 404s and 429s: `no-store`.
+- `/scene`: `private, no-cache` with the R2 object's ETag. The browser may keep the bytes but must revalidate before each use; revalidation runs the full token check and answers 304 with no body while the link is live, or 404 once it is revoked. Repeat views cost no download, and revocation still takes effect at once. Shared caches never store it. A failed `If-Match` or `If-Unmodified-Since` answers 412 (RFC 9110 §13.2.2: `If-Match` first, strong comparison), not 304.
+- `/download`: `private, no-store`.
+
+**Headers.** Every public response sends `Referrer-Policy: no-referrer` (the token is in the URL), `X-Robots-Tag: noindex, nofollow` and `X-Content-Type-Options: nosniff`; the pages also set `noindex` and `no-referrer` in their metadata. The page sends `Content-Security-Policy: frame-ancestors 'none'` and `X-Frame-Options: DENY`. The embed sends `frame-ancestors *` and no `X-Frame-Options`, so any site can frame it. Data responses send `default-src 'none'; frame-ancestors 'none'; sandbox`. HTML errors (404, 503) follow their route: on `/s/:token/embed` they send `frame-ancestors *`, so a revoked embed shows "This link is not available" inside the host page instead of a browser error; on every other route they send `frame-ancestors 'none'` and `X-Frame-Options: DENY`. Owner pages: `worker/index.ts` passes every app-router response through `refuseFraming` (`worker/framing.ts`), which adds `frame-ancestors 'none'` and `X-Frame-Options: DENY` to HTML. An existing CSP is extended, never replaced, and an existing `frame-ancestors` or `X-Frame-Options` is kept. `/s/*` never reaches the app router directly, so `/s/:token/embed` is the only frameable HTML.
+
+**Views** count page and embed loads only: a `GET` that is not a prefetch (`Sec-Purpose` or `Purpose` naming prefetch or prerender, or `Next-Router-Prefetch`) and whose `User-Agent` does not match `bot|crawler|spider|preview|facebookexternalhit|slackbot|discordbot|twitterbot|whatsapp|telegrambot` (case-insensitive; link unfurlers and crawlers). Uncounted loads are still checked and still get the page; only the count is skipped. User agents can be anything, so this is best effort. The check and the count are one statement, `UPDATE shares SET views=views+1 WHERE token_hash=? AND revoked_at IS NULL AND EXISTS (…ready…) RETURNING id`. `HEAD`, prefetches, `/info`, `/scene`, `/download` and revalidations are not counted. A count is page loads, not unique visitors.
+
+**Rate limiting** is best effort. There is no rate-limiting binding in this deployment, so `takeRateLimit` keeps a fixed one-minute window per `CF-Connecting-IP` in module memory: 120 public requests per minute by default (`SHARE_RATE_LIMIT` overrides it), then 429 with `Retry-After`. At most 10,000 clients are tracked; past that the oldest windows are dropped. It is per isolate, so the effective global limit is that figure times the number of isolates a client reaches, and an evicted isolate forgets its counts. Clients behind one NAT share a budget. It bounds what one client can make one isolate do (scraping, refresh loops); it is not what protects the tokens, which cannot be guessed. A request without `CF-Connecting-IP` is not limited, and the first one per isolate logs a warning. Cloudflare's edge always sets the header, so its absence means the request did not come through the edge (a local tool or a misconfigured gateway); putting all such requests in one shared "unknown" bucket would let one client use up the budget of everyone else without the header. Production should use a Workers Rate Limiting binding or a WAF rate-limiting rule on `/s/*`, and the gateway must forward a trustworthy client IP: if it overwrites `CF-Connecting-IP` with its own address, every visitor shares one budget.
+
+**Gateway.** Anonymous access must be opened for `/s/*` only; `/api/*` and the owner pages stay behind sign-in. The gateway must strip or overwrite `oai-authenticated-user-email` on every request, anonymous ones included, so a visitor cannot present an owner's address to `/api/*`.
+
+**Router smoke test** (S8 review, 2026-11-23). `npm run build`, then the built worker (`wrangler dev -c dist/server/wrangler.json`) on a local port, against a **seeded local D1 and R2** (`--persist-to`): two owners' ready captures with marker strings in the owner, name, photo name and photo bytes, plus a live link, a revoked link (both on the first capture) and a live link on the other owner's capture. Paths were sent raw, without client-side normalisation. "Leak" means any marker for an owner, a photo, an internal id or the other capture appeared in the body.
+
+| Request | Status | Share page rendered | Leak | Notes |
+|---|---|---|---|---|
+| `/s/<live>` (control) | 200 | yes, after the check | none | `frame-ancestors 'none'`, DENY, `no-store` |
+| `/s/<live>/embed` (control) | 200 | yes, after the check | none | `frame-ancestors *`, no XFO |
+| `/S/<live>` | 404 | no | none | share handler (HTML 404, DENY) |
+| `/%73/<live>`, `/%53/<live>` | 404 | no | none | share handler |
+| `//s/<live>` | 404 | no | none | share handler |
+| `/s%2F<live>` | 404 | no | none | share handler |
+| `/s/<live>/` | 404 | no | none | share handler |
+| `/s;x/<live>` | 404 | no | none | app router's plain-text 404; not a share route |
+| `/s/<live>.rsc`, `/s/<live>/embed.rsc` | 404 | no | none | share handler (token shape fails) |
+| `/s/<live>` + `RSC: 1` | 200 | yes, after the check | none | the check and the count run as for HTML |
+| `/s/<live>?_rsc=x` (with and without `RSC: 1`) | 200 | yes, after the check | none | same |
+| `/_next/data/x/s/<live>.json`, `…/embed.json` | 404 | no | none | app router's plain-text 404 |
+| `/s/<live>/info` | 200 | no (JSON) | none | name, format, sizes only |
+| `/s/<revoked>` (also with `RSC: 1`), `/S/<revoked>` | 404 | no | none | |
+| `/s/<revoked>/embed` | 404 | no | none | frameable 404 (`frame-ancestors *`) |
+| `/s/<revoked>/scene` | 404 | no | none | JSON 404 |
+| `/s/<bogus>`, `/s/<bogus>/embed`, `/s/not-a-token` | 404 | no | none | |
+| `/s/<live>/images/<image id>` | 404 | no | none | |
+| `/` (owner page) | 200 | no | none | `frame-ancestors 'none'`, DENY (`refuseFraming`) |
+| `/api/captures` without identity | 401 | no | none | |
+
+No spelling reached the app router's share page without the token check, so `worker/index.ts` routing was not changed. `tests/share.test.mjs` ("every spelling of /s is routed through the token check") covers the share-handler spellings.
+
+**UI.** The Share panel (`components/SharePanel.tsx`) appears under a `ready` capture in the Studio. It is a disclosure button (`aria-expanded`); opening it fetches the list, so view counts are current. Create has an "Allow PLY download" option. The new link and an `<iframe>` snippet are shown once, each with a Copy button, and copy failures are announced. Each link shows its creation time, views and status, a per-link download toggle and Revoke, which asks for confirmation. Changes are announced through a polite live region. The public page and embed are `components/SharedScene.tsx` over the same `SplatViewer`, captioned "Shared scene · view only".
+
+### 7.10 Capture deletion and retention (S7, PRD R5.3)
 
 Captures are kept until their owner deletes them; nothing expires on its own. No migration: `deleting` is a new value of the free-text `captures.status`.
 

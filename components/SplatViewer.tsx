@@ -5,7 +5,8 @@ import type { SplatMesh } from "@sparkjsdev/spark";
 import type { WebGLRenderer } from "three";
 import { attemptController, describeFailure, DownloadError, EngineError, openScene, sceneOutcome, type Download } from "../lib/scene";
 /** `fallbackUrl`: loaded instead when `url` downloads but cannot be decoded (the PLY behind an SPZ). */
-export type SceneSource = { url?: string; fallbackUrl?: string; file?: File; name: string; sample?: boolean };
+/** `caption` (S8): the line under the name; defaults to "Your captured world". */
+export type SceneSource = { url?: string; fallbackUrl?: string; file?: File; name: string; sample?: boolean; caption?: string };
 
 type EngineEvents = { onLost: () => void; onRestored: () => void };
 /**
@@ -235,7 +236,7 @@ export default function SplatViewer({ source }: { source: SceneSource }) {
           {downloading && !decoding && state.total > 0 && <progress value={state.loaded} max={state.total} aria-label="Scene download progress" />}</div>}
         {state.error && <div className="viewer-message error" role="alert"><AlertCircle size={25} aria-hidden="true" /><span>{state.error}</span>{state.retry && <button type="button" onClick={reload}>Reload scene</button>}</div>}
       </>}
-    <div className="viewer-bottom"><div><h3>{source.name}</h3><p>{source.sample ? <>Viewer sample by <a href="https://sparkjs.dev/" target="_blank" rel="noreferrer">Spark ↗</a></> : "Your captured world"}{state.count > 0 && <> · {(state.count / 1000).toFixed(0)}k splats</>}{!state.loading && state.notice && <> · Showing the full PLY (the SPZ could not be decoded)</>}</p></div>
+    <div className="viewer-bottom"><div><h3>{source.name}</h3><p>{source.sample ? <>Viewer sample by <a href="https://sparkjs.dev/" target="_blank" rel="noreferrer">Spark ↗</a></> : source.caption ?? "Your captured world"}{state.count > 0 && <> · {(state.count / 1000).toFixed(0)}k splats</>}{!state.loading && state.notice && <> · Showing the full PLY (the SPZ could not be decoded)</>}</p></div>
       <div className="viewer-tools"><button disabled={blocked} title={rotating ? "Pause rotation" : "Rotate scene"} aria-label={rotating ? "Pause rotation" : "Rotate scene"} onClick={() => { controls.current?.rotate(!rotating); setRotating(!rotating); }}>{rotating ? <Pause size={16} /> : <Play size={16} />}</button><button disabled={blocked} title="Reset view" aria-label="Reset view" onClick={() => controls.current?.reset()}><RotateCcw size={16} /></button><button title="Fullscreen" aria-label="Fullscreen" onClick={() => { const promise = document.fullscreenElement ? document.exitFullscreen() : frame.current?.requestFullscreen(); promise?.catch(() => {}); }}><Expand size={16} /></button></div>
     </div>
     {!blocked && <div className="viewer-hint"><Move size={13} /> Drag to orbit · Scroll to zoom · Right-drag to pan</div>}
