@@ -1,14 +1,16 @@
 // Unit tests for client-side capture prep (lib/capture-prep): blur metric, perceptual hash,
-// duplicate grouping, HEIC detection, JPEG size fallback and libheif decoding.
+// duplicate grouping, HEIC detection, JPEG size fallback, header size parsing, libheif decoding
+// and the worker pool (with a fake Worker).
 import { test, before } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { build } from 'esbuild';
 
 let m;
 before(async () => {
   const result = await build({
-    stdin: { contents: `export * from "./lib/capture-prep/metrics.ts"; export * from "./lib/capture-prep/heic.ts"; export * from "./lib/capture-prep/heif-decode.ts"; export { MAX_IMAGE_BYTES } from "./lib/validation.ts";`, resolveDir: process.cwd(), loader: 'ts' },
+    stdin: { contents: `export * from "./lib/capture-prep/metrics.ts"; export * from "./lib/capture-prep/heic.ts"; export * from "./lib/capture-prep/heif-decode.ts"; export * from "./lib/capture-prep/dimensions.ts"; export { WorkerPool } from "./lib/capture-prep/pool.ts"; export { MAX_IMAGE_BYTES } from "./lib/validation.ts";`, resolveDir: process.cwd(), loader: 'ts' },
     bundle: true, write: false, format: 'esm', platform: 'neutral',
   });
   m = await import(`data:text/javascript;base64,${Buffer.from(result.outputFiles[0].text).toString('base64')}`);
@@ -117,9 +119,17 @@ test('hammingDistance counts differing bits and rejects mismatched hashes', () =
   assert.throws(() => m.hammingDistance('ff', 'ffff'));
 });
 
-test('groupNearDuplicates groups transitively, skips nulls and singletons, sorts output', () => {
+test('groupNearDuplicates uses complete linkage: every pair in a group is within the distance', () => {
   const a = '0000000000000000', b = '000000000000003f' /* 6 from a */, c = '0000000000000fff' /* 6 from b, 12 from a */, far = 'ffffffffffffffff';
-  assert.deepEqual(m.groupNearDuplicates([far, c, null, a, b]), [[1, 3, 4]]);
+  // b is close to both a and c, but a and c are 12 apart, so they never share a group (no chaining
+  // through b). c comes first, so b joins c; a is left alone. Nulls and singletons are skipped.
+  assert.deepEqual(m.groupNearDuplicates([far, c, null, a, b]), [[1, 4]]);
+  assert.deepEqual(m.groupNearDuplicates([a, b, c]), [[0, 1]]);
+  // A slow pan: each photo 4 bits from the next. Transitive grouping would merge all five.
+  const pan = ['0000000000000000', '000000000000000f', '00000000000000ff', '0000000000000fff', '000000000000ffff'];
+  assert.deepEqual(m.groupNearDuplicates(pan), [[0, 1], [2, 3]]);
+  const groups = m.groupNearDuplicates(pan);
+  for (const g of groups) for (const i of g) for (const j of g) assert.ok(m.hammingDistance(pan[i], pan[j]) <= m.NEAR_DUPLICATE_MAX_DISTANCE);
   assert.deepEqual(m.groupNearDuplicates([a, b], 5), []);
   assert.deepEqual(m.groupNearDuplicates([a, far, a, far]), [[0, 2], [1, 3]]);
   assert.deepEqual(m.groupNearDuplicates([]), []);
@@ -144,6 +154,7 @@ test('buildPrepReport keeps the sharpest duplicate and counts usable photos', ()
   const r = m.buildPrepReport(items);
   assert.deepEqual(r.duplicateGroups, [[0, 1, 2]]);
   assert.deepEqual(r.blurry, [3]);
+  assert.deepEqual(r.extraCopies, [0, 2], 'all but the sharpest (index 1) of the group');
   assert.deepEqual(r.redundant, [0, 2, 3]);
   assert.equal(r.usable, items.length - 3);
   assert.equal(r.fewPhotos, false);
@@ -201,9 +212,11 @@ test('nextEncodeAttempt walks the quality ladder, then downscales, then gives up
   assert.equal(decision.kind, 'done'); assert.ok(size(attempt) <= L && steps < 10 && attempt.scale >= m.MIN_DOWNSCALE);
 });
 
-test('libheif decodes the HEIC fixture upright (irot + crop applied)', async () => {
-  const { default: factory } = await import('libheif-js/libheif-wasm/libheif-bundle.mjs');
-  const lib = await factory();
+test('libheif (separate glue + .wasm, as shipped) decodes the HEIC fixture upright (irot + crop applied)', async () => {
+  // The same two files the app ships: Emscripten glue plus the .wasm passed in as wasmBinary.
+  const require = createRequire(import.meta.url);
+  const factory = require('libheif-js/libheif-wasm/libheif.js');
+  const lib = await factory({ wasmBinary: readFileSync(require.resolve('libheif-js/libheif-wasm/libheif.wasm')) });
   // Stored 64×48 with "rotate 90° clockwise to display": upright it is 48×64 with red top-left,
   // green top-right and blue bottom-left.
   const { data, width, height } = await m.decodeHeif(lib, new Uint8Array(readFileSync('tests/fixtures/rotated-90cw.heic')));
@@ -214,4 +227,193 @@ test('libheif decodes the HEIC fixture upright (irot + crop applied)', async () 
   assert.ok(near(px(45, 2), [0, 200, 0]), `top-right ${px(45, 2)}`);
   assert.ok(near(px(2, 61), [0, 0, 255]), `bottom-left ${px(2, 61)}`);
   await assert.rejects(m.decodeHeif(lib, new Uint8Array(64)), m.HeifDecodeError);
+  // Pixel cap: refused from libheif's reported size, before the RGBA buffer is allocated.
+  await assert.rejects(m.decodeHeif(lib, new Uint8Array(readFileSync('tests/fixtures/rotated-90cw.heic')), 1000),
+    e => e instanceof m.HeifTooLargeError && e.width * e.height === 48 * 64);
+});
+
+// ── header sizes (dimensions.ts) ──────────────────────────────────────────────────────────
+const be32 = v => [(v >>> 24) & 255, (v >>> 16) & 255, (v >>> 8) & 255, v & 255];
+const le32 = v => be32(v).reverse();
+const be16 = v => [(v >>> 8) & 255, v & 255];
+const le16 = v => be16(v).reverse();
+function png(width, height) {
+  return new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, ...be32(13), ...Buffer.from('IHDR'), ...be32(width), ...be32(height), 8, 6, 0, 0, 0]);
+}
+/** A minimal JPEG header: SOI, optional APP1/EXIF with an orientation tag, SOF0, SOS. */
+function jpeg(width, height, { orientation, little = false, fill = false, sof = 0xc0 } = {}) {
+  const u16 = little ? le16 : be16, u32 = little ? le32 : be32;
+  const parts = [0xff, 0xd8];
+  if (fill) parts.push(0xff, 0xff); // fill bytes before a marker are legal
+  if (orientation) {
+    const tiff = [...Buffer.from(little ? 'II' : 'MM'), ...u16(42), ...u32(8), ...u16(1), ...u16(0x0112), ...u16(3), ...u32(1), ...u16(orientation), 0, 0, ...u32(0)];
+    const payload = [...Buffer.from('Exif\0\0', 'latin1'), ...tiff];
+    parts.push(0xff, 0xe1, ...be16(payload.length + 2), ...payload);
+  }
+  parts.push(0xff, 0xdb, ...be16(4), 0, 0); // a dummy DQT before the frame header
+  parts.push(0xff, sof, ...be16(11), 8, ...be16(height), ...be16(width), 1, 1, 0x11, 0);
+  parts.push(0xff, 0xda, ...be16(2));
+  return new Uint8Array(parts);
+}
+
+test('pngSize reads IHDR; displaySize passes PNG through', () => {
+  assert.deepEqual(m.pngSize(png(4032, 3024)), { width: 4032, height: 3024 });
+  assert.deepEqual(m.displaySize(png(10, 20)), { width: 10, height: 20 });
+  assert.equal(m.pngSize(png(4032, 3024).subarray(0, 20)), null, 'truncated');
+  assert.equal(m.pngSize(new Uint8Array(32)), null);
+});
+
+test('jpegInfo reads the SOF size and EXIF orientation in both byte orders; displaySize swaps for 5–8', () => {
+  assert.deepEqual(m.jpegInfo(jpeg(4032, 3024)), { width: 4032, height: 3024, orientation: 1 });
+  assert.deepEqual(m.jpegInfo(jpeg(4032, 3024, { orientation: 6 })), { width: 4032, height: 3024, orientation: 6 });
+  assert.deepEqual(m.jpegInfo(jpeg(4032, 3024, { orientation: 6, little: true })), { width: 4032, height: 3024, orientation: 6 });
+  assert.deepEqual(m.jpegInfo(jpeg(800, 600, { orientation: 3, fill: true, sof: 0xc2 })), { width: 800, height: 600, orientation: 3 }, 'progressive, fill bytes');
+  assert.deepEqual(m.displaySize(jpeg(4032, 3024, { orientation: 6 })), { width: 3024, height: 4032 });
+  assert.deepEqual(m.displaySize(jpeg(4032, 3024, { orientation: 8, little: true })), { width: 3024, height: 4032 });
+  assert.deepEqual(m.displaySize(jpeg(4032, 3024, { orientation: 3 })), { width: 4032, height: 3024 });
+  // A real encoder's file (JFIF + big-endian EXIF, orientation 6, stored 64×48).
+  const real = new Uint8Array(readFileSync('tests/fixtures/rotated-exif6.jpg'));
+  assert.deepEqual(m.jpegInfo(real), { width: 64, height: 48, orientation: 6 });
+  assert.deepEqual(m.displaySize(real), { width: 48, height: 64 });
+});
+
+test('header parsers return null for garbage, truncation and SOS before SOF', () => {
+  const full = jpeg(4032, 3024, { orientation: 6 });
+  assert.equal(m.jpegInfo(full.subarray(0, full.length - 20)), null, 'cut before the frame header');
+  assert.equal(m.jpegInfo(new Uint8Array([0xff, 0xd8, 0xff, 0xda, 0, 2, 0xff, 0xc0, 0, 11, 8, 0, 10, 0, 10])), null);
+  assert.equal(m.jpegInfo(new Uint8Array([0xff, 0xd8, 0x12, 0x34, 0, 0])), null, 'not a marker');
+  const random = Uint8Array.from({ length: 4096 }, (_, i) => (i * 2654435761) >>> 24);
+  for (const parse of [m.pngSize, m.jpegInfo, m.heicSize, m.displaySize]) {
+    assert.equal(parse(random), null, parse.name);
+    assert.equal(parse(new Uint8Array(0)), null, `${parse.name} empty`);
+  }
+});
+
+test('heicSize reads the largest ispe box; megapixels rounds to 0.1', () => {
+  // The fixture is coded 64×64, then cropped (clap) to 64×48 and rotated (irot). ispe is the coded
+  // size, an upper bound on the decoded pixels, which is what the cap needs.
+  assert.deepEqual(m.heicSize(new Uint8Array(readFileSync('tests/fixtures/rotated-90cw.heic'))), { width: 64, height: 64 });
+  const ispe = (w, h) => [...be32(20), ...Buffer.from('ispe'), 0, 0, 0, 0, ...be32(w), ...be32(h)];
+  // iPhone grid: 512×512 tiles plus the full 8064×6048 canvas.
+  const grid = new Uint8Array([0, 0, 0, 0, ...ispe(512, 512), ...ispe(8064, 6048), ...ispe(512, 512)]);
+  assert.deepEqual(m.heicSize(grid), { width: 8064, height: 6048 });
+  assert.ok(8064 * 6048 <= m.MAX_DECODE_PIXELS, 'a 48 MP iPhone photo is allowed');
+  assert.equal(m.megapixels({ width: 8064, height: 6048 }), 48.8);
+  assert.equal(m.heicSize(new Uint8Array([0, 0, 0, 0, ...be32(99), ...Buffer.from('ispe'), 0, 0, 0, 0, ...be32(9e4), ...be32(9e4)])), null, 'wrong box size');
+});
+
+// ── worker pool ─────────────────────────────────────────────────────────────────────────────
+/** A stand-in for Worker. `script(worker, message)` decides how it answers each posted job. */
+class FakeWorker {
+  constructor(script, { ready = true } = {}) {
+    this.script = script; this.posted = []; this.terminated = false;
+    // Real workers post "ready" once their module has loaded.
+    if (ready) queueMicrotask(() => this.emit({ id: 0, type: 'ready' }));
+  }
+  postMessage(message) { this.posted.push(message); this.script?.(this, message); }
+  terminate() { this.terminated = true; }
+  emit(data) { if (!this.terminated) this.onmessage?.({ data }); }
+  crash() { if (!this.terminated) this.onerror?.({ preventDefault() {} }); }
+}
+const MESSAGES = { crash: 'crashed', load: 'not loaded', timeout: 'timed out', cancelled: 'cancelled' };
+function pool(script, { size = 1, timeoutMs = 1000, workerOptions, create } = {}) {
+  const workers = [];
+  const p = new m.WorkerPool(create ?? (() => { const w = new FakeWorker(script, workerOptions); workers.push(w); return w; }), { size, timeoutMs, idleMs: 5, messages: MESSAGES });
+  return { p, workers };
+}
+const file = name => ({ name });
+/** Answers after a macrotask: stage first, then done. */
+const answer = (w, { id }) => setTimeout(() => { w.emit({ id, type: 'stage', stage: 'decoding' }); w.emit({ id, type: 'done', value: id }); }, 0);
+
+test('WorkerPool: runs jobs, forwards stage messages, reuses idle workers and respects size', async () => {
+  const { p, workers } = pool(answer, { size: 2 });
+  const stages = [];
+  const runs = [1, 2, 3].map(n => p.run(file(n), { onMessage: msg => stages.push(msg.stage) }));
+  assert.deepEqual(p.stats, { idle: 0, running: 2, queued: 1 });
+  const results = await Promise.all(runs);
+  assert.deepEqual(results.map(r => r.type), ['done', 'done', 'done']);
+  assert.deepEqual(stages, ['decoding', 'decoding', 'decoding']);
+  assert.equal(workers.length, 2, 'the third job reused a worker');
+  assert.deepEqual(p.stats, { idle: 2, running: 0, queued: 0 });
+  p.terminate();
+  assert.ok(workers.every(w => w.terminated));
+});
+
+test('WorkerPool.run never rejects when the Worker constructor or postMessage throws', async () => {
+  const broken = pool(null, { size: 2, create: () => { throw new Error('blocked by CSP'); } }).p;
+  const results = await Promise.all([1, 2, 3].map(n => broken.run(file(n))));
+  for (const r of results) { assert.equal(r.type, 'error'); assert.equal(r.reason, 'load'); assert.match(r.message, /not loaded \(blocked by CSP\)/); }
+  assert.deepEqual(broken.stats, { idle: 0, running: 0, queued: 0 });
+
+  const { p, workers } = pool((w, msg) => { if (msg.file.name === 'bad') throw new Error('DataCloneError'); answer(w, msg); });
+  const [bad, good] = await Promise.all([p.run(file('bad')), p.run(file('good'))]);
+  assert.equal(bad.reason, 'load');
+  assert.equal(good.type, 'done', 'the next photo still runs');
+  assert.ok(workers[0].terminated, 'the worker that failed to accept the job is dropped');
+  assert.deepEqual(p.stats, { idle: 1, running: 0, queued: 0 });
+  p.terminate();
+});
+
+test('WorkerPool: the watchdog stops a hung job, frees the slot, and ignores its late answer', async () => {
+  const { p, workers } = pool((w, msg) => { if (msg.file.name !== 'hang') answer(w, msg); }, { timeoutMs: 20 });
+  const hung = p.run(file('hang')), next = p.run(file('ok'));
+  const r = await hung;
+  assert.deepEqual([r.type, r.reason, r.message], ['error', 'timeout', 'timed out']);
+  assert.ok(workers[0].terminated);
+  workers[0].onmessage?.({ data: { id: r.id, type: 'done' } }); // a late answer changes nothing
+  assert.equal((await next).type, 'done');
+  assert.equal(workers.length, 2, 'the queued job ran on a fresh worker');
+  p.terminate();
+});
+
+test('WorkerPool: aborting drops a queued job, or terminates the worker of a running one', async () => {
+  const { p, workers } = pool(() => {}); // never answers
+  const running = new AbortController(), queued = new AbortController();
+  const first = p.run(file(1), { signal: running.signal });
+  const second = p.run(file(2), { signal: queued.signal });
+  assert.deepEqual(p.stats, { idle: 0, running: 1, queued: 1 });
+  queued.abort();
+  assert.deepEqual(await second, { id: 2, type: 'error', message: 'cancelled', reason: 'cancelled' });
+  assert.deepEqual(p.stats, { idle: 0, running: 1, queued: 0 });
+  assert.equal(workers[0].terminated, false, 'cancelling a queued job leaves the running one alone');
+  running.abort();
+  assert.equal((await first).reason, 'cancelled');
+  assert.ok(workers[0].terminated);
+  assert.deepEqual(p.stats, { idle: 0, running: 0, queued: 0 });
+  // Already aborted: resolves at once and never starts a worker.
+  const done = new AbortController(); done.abort();
+  assert.equal((await p.run(file(3), { signal: done.signal })).reason, 'cancelled');
+  assert.equal(workers.length, 1);
+  // Aborting after the result arrived is a no-op.
+  const late = new AbortController();
+  const { p: q } = pool(answer);
+  assert.equal((await q.run(file(4), { signal: late.signal })).type, 'done');
+  late.abort();
+  assert.deepEqual(q.stats, { idle: 1, running: 0, queued: 0 });
+  q.terminate(); p.terminate();
+});
+
+test('WorkerPool: tells a worker that never loaded from one that crashed, and drops crashed idle workers', async () => {
+  // Errors before any message: the script never loaded.
+  const unloaded = pool(w => setTimeout(() => w.crash(), 0), { workerOptions: { ready: false } }).p;
+  const r1 = await unloaded.run(file(1));
+  assert.deepEqual([r1.reason, r1.message], ['load', 'not loaded']);
+
+  // Errors after "ready": a crash mid-job (typically out of memory).
+  const crashing = pool(w => setTimeout(() => w.crash(), 0));
+  const r2 = await crashing.p.run(file(2));
+  assert.deepEqual([r2.reason, r2.message], ['crash', 'crashed']);
+  assert.ok(crashing.workers[0].terminated);
+  assert.deepEqual(crashing.p.stats, { idle: 0, running: 0, queued: 0 });
+
+  // A worker that dies while idle is removed, so the next job gets a fresh one.
+  const { p, workers } = pool(answer);
+  assert.equal((await p.run(file(3))).type, 'done');
+  assert.deepEqual(p.stats, { idle: 1, running: 0, queued: 0 });
+  workers[0].crash();
+  assert.deepEqual(p.stats, { idle: 0, running: 0, queued: 0 });
+  assert.ok(workers[0].terminated);
+  assert.equal((await p.run(file(4))).type, 'done');
+  assert.equal(workers.length, 2);
+  p.terminate(); unloaded.terminate(); crashing.p.terminate();
 });

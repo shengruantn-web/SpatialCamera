@@ -1,14 +1,16 @@
 /**
  * HEIC/HEIF → JPEG conversion, off the main thread. One photo per message.
- * Safari decodes HEIC natively; elsewhere libheif-js (LGPL-3.0, ~2 MB with inlined WASM) is
- * loaded on first need with a dynamic import, so it never reaches the main bundle.
+ * Safari decodes HEIC natively; elsewhere libheif-js (LGPL-3.0: ~90 KB glue + ~1.5 MB WASM, two
+ * separate files) is loaded on first need with a dynamic import, so it never reaches the main bundle.
  */
-import type { LibHeif } from "libheif-js/libheif-wasm/libheif-bundle.mjs";
+import type { LibHeif } from "libheif-js/libheif-wasm/libheif.js";
 import { JPEG_QUALITY, nextEncodeAttempt, type EncodeAttempt } from "./heic";
-import { decodeHeif, HeifDecodeError } from "./heif-decode";
+import { HEADER_BYTES, heicSize, MAX_DECODE_PIXELS, megapixels, type ImageSize } from "./dimensions";
+import { decodeHeif, HeifDecodeError, HeifTooLargeError } from "./heif-decode";
 import type { ConversionMessage, ConversionStage, JobRequest, WorkerScope } from "./protocol";
 
 const scope = self as unknown as WorkerScope<JobRequest, ConversionMessage>;
+scope.postMessage({ id: 0, type: "ready" });
 
 /** Error whose message is shown to the user as-is. */
 class ConversionError extends Error {}
@@ -17,14 +19,20 @@ const EXPORT_HINT = "Export it as JPEG instead (iPhone: Settings › Camera › 
 
 let libheif: Promise<LibHeif> | null = null;
 function loadLibheif(): Promise<LibHeif> {
-  libheif ??= import("libheif-js/libheif-wasm/libheif-bundle.mjs")
-    .then(module => module.default())
+  libheif ??= import("./libheif-loader")
+    .then(module => module.createLibheif())
     .catch(error => { libheif = null; throw error; });
   return libheif;
 }
 
+const tooLarge = (size: ImageSize) => new ConversionError(
+  `This photo is ${size.width} × ${size.height} (${megapixels(size)} MP), larger than the ${MAX_DECODE_PIXELS / 1e6} MP the browser converter can handle safely. Export it as a JPEG or reduce its size and add it again.`);
+
 async function decode(file: File, stage: (s: ConversionStage) => void): Promise<ImageBitmap> {
   stage("decoding");
+  // Refuse oversized photos from the header, before any decoder allocates their pixels.
+  const declared = heicSize(new Uint8Array(await file.slice(0, HEADER_BYTES).arrayBuffer()));
+  if (declared && declared.width * declared.height > MAX_DECODE_PIXELS) throw tooLarge(declared);
   // Safari (and any browser with a HEIC codec) decodes natively, applying the file's rotation.
   try { return await createImageBitmap(file); } catch { /* no native HEIC support: use libheif */ }
   let lib: LibHeif;
@@ -36,9 +44,10 @@ async function decode(file: File, stage: (s: ConversionStage) => void): Promise<
   }
   stage("decoding");
   try {
-    const pixels = await decodeHeif(lib, new Uint8Array(await file.arrayBuffer()));
+    const pixels = await decodeHeif(lib, new Uint8Array(await file.arrayBuffer()), MAX_DECODE_PIXELS);
     return await createImageBitmap(new ImageData(pixels.data, pixels.width, pixels.height));
   } catch (error) {
+    if (error instanceof HeifTooLargeError) throw tooLarge(error);
     if (error instanceof HeifDecodeError) throw new ConversionError(`This HEIC file could not be read; it may be damaged or use an unsupported variant. ${EXPORT_HINT}`);
     throw error;
   }
@@ -78,7 +87,7 @@ scope.onmessage = async event => {
     const message = error instanceof ConversionError ? error.message
       : error instanceof RangeError ? "Ran out of memory converting this photo. Close other tabs or add fewer HEIC photos at a time."
       : `Conversion failed (${(error as Error)?.message || "unknown error"}). ${EXPORT_HINT}`;
-    scope.postMessage({ id, type: "error", message });
+    scope.postMessage({ id, type: "error", reason: "failed", message });
   } finally {
     bitmap?.close();
   }

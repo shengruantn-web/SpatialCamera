@@ -1,8 +1,9 @@
 /**
- * Types for the part of libheif-js (LGPL-3.0) used by heic.worker.ts. The package ships only
- * Emscripten-level typings; this ESM bundle has the WASM inlined, so it needs no asset URL.
+ * Types for the part of libheif-js (LGPL-3.0) used by libheif-loader.ts and heif-decode.ts. The
+ * package ships only Emscripten-level typings. libheif.js is the Emscripten glue; the WASM binary
+ * is a separate file that the caller fetches and passes as `wasmBinary`.
  */
-declare module "libheif-js/libheif-wasm/libheif-bundle.mjs" {
+declare module "libheif-js/libheif-wasm/libheif.js" {
   export type HeifPixels = { data: Uint8ClampedArray<ArrayBuffer>; width: number; height: number };
   export interface HeifImage {
     get_width(): number;
@@ -23,6 +24,12 @@ declare module "libheif-js/libheif-wasm/libheif-bundle.mjs" {
     HeifDecoder: new () => HeifDecoder;
     heif_context_free(context: unknown): void;
   }
-  const factory: (options?: Record<string, unknown>) => Promise<LibHeif>;
+  const factory: (options?: { wasmBinary?: ArrayBuffer | Uint8Array }) => Promise<LibHeif>;
   export default factory;
+}
+
+/** Vite emits the file as a hashed asset and the import resolves to its URL. */
+declare module "*.wasm?url" {
+  const url: string;
+  export default url;
 }

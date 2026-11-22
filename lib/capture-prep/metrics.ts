@@ -129,23 +129,20 @@ export function hammingDistance(a: string, b: string): number {
 }
 
 /**
- * Group indices whose hashes are within maxDistance (transitively, via union-find).
- * Only groups with ≥2 members are returned; each group is sorted, groups ordered by first index.
- * Entries with a null hash (not analysed / failed) never group.
+ * Group near-identical photos with complete linkage: a photo joins a group only if it is within
+ * maxDistance of EVERY member, so a slow pan (a≈b, b≈c, a≉c) cannot chain distinct views into one
+ * group, and whichever member is kept is a near copy of each one removed. Greedy in index order
+ * (deterministic). Only groups with ≥2 members are returned; each group is sorted, groups ordered
+ * by first index. Entries with a null hash (not analysed / failed) never group.
  */
 export function groupNearDuplicates(hashes: readonly (string | null)[], maxDistance = NEAR_DUPLICATE_MAX_DISTANCE): number[][] {
-  const parent = hashes.map((_, i) => i);
-  const find = (i: number): number => { while (parent[i] !== i) { parent[i] = parent[parent[i]]; i = parent[i]; } return i; };
-  for (let i = 0; i < hashes.length; i++) {
-    const a = hashes[i]; if (!a) continue;
-    for (let j = i + 1; j < hashes.length; j++) {
-      const b = hashes[j];
-      if (b && hammingDistance(a, b) <= maxDistance) { const ri = find(i), rj = find(j); if (ri !== rj) parent[Math.max(ri, rj)] = Math.min(ri, rj); }
-    }
-  }
-  const groups = new Map<number, number[]>();
-  hashes.forEach((h, i) => { if (!h) return; const r = find(i); groups.set(r, [...(groups.get(r) ?? []), i]); });
-  return [...groups.values()].filter(g => g.length > 1).sort((a, b) => a[0] - b[0]);
+  const groups: number[][] = [];
+  hashes.forEach((hash, i) => {
+    if (!hash) return;
+    const home = groups.find(group => group.every(j => hammingDistance(hash, hashes[j]!) <= maxDistance));
+    if (home) home.push(i); else groups.push([i]);
+  });
+  return groups.filter(g => g.length > 1);
 }
 
 function median(values: readonly number[]): number {
@@ -168,6 +165,8 @@ export type PrepReport = {
   blurry: number[];
   /** Groups of near-identical photos (indices). */
   duplicateGroups: number[][];
+  /** Per group, all but the sharpest member: the photos "remove extra copies" takes out. */
+  extraCopies: number[];
   /** Indices that add nothing beyond another photo: blurry ones, plus all but the sharpest of each duplicate group. */
   redundant: number[];
   /** Photos left after setting aside `redundant`. */
@@ -180,12 +179,14 @@ export type PrepReport = {
 export function buildPrepReport(items: readonly { blur: number | null; hash: string | null }[]): PrepReport {
   const blurry = findBlurry(items.map(i => i.blur));
   const duplicateGroups = groupNearDuplicates(items.map(i => i.hash));
-  const redundant = new Set(blurry);
+  const extraCopies: number[] = [];
   for (const group of duplicateGroups) {
     // Keep the sharpest member of each group; the others are extra copies.
     const keep = group.reduce((best, i) => (items[i].blur ?? 0) > (items[best].blur ?? 0) ? i : best, group[0]);
-    group.forEach(i => { if (i !== keep) redundant.add(i); });
+    group.forEach(i => { if (i !== keep) extraCopies.push(i); });
   }
+  extraCopies.sort((a, b) => a - b);
+  const redundant = new Set([...blurry, ...extraCopies]);
   const usable = items.length - redundant.size;
-  return { blurry, duplicateGroups, redundant: [...redundant].sort((a, b) => a - b), usable, fewPhotos: usable < RECOMMENDED_MIN_PHOTOS };
+  return { blurry, duplicateGroups, extraCopies, redundant: [...redundant].sort((a, b) => a - b), usable, fewPhotos: usable < RECOMMENDED_MIN_PHOTOS };
 }
